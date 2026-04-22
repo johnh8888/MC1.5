@@ -28,16 +28,16 @@ jobs:
       - name: 初始化数据库（如果不存在）
         run: |
           if [ ! -f "newmacau_marksix.db" ]; then
-            python newmacau_marksix.py bootstrap
+            python newmacau_marksix bootstrap
           fi
 
       - name: 同步最新开奖并生成预测
         run: |
-          python newmacau_marksix.py sync --with-backtest
+          python newmacau_marksix sync --with-backtest
 
       - name: 显示结果并推送微信
         run: |
-          python newmacau_marksix.py show
+          python newmacau_marksix show
 
       - name: 上传数据库（可选，用于备份）
         uses: actions/upload-artifact@v4
