@@ -1,1 +1,47 @@
+name: 新澳门彩每日自动更新与推送
 
+on:
+  schedule:
+    # 每天 14:00 UTC（北京时间 22:00），可根据实际开奖时间调整
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-predict:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖（无需额外包）
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: 配置 PushPlus Token
+        run: echo "PUSHPLUS_TOKEN=${{ secrets.PUSHPLUS_TOKEN }}" >> $GITHUB_ENV
+
+      - name: 初始化数据库（如果不存在）
+        run: |
+          if [ ! -f "newmacau_marksix.db" ]; then
+            python newmacau_marksix.py bootstrap
+          fi
+
+      - name: 同步最新开奖并生成预测
+        run: |
+          python newmacau_marksix.py sync --with-backtest
+
+      - name: 显示结果并推送微信
+        run: |
+          python newmacau_marksix.py show
+
+      - name: 上传数据库（可选，用于备份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: newmacau-db
+          path: newmacau_marksix.db
+          retention-days: 7
