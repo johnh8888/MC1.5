@@ -23,8 +23,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
 CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
 
-# 澳门数据源（使用 marksix6.net API 中的“新澳门彩”）
-MACAU_API_URL = "https://marksix6.net/index.php?api=1"
+# 澳门数据源（支持 marksix6.net 的多个 API 入口）
+MACAU_API_URLS = [
+    "https://marksix6.net/index.php?api=1",
+    "https://marksix6.net/api/lottery_api.php",
+]
 API_TIMEOUT_DEFAULT = 20
 API_RETRIES_DEFAULT = 4
 API_RETRY_BACKOFF_SECONDS = 2.0
@@ -350,54 +353,73 @@ def parse_draw_csv_text(csv_text: str) -> List[DrawRecord]:
     return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
 
 
-def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
+def _normalize_marksix_payload(payload: object) -> List[dict]:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("lottery_data"), list):
+            return [item for item in payload.get("lottery_data", []) if isinstance(item, dict)]
+        if isinstance(payload.get("data"), list):
+            return [item for item in payload.get("data", []) if isinstance(item, dict)]
+        if any(k in payload for k in ("name", "expect", "openCode", "numbers", "history")):
+            return [payload]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _extract_macau_data_items(payload: object) -> List[dict]:
+    items = _normalize_marksix_payload(payload)
+    if not items:
+        return []
+    for item in items:
+        if item.get("name") == "新澳门彩":
+            history = item.get("history")
+            if isinstance(history, list) and history:
+                return [item]
+            return [item]
+    return items
+
+
+def parse_macau_from_marksix6_api(payload: object) -> List[DrawRecord]:
     records: List[DrawRecord] = []
-    lottery_list = payload.get("lottery_data", [])
-    if not isinstance(lottery_list, list):
+    items = _extract_macau_data_items(payload)
+    if not items:
         return records
 
-    macau_data = None
-    for item in lottery_list:
-        if isinstance(item, dict) and item.get("name") == "新澳门彩":
-            macau_data = item
-            break
+    for macau_data in items:
+        history_list = macau_data.get("history", [])
+        if history_list and isinstance(history_list, list):
+            for line in history_list:
+                match = re.match(r"(\d{7})\s*期[：:]\s*([\d,]+)", str(line))
+                if not match:
+                    continue
+                expect_raw = match.group(1)
+                numbers_str = match.group(2)
+                num_list = _parse_numbers(numbers_str)
+                if len(num_list) < 7:
+                    continue
+                main_numbers = num_list[:6]
+                special = num_list[6]
 
-    if not macau_data:
-        return records
+                if len(expect_raw) >= 7:
+                    year = expect_raw[2:4]
+                    seq = str(int(expect_raw[4:]))
+                    issue_no = f"{year}/{seq.zfill(3)}"
+                else:
+                    issue_no = expect_raw
 
-    history_list = macau_data.get("history", [])
-    if history_list and isinstance(history_list, list):
-        for line in history_list:
-            match = re.match(r"(\d{7})\s*期[：:]\s*([\d,]+)", line)
-            if not match:
-                continue
-            expect_raw = match.group(1)
-            numbers_str = match.group(2)
-            num_list = _parse_numbers(numbers_str)
-            if len(num_list) < 7:
-                continue
-            main_numbers = num_list[:6]
-            special = num_list[6]
+                draw_date = _parse_date(str(macau_data.get("openTime", "")).split()[0]) if macau_data.get("openTime") else None
+                if not draw_date:
+                    draw_date = "2026-01-01"
+                records.append(DrawRecord(
+                    issue_no=issue_no,
+                    draw_date=draw_date,
+                    numbers=main_numbers,
+                    special_number=special,
+                ))
+            continue
 
-            if len(expect_raw) >= 7:
-                year = expect_raw[2:4]
-                seq = str(int(expect_raw[4:]))
-                issue_no = f"{year}/{seq.zfill(3)}"
-            else:
-                issue_no = expect_raw
-
-            draw_date = _parse_date(macau_data.get("openTime", "").split()[0]) if macau_data.get("openTime") else None
-            if not draw_date:
-                draw_date = "2026-01-01"
-            records.append(DrawRecord(
-                issue_no=issue_no,
-                draw_date=draw_date,
-                numbers=main_numbers,
-                special_number=special,
-            ))
-    else:
-        expect_raw = str(macau_data.get("expect", ""))
-        numbers_raw = macau_data.get("openCode") or macau_data.get("numbers")
+        expect_raw = str(macau_data.get("expect", "") or macau_data.get("issue", ""))
+        numbers_raw = macau_data.get("openCode") or macau_data.get("numbers") or macau_data.get("open_code")
         if numbers_raw:
             if isinstance(numbers_raw, str):
                 num_list = _parse_numbers(numbers_raw)
@@ -414,14 +436,15 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
                     issue_no = f"{year}/{seq.zfill(3)}"
                 else:
                     issue_no = expect_raw
-                draw_date = _parse_date(macau_data.get("openTime", "").split()[0]) if macau_data.get("openTime") else None
-                if draw_date:
-                    records.append(DrawRecord(
-                        issue_no=issue_no,
-                        draw_date=draw_date,
-                        numbers=main_numbers,
-                        special_number=special,
-                    ))
+                draw_date = _parse_date(str(macau_data.get("openTime", "")).split()[0]) if macau_data.get("openTime") else None
+                if not draw_date:
+                    draw_date = utc_now()[:10]
+                records.append(DrawRecord(
+                    issue_no=issue_no,
+                    draw_date=draw_date,
+                    numbers=main_numbers,
+                    special_number=special,
+                ))
 
     dedup: Dict[str, DrawRecord] = {}
     for r in records:
@@ -433,36 +456,36 @@ def fetch_macau_records(
     timeout: int = API_TIMEOUT_DEFAULT,
     retries: int = API_RETRIES_DEFAULT,
     backoff_seconds: float = API_RETRY_BACKOFF_SECONDS,
+    limit: int = 120,
 ) -> List[DrawRecord]:
-    req = Request(
-        MACAU_API_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; macau-local/1.0)",
-            "Accept": "application/json",
-        },
-    )
-
     attempts = max(1, int(retries))
     last_error: Optional[Exception] = None
-    for attempt in range(1, attempts + 1):
-        try:
-            with urlopen(req, timeout=int(timeout)) as resp:
-                raw = resp.read().decode("utf-8-sig")
-            payload = json.loads(raw)
-            records = parse_macau_from_marksix6_api(payload)
-            if not records:
-                raise RuntimeError("澳门彩数据解析失败，请检查API返回格式")
-            return records
-        except (TimeoutError, socket.timeout, URLError, json.JSONDecodeError, RuntimeError) as exc:
-            last_error = exc
-            if attempt >= attempts:
-                break
-            delay = backoff_seconds * (2 ** (attempt - 1))
-            print(
-                f"[sync] API attempt {attempt}/{attempts} failed: {exc}. retry in {delay:.1f}s",
-                flush=True,
-            )
-            time.sleep(delay)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; macau-local/1.0)",
+        "Accept": "application/json",
+    }
+
+    for api_url in MACAU_API_URLS:
+        req = Request(api_url, headers=headers)
+        for attempt in range(1, attempts + 1):
+            try:
+                with urlopen(req, timeout=int(timeout)) as resp:
+                    raw = resp.read().decode("utf-8-sig")
+                payload = json.loads(raw)
+                records = parse_macau_from_marksix6_api(payload)
+                if not records:
+                    raise RuntimeError("澳门彩数据解析失败，请检查API返回格式")
+                return _limit_draw_records(records, limit=limit)
+            except (TimeoutError, socket.timeout, URLError, json.JSONDecodeError, RuntimeError) as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                delay = backoff_seconds * (2 ** (attempt - 1))
+                print(
+                    f"[sync] API {api_url} attempt {attempt}/{attempts} failed: {exc}. retry in {delay:.1f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
 
     raise RuntimeError(
         f"澳门API请求失败，已重试 {attempts} 次。"
@@ -493,8 +516,14 @@ def upsert_draw(conn: sqlite3.Connection, record: DrawRecord, source: str) -> st
     return "inserted"
 
 
+def _limit_draw_records(records: List[DrawRecord], limit: int = 120) -> List[DrawRecord]:
+    if limit <= 0:
+        return records
+    return sorted(records, key=lambda r: (r.draw_date, r.issue_no))[-limit:]
+
+
 def sync_from_csv(conn: sqlite3.Connection, csv_path: str, source: str = "local_csv") -> Tuple[int, int, int]:
-    records = parse_draw_csv(csv_path)
+    records = _limit_draw_records(parse_draw_csv(csv_path), limit=120)
     return sync_from_records(conn, records, source)
 
 
@@ -2390,7 +2419,7 @@ def get_recent_single_zodiac_report(conn, lookback=20, history_window=14, insura
             miss_streak = 0
     if samples == 0:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak)}
+    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": 0.0}
 
 
 def get_recent_two_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=12):
@@ -2951,7 +2980,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries)
+        records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries, limit=120)
         total, inserted, updated = sync_from_records(conn, records, source="macau_api")
         print(f"自动执行轻量回测（最近{BACKTEST_ISSUES_DEFAULT}期）...")
         run_historical_backtest(conn, rebuild=True, max_issues=BACKTEST_ISSUES_DEFAULT)
@@ -2965,7 +2994,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries)
+        records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries, limit=120)
         if args.require_continuity:
             missing = missing_issues_since_latest(conn, records)
             if missing:
