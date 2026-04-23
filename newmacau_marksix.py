@@ -51,6 +51,7 @@ STRATEGY_BASE_WINDOWS = {
 WEIGHT_WINDOW_DEFAULT = 36
 HEALTH_WINDOW_DEFAULT = 24
 BACKTEST_ISSUES_DEFAULT = 240
+BACKTEST_RUN_STATE_KEY = "historical_backtest_state_v1"
 PHYSICAL_BIAS_WINDOW_DEFAULT = 20
 PHYSICAL_BIAS_SCORE_WEIGHT = 0.12
 MICRO_PATTERN_WINDOW_DEFAULT = 5
@@ -98,6 +99,7 @@ if os.environ.get("PUSHPLUS_TOKEN"):
 
 _WEIGHT_PROTECTION_PRINTED: set[str] = set()
 _PROTECTION_PRINT_COUNTER = 0
+_BACKTEST_ONCE_IN_PROCESS = False
 
 
 @dataclass
@@ -902,22 +904,34 @@ def _base_strategy_config(strategy: str, window_size: int) -> Dict[str, float]:
 
 def _candidate_strategy_configs(strategy: str) -> List[Dict[str, float]]:
     base_window = STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
-    windows = sorted({max(5, base_window - 2), base_window, min(20, base_window + 2), min(24, base_window + 4)})
+    windows = sorted({max(5, base_window - 4), max(5, base_window - 2), base_window, min(24, base_window + 2), min(24, base_window + 4), min(24, base_window + 6)})
     if strategy == "hot_v1":
-        triplets = [(0.78, 0.05, 0.17), (0.72, 0.08, 0.20), (0.68, 0.10, 0.22)]
+        triplets = [
+            (0.84, 0.04, 0.12), (0.80, 0.06, 0.14), (0.76, 0.08, 0.16),
+            (0.72, 0.10, 0.18), (0.68, 0.12, 0.20),
+        ]
     elif strategy == "cold_rebound_v1":
-        triplets = [(0.05, 0.68, 0.27), (0.08, 0.62, 0.30), (0.10, 0.58, 0.32)]
+        triplets = [
+            (0.04, 0.76, 0.20), (0.06, 0.72, 0.22), (0.08, 0.68, 0.24),
+            (0.10, 0.64, 0.26), (0.12, 0.60, 0.28),
+        ]
     elif strategy == "momentum_v1":
-        triplets = [(0.12, 0.05, 0.83), (0.16, 0.06, 0.78), (0.20, 0.08, 0.72)]
+        triplets = [
+            (0.08, 0.04, 0.88), (0.10, 0.05, 0.85), (0.12, 0.06, 0.82),
+            (0.16, 0.08, 0.76), (0.20, 0.10, 0.70),
+        ]
     else:
-        triplets = [(0.40, 0.30, 0.20), (0.38, 0.32, 0.20), (0.35, 0.35, 0.20)]
+        triplets = [
+            (0.44, 0.26, 0.18), (0.40, 0.30, 0.18), (0.38, 0.32, 0.18),
+            (0.36, 0.34, 0.18), (0.34, 0.36, 0.18),
+        ]
 
     out: List[Dict[str, float]] = []
     for w in windows:
         for wf, wo, wm in triplets:
             cfg = {"window": float(w), "w_freq": wf, "w_omit": wo, "w_mom": wm}
             if strategy == "balanced_v1":
-                for wp, wz in [(0.05, 0.05), (0.08, 0.02), (0.02, 0.08)]:
+                for wp, wz in [(0.00, 0.00), (0.03, 0.03), (0.05, 0.05), (0.08, 0.02), (0.02, 0.08)]:
                     cfg2 = dict(cfg)
                     cfg2["w_pair"] = wp
                     cfg2["w_zone"] = wz
@@ -1586,6 +1600,29 @@ def _draws_ordered_asc(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     ).fetchall()
 
 
+def _get_backtest_state(conn: sqlite3.Connection) -> Optional[Dict[str, int]]:
+    raw = get_model_state(conn, BACKTEST_RUN_STATE_KEY)
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    try:
+        last_idx = int(obj.get("last_idx", -1))
+        min_history = int(obj.get("min_history", 3))
+    except Exception:
+        return None
+    return {"last_idx": last_idx, "min_history": min_history}
+
+
+def _set_backtest_state(conn: sqlite3.Connection, last_idx: int, min_history: int) -> None:
+    set_model_state(conn, BACKTEST_RUN_STATE_KEY, json.dumps({"last_idx": int(last_idx), "min_history": int(min_history)}))
+    conn.commit()
+
+
 def run_historical_backtest(
     conn: sqlite3.Connection,
     min_history: int = 3,
@@ -1593,6 +1630,12 @@ def run_historical_backtest(
     progress_every: int = 20,
     max_issues: int = BACKTEST_ISSUES_DEFAULT,
 ) -> Tuple[int, int]:
+    global _BACKTEST_ONCE_IN_PROCESS
+    if _BACKTEST_ONCE_IN_PROCESS:
+        print("[backtest] 本次启动已执行过自动回测，跳过重复触发", flush=True)
+        return 0, 0
+    _BACKTEST_ONCE_IN_PROCESS = True
+
     draws = _draws_ordered_asc(conn)
     if len(draws) <= min_history:
         return 0, 0
@@ -1617,19 +1660,28 @@ def run_historical_backtest(
         conn.execute("DELETE FROM strategy_performance WHERE issue_no IN (SELECT issue_no FROM draws)")
         conn.commit()
 
+    state = _get_backtest_state(conn) if not rebuild else None
+    start_idx = min_history
+    if state and state.get("min_history") == min_history:
+        start_idx = max(min_history, int(state.get("last_idx", min_history - 1)) + 1)
+        if start_idx >= len(draws):
+            print(f"[backtest] 已完成，无需重复回测（start_idx={start_idx}, total={len(draws)}）", flush=True)
+            return 0, 0
+
     issues_processed = 0
     runs_processed = 0
-    total_targets = len(draws) - min_history
+    total_targets = len(draws) - start_idx
     started_at = time.time()
 
     mined_cfg_cache: Dict[int, Dict[str, float]] = {}
     tuned_cfgs = ensure_tuned_strategy_configs(conn, force=False)
     print(
-        f"[backtest] start: total_issues={total_targets}, strategies_per_issue={len(STRATEGY_IDS)}, rebuild={rebuild}",
+        f"[backtest] start: start_idx={start_idx}, total_issues={total_targets}, strategies_per_issue={len(STRATEGY_IDS)}, rebuild={rebuild}",
         flush=True,
     )
 
-    for i in range(min_history, len(draws)):
+    last_processed_idx = start_idx - 1
+    for i in range(start_idx, len(draws)):
         target = draws[i]
         issue_no = str(target["issue_no"])
         existing = conn.execute(
@@ -1760,6 +1812,7 @@ def run_historical_backtest(
             runs_processed += 1
 
         issues_processed += 1
+        last_processed_idx = i
         if (
             issues_processed == 1
             or issues_processed == total_targets
@@ -1774,6 +1827,9 @@ def run_historical_backtest(
                 f"runs={runs_processed}, elapsed={elapsed:.0f}s, eta={eta:.0f}s",
                 flush=True,
             )
+
+    if last_processed_idx >= start_idx:
+        _set_backtest_state(conn, last_processed_idx, min_history)
 
     conn.commit()
     return issues_processed, runs_processed
@@ -3033,6 +3089,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         print(f"Bootstrap done. total={total}, inserted={inserted}, updated={updated}, next_prediction={issue}")
     finally:
         conn.close()
+        globals()["_BACKTEST_ONCE_IN_PROCESS"] = False
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
@@ -3064,6 +3121,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
             print(f"Patched missing special picks: {patched}")
     finally:
         conn.close()
+        globals()["_BACKTEST_ONCE_IN_PROCESS"] = False
 
 
 def cmd_predict(args: argparse.Namespace) -> None:
@@ -3077,6 +3135,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
             print(f"Patched missing special picks: {patched}")
     finally:
         conn.close()
+        globals()["_BACKTEST_ONCE_IN_PROCESS"] = False
 
 
 def cmd_review(args: argparse.Namespace) -> None:
@@ -3087,6 +3146,7 @@ def cmd_review(args: argparse.Namespace) -> None:
         print(f"Reviewed runs: {reviewed}")
     finally:
         conn.close()
+        globals()["_BACKTEST_ONCE_IN_PROCESS"] = False
 
 
 def cmd_show(args: argparse.Namespace) -> None:
@@ -3097,6 +3157,7 @@ def cmd_show(args: argparse.Namespace) -> None:
         print_dashboard(conn)
     finally:
         conn.close()
+        globals()["_BACKTEST_ONCE_IN_PROCESS"] = False
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
@@ -3117,6 +3178,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         print(f"Tuned config: {json.dumps(tuned_cfgs, ensure_ascii=False)}")
     finally:
         conn.close()
+        globals()["_BACKTEST_ONCE_IN_PROCESS"] = False
 
 
 def cmd_mine(args: argparse.Namespace) -> None:
