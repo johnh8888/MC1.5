@@ -933,9 +933,12 @@ def _score_strategy_config(rows: Sequence[sqlite3.Row], strategy: str, cfg: Dict
     parsed_main = [json.loads(r["numbers_json"]) for r in rows]
     parsed_special = [int(r["special_number"]) for r in rows]
     min_history = 6
-    start = max(min_history, len(rows) - min(220, len(rows) - min_history))
+    start = max(min_history, len(rows) - min(320, len(rows) - min_history))
     total = 0.0
     cnt = 0
+    recent_total = 0.0
+    recent_cnt = 0
+    recent_start = max(start, len(rows) - 24)
     for i in range(start, len(rows)):
         hist_start = max(0, i - int(cfg.get("window", FEATURE_WINDOW_DEFAULT)))
         history_desc = [parsed_main[j] for j in range(i - 1, hist_start - 1, -1)]
@@ -946,9 +949,17 @@ def _score_strategy_config(rows: Sequence[sqlite3.Row], strategy: str, cfg: Dict
         win_main = set(parsed_main[i])
         hit_count = len([n for n in picked if n in win_main])
         sp_hit = 1 if int(sp) == parsed_special[i] else 0
-        total += (hit_count / 6.0) + sp_hit * 0.18
+        score = (hit_count / 6.0) + sp_hit * 0.18
+        total += score
         cnt += 1
-    return (total / cnt) if cnt else 0.0
+        if i >= recent_start:
+            recent_total += score
+            recent_cnt += 1
+    if not cnt:
+        return 0.0
+    overall = total / cnt
+    recent = (recent_total / recent_cnt) if recent_cnt else overall
+    return overall * 0.72 + recent * 0.28
 
 
 def ensure_tuned_strategy_configs(conn: sqlite3.Connection, force: bool = False) -> Dict[str, Dict[str, float]]:
@@ -966,8 +977,38 @@ def ensure_tuned_strategy_configs(conn: sqlite3.Connection, force: bool = False)
     tuned: Dict[str, Dict[str, float]] = {}
     for strategy in ("hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1"):
         best_cfg = _base_strategy_config(strategy, STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT))
+        candidate_cfgs = _candidate_strategy_configs(strategy)
+        if strategy == "balanced_v1":
+            candidate_cfgs.extend([
+                {"window": float(w), "w_freq": wf, "w_omit": wo, "w_mom": wm, "w_pair": wp, "w_zone": wz}
+                for w in (8, 10, 12, 14, 16, 18, 20, 24)
+                for wf, wo, wm, wp, wz in [
+                    (0.44, 0.26, 0.18, 0.06, 0.06),
+                    (0.40, 0.30, 0.20, 0.05, 0.05),
+                    (0.36, 0.34, 0.20, 0.05, 0.05),
+                    (0.32, 0.38, 0.20, 0.05, 0.05),
+                ]
+            ])
+        elif strategy == "hot_v1":
+            candidate_cfgs.extend([
+                {"window": float(w), "w_freq": wf, "w_omit": wo, "w_mom": wm}
+                for w in (5, 6, 7, 8, 9, 10, 12)
+                for wf, wo, wm in [(0.82, 0.04, 0.14), (0.78, 0.06, 0.16), (0.74, 0.08, 0.18)]
+            ])
+        elif strategy == "cold_rebound_v1":
+            candidate_cfgs.extend([
+                {"window": float(w), "w_freq": wf, "w_omit": wo, "w_mom": wm}
+                for w in (10, 12, 14, 15, 16, 18, 20, 24)
+                for wf, wo, wm in [(0.06, 0.70, 0.24), (0.08, 0.66, 0.26), (0.10, 0.62, 0.28)]
+            ])
+        elif strategy == "momentum_v1":
+            candidate_cfgs.extend([
+                {"window": float(w), "w_freq": wf, "w_omit": wo, "w_mom": wm}
+                for w in (6, 7, 8, 9, 10, 12, 14)
+                for wf, wo, wm in [(0.10, 0.06, 0.84), (0.14, 0.06, 0.80), (0.18, 0.08, 0.74)]
+            ])
         best_score = _score_strategy_config(rows, strategy, best_cfg)
-        for cfg in _candidate_strategy_configs(strategy):
+        for cfg in candidate_cfgs:
             s = _score_strategy_config(rows, strategy, cfg)
             if s > best_score:
                 best_score = s
@@ -2020,6 +2061,7 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
             continue
         recent_avg = float(h.get("recent_avg_hit", 0.0))
         hit1_rate = float(h.get("hit1_rate", 0.0))
+        hit2_rate = float(h.get("hit2_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
 
         shrink = 1.0
@@ -2027,6 +2069,8 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
             shrink *= 0.90 ** ((0.7 - recent_avg) * 8)
         if hit1_rate < 0.52:
             shrink *= 0.87
+        if hit2_rate < 0.18:
+            shrink *= 0.92
         if cold_streak >= 3:
             shrink *= 0.72
 
@@ -2107,6 +2151,7 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
             "hit1_rate": float(hit1_rate),
             "hit2_rate": float(hit2_rate),
             "cold_streak": float(cold_streak),
+            "score": float(recent_avg_hit * 0.7 + hit1_rate * 0.2 + hit2_rate * 0.1 - cold_streak * 0.03),
         }
     return health
 
@@ -2387,85 +2432,84 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     return ranked[0][0]
 
 
-def get_recent_single_zodiac_report(conn, lookback=20, history_window=14, insurance_topk=12):
+def get_recent_single_zodiac_report(conn, lookback=20, history_window=14):
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0, "max_miss_desc": "暂无数据"}
     start = max(history_window, len(rows) - lookback)
     hits = 0
     samples = 0
     miss_streak = 0
     max_miss_streak = 0
+    max_miss_desc = ""
     for i in range(start, len(rows)):
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.10)
         pick = _get_single_zodiac_from_history_rows(history_rows)
-        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-        pool = [pick] + [z for z in ranked if z != pick]
-        pool = pool[: max(1, int(insurance_topk))]
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+        hit = 1 if pick in winning_zodiacs else 0
         hits += hit
         samples += 1
         if hit == 0:
             miss_streak += 1
-            max_miss_streak = max(max_miss_streak, miss_streak)
+            if miss_streak > max_miss_streak:
+                max_miss_streak = miss_streak
+                max_miss_desc = f"最近出现连续空开 {max_miss_streak} 期"
         else:
             miss_streak = 0
     if samples == 0:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": 0.0}
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0, "max_miss_desc": "暂无数据"}
+    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak), "max_miss_desc": max_miss_desc or f"最大连空 {max_miss_streak} 期"}
 
 
-def get_recent_two_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=12):
+def get_recent_two_zodiac_report(conn, lookback=20, history_window=16):
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0, "max_miss_desc": "暂无数据"}
     start = max(history_window, len(rows) - lookback)
     hits = 0
     samples = 0
     miss_streak = 0
     max_miss_streak = 0
+    max_miss_desc = ""
     for i in range(start, len(rows)):
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.10)
         picks = _get_two_zodiac_from_history_rows(history_rows)
-        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-        pool = list(picks) + [z for z in ranked if z not in picks]
-        pool = pool[: max(2, int(insurance_topk))]
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
         hits += hit
         samples += 1
         if hit == 0:
             miss_streak += 1
-            max_miss_streak = max(max_miss_streak, miss_streak)
+            if miss_streak > max_miss_streak:
+                max_miss_streak = miss_streak
+                max_miss_desc = f"最近出现连续空开 {max_miss_streak} 期"
         else:
             miss_streak = 0
     if samples == 0:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak)}
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0, "max_miss_desc": "暂无数据"}
+    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak), "max_miss_desc": max_miss_desc or f"最大连空 {max_miss_streak} 期"}
 
 
-def get_recent_three_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=12):
+def get_recent_three_zodiac_report(conn, lookback=20, history_window=16):
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0, "max_miss_desc": "暂无数据"}
     start = max(history_window, len(rows) - lookback)
     hits = 0
     samples = 0
     miss_streak = 0
     max_miss_streak = 0
+    max_miss_desc = ""
     for i in range(start, len(rows)):
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
@@ -2473,32 +2517,35 @@ def get_recent_three_zodiac_report(conn, lookback=20, history_window=16, insuran
         zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.08)
         ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
         picks = ranked[:3] if len(ranked) >= 3 else ["马", "蛇", "龙"]
-        pool = picks + [z for z in ranked if z not in picks]
-        pool = pool[: max(3, int(insurance_topk))]
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+        hit = 1 if all(z in winning_zodiacs for z in picks) else 0
         hits += hit
         samples += 1
         if hit == 0:
             miss_streak += 1
-            max_miss_streak = max(max_miss_streak, miss_streak)
+            if miss_streak > max_miss_streak:
+                max_miss_streak = miss_streak
+                max_miss_desc = f"最近出现连续空开 {max_miss_streak} 期"
         else:
             miss_streak = 0
     if samples == 0:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak)}
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0, "max_miss_desc": "暂无数据"}
+    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak), "max_miss_desc": max_miss_desc or f"最大连空 {max_miss_streak} 期"}
 
 
-def get_recent_texiao4_report(conn, lookback=20, history_window=16, insurance_topk=12):
+def get_recent_texiao4_report(conn, lookback=20, history_window=16):
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0, "max_miss_desc": "暂无数据"}
     start = max(history_window, len(rows) - lookback)
     hits = 0
     samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
+    max_miss_desc = ""
     for i in range(start, len(rows)):
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
@@ -2506,16 +2553,14 @@ def get_recent_texiao4_report(conn, lookback=20, history_window=16, insurance_to
         zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.08)
         ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
         picks = ranked[:4] if len(ranked) >= 4 else ranked
-        pool = picks + [z for z in ranked if z not in picks]
-        pool = pool[: max(4, int(insurance_topk))]
         win_special = int(rows[i]["special_number"])
         win_z = get_zodiac_by_number(win_special)
-        hit = 1 if win_z in pool else 0
+        hit = 1 if win_z in picks else 0
         hits += hit
         samples += 1
     if samples == 0:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": 0.0}
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0, "max_miss_desc": "暂无数据"}
+    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak), "max_miss_desc": max_miss_desc or f"最大连空 {max_miss_streak} 期"}
 
 
 # ========== 特别号投票 ==========
@@ -2900,15 +2945,15 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
-    zodiac_three_report = get_recent_three_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=12)
-    print("三肖复盘（最近20期，保险口径）:")
+    zodiac_three_report = get_recent_three_zodiac_report(conn, lookback=20, history_window=16)
+    print("三肖复盘（最近20期，三肖中特口径）:")
     print(
         f"  - 最近样本={int(zodiac_three_report['samples'])}期 "
         f"命中率={zodiac_three_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
     )
-    texiao4_report = get_recent_texiao4_report(conn, lookback=20, history_window=16, insurance_topk=12)
-    print("特肖复盘（最近20期，4肖保险口径）:")
+    texiao4_report = get_recent_texiao4_report(conn, lookback=20, history_window=16)
+    print("特肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(texiao4_report['samples'])}期 "
         f"命中率={texiao4_report['hit_rate'] * 100:.1f}% "
