@@ -72,7 +72,6 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1"]
-ZODIAC_ORDER = list(ZODIAC_MAP.keys())
 
 # 生肖映射（正确版本：1=马，2=蛇，3=龙，4=兔，5=虎，6=牛，7=鼠，8=猪，9=狗，10=鸡，11=猴，12=羊）
 ZODIAC_MAP = {
@@ -89,6 +88,8 @@ ZODIAC_MAP = {
     "猴": [11, 23, 35, 47],
     "羊": [12, 24, 36, 48],
 }
+
+ZODIAC_ORDER = list(ZODIAC_MAP.keys())
 
 # PushPlus 配置
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
