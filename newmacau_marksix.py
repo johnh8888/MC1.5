@@ -2089,7 +2089,7 @@ def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0
     return zodiac_scores
 
 
-def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 16) -> List[str]:
+def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 20) -> List[str]:
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
         (window,),
@@ -2151,7 +2151,7 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     return picks[:2]
 
 
-def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 14) -> str:
+def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 20) -> str:
     two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
@@ -2356,7 +2356,7 @@ def evaluate_zodiac_rules(
 def score_zodiac_candidates(
     conn: sqlite3.Connection,
     issue_no: str,
-    window: int = 16,
+    window: int = 20,
 ) -> Dict[str, Dict[str, object]]:
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
@@ -3018,7 +3018,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         )
 
     zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=16)
-    zodiac_eval = evaluate_zodiac_rules(conn, lookback=60, history_window=16)
+    zodiac_eval = evaluate_zodiac_rules(conn, lookback=20, history_window=16)
     print("\n单生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_report['samples'])}期 "
@@ -3032,7 +3032,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
-    print("生肖规则评估（最近60期）:")
+    print("生肖规则评估（最近20期）:")
     print(
         f"  - 单生肖（主号+特别号）命中率={zodiac_eval['single']['hit_rate'] * 100:.1f}% "
         f"样本={int(zodiac_eval['single']['samples'])}"
