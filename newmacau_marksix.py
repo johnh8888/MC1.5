@@ -3349,8 +3349,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"2生肖推荐：{zodiac_two_text} | 信心={top_double_conf:.3f}\n"
-                f"1生肖推荐：{zodiac_single_text} | 信心={top_single_conf:.3f}\n"
+                f"2生肖推荐：{zodiac_two_text}\n"
+                f"1生肖推荐：{zodiac_single_text}\n"
                 f"生肖Top3：{top_single_text}\n"
                 f"双生肖Top1组合：{top_double_text}\n"
                 f"特别号主推：{special_text}{conflict_tip}\n"
