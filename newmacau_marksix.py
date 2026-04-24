@@ -3261,11 +3261,6 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"特别号命中率={s['special_rate'] * 100:.2f}% 至少中1个={s['hit1_rate'] * 100:.2f}% 至少中2个={s['hit2_rate'] * 100:.2f}%"
         )
 
-        print(
-            f"  - {strategy_name}: 样本={samples} 最近均中={avg_hit:.2f} "
-            f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
-        )
-
     zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=16)
     zodiac_eval = evaluate_zodiac_rules(conn, lookback=20, history_window=16)
     print("\n单生肖复盘（最近20期）:")
