@@ -2363,10 +2363,7 @@ def score_zodiac_candidates(
         (window,),
     ).fetchall()
     if not rows:
-        return {
-            z: {"score": 0.0, "reason": "no-data"}
-            for z in ZODIAC_MAP.keys()
-        }
+        return {z: {"score": 0.0, "reason": "no-data"} for z in ZODIAC_MAP.keys()}
 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
     omission_map = _zodiac_omission_map(rows)
@@ -2376,40 +2373,38 @@ def score_zodiac_candidates(
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
     xgb_special = predict_special_number_xgb(conn, issue_no)
     xgb_zodiac = get_zodiac_by_number(xgb_special) if xgb_special is not None else None
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+
+    out: Dict[str, Dict[str, object]] = {}
     for z in zodiac_scores:
-        score = zodiac_scores[z]
-        reason_parts = [f"base={score:.2f}"]
+        score = float(zodiac_scores[z])
+        reasons: List[str] = [f"base={score:.2f}"]
         omit = omission_map.get(z, 0)
         if omit >= 8:
             score += 2.0
-            reason_parts.append(f"omit+2.0({omit})")
+            reasons.append(f"omit+2.0({omit})")
         elif omit >= 5:
             score += 1.0
-            reason_parts.append(f"omit+1.0({omit})")
+            reasons.append(f"omit+1.0({omit})")
         pc = pool_counter.get(z, 0)
         if pc:
             bonus = pc * 0.6
             score += bonus
-            reason_parts.append(f"pool+{bonus:.1f}")
+            reasons.append(f"pool+{bonus:.1f}")
         spc = sum(1 for sp in top_special_votes if get_zodiac_by_number(sp) == z)
         if spc:
             bonus = spc * 1.5
             score += bonus
-            reason_parts.append(f"sp+{bonus:.1f}")
+            reasons.append(f"sp+{bonus:.1f}")
         if xgb_zodiac == z:
             score += 3.0
-            reason_parts.append("xgb+3.0")
-        if z in [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]:
+            reasons.append("xgb+3.0")
+        if z in recent_special_zodiacs:
             score -= 0.2
-            reason_parts.append("recent-0.2")
-        zodiac_scores[z] = score
-        reason = ", ".join(reason_parts)
-    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    out: Dict[str, Dict[str, object]] = {}
-    for z, s in ranked:
+            reasons.append("recent-0.2")
         out[z] = {
-            "score": float(s),
-            "reason": f"{z}: " + ", ".join([f"score={s:.2f}"])
+            "score": round(score, 4),
+            "reason": f"{z}: " + ", ".join(reasons),
         }
     return out
 
@@ -2872,6 +2867,10 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     top_double = []
     if len(top_single) >= 2:
         top_double = [(top_single[0][0], top_single[1][0])]
+    top_single_reason = zodiac_score_map[top_single[0][0]]["reason"] if top_single else "无"
+    top_double_reason = "；".join(
+        zodiac_score_map[z]["reason"] for z in top_double[0]
+    ) if top_double else "无"
     defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
     strategy_special_text = " ".join(_fmt_num(n) for n in strategy_specials) if strategy_specials else "无"
     strategy_zodiac_text = "、".join(strategy_special_zodiacs) if strategy_special_zodiacs else "无"
@@ -2895,12 +2894,13 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"2生肖推荐: {zodiac_two_text}")
     print(f"1生肖推荐: {zodiac_single_text}")
     if top_single:
-        single_lines = []
-        for z, info in top_single:
-            single_lines.append(f"{z}({float(info['score']):.2f})")
-        print(f"生肖Top3: {' | '.join(single_lines)}")
+        print("生肖Top3:")
+        for zodiac, info in top_single:
+            print(f"  - {zodiac}: {float(info['score']):.2f} | {info['reason']}")
     if top_double:
-        print(f"双生肖Top1组合: {top_double[0][0]} + {top_double[0][1]}")
+        print("双生肖Top1组合:")
+        for a, b in top_double:
+            print(f"  - {a} + {b}")
     print("=" * 50)
 
 
@@ -3073,12 +3073,21 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
             zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
             zodiac_two_text = "、".join(zodiac_two) if zodiac_two else "数据不足"
+            zodiac_score_map = score_zodiac_candidates(conn, issue_no, window=16)
+            top_single = sorted(zodiac_score_map.items(), key=lambda x: (-float(x[1]["score"]), x[0]))[:3]
+            top_double = []
+            if len(top_single) >= 2:
+                top_double = [(top_single[0][0], top_single[1][0])]
             conflict_tip = "（已避开主号冲突）" if special_conflict else ""
+            top_single_text = "；".join(f"{z}:{float(info['score']):.2f}" for z, info in top_single) if top_single else "无"
+            top_double_text = "、".join(f"{a}+{b}" for a, b in top_double) if top_double else "无"
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
                 f"2生肖推荐：{zodiac_two_text}\n"
                 f"1生肖推荐：{zodiac_single_text}\n"
+                f"生肖Top3：{top_single_text}\n"
+                f"双生肖Top1组合：{top_double_text}\n"
                 f"特别号主推：{special_text}{conflict_tip}\n"
                 f"特别号防守：{defense_text}\n"
                 f"六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
