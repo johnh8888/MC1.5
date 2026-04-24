@@ -2116,18 +2116,20 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     for z in zodiac_scores:
         score = float(zodiac_scores[z])
         omit = omission_map.get(z, 0)
-        if omit >= 8:
-            score += 2.0
-        elif omit >= 5:
-            score += 1.0
+        if omit >= 10:
+            score += 2.8
+        elif omit >= 6:
+            score += 1.6
+        elif omit >= 4:
+            score += 0.8
         if pool_counter.get(z, 0):
-            score += pool_counter.get(z, 0) * 0.6
+            score += pool_counter.get(z, 0) * 0.75
         if z in top_special_zodiacs:
-            score += 1.5 * top_special_zodiacs.count(z)
+            score += 1.8 * top_special_zodiacs.count(z)
         if xgb_zodiac == z:
-            score += 3.2
+            score += 3.6
         if z in recent_special_zodiacs:
-            score -= 0.2
+            score -= 0.35
         zodiac_scores[z] = score
 
     prev_issue = _get_previous_issue(conn, issue_no)
@@ -2144,29 +2146,31 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
                 return hot_two[:2]
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    candidates = [z for z, _ in ranked[:8]]
+    candidates = [z for z, _ in ranked[:10]]
     if xgb_zodiac and xgb_zodiac not in candidates:
         candidates.insert(0, xgb_zodiac)
-    candidates = list(dict.fromkeys(force_include + candidates))[:8]
+    candidates = list(dict.fromkeys(force_include + candidates))[:10]
 
     def pair_score(a: str, b: str) -> float:
         sa = float(zodiac_scores.get(a, 0.0))
         sb = float(zodiac_scores.get(b, 0.0))
         score = sa + sb
         if a in top_special_zodiacs:
-            score += 0.7
-        if b in top_special_zodiacs:
-            score += 0.7
-        if a == xgb_zodiac or b == xgb_zodiac:
             score += 1.0
+        if b in top_special_zodiacs:
+            score += 1.0
+        if a == xgb_zodiac or b == xgb_zodiac:
+            score += 1.3
         if a in recent_special_zodiacs or b in recent_special_zodiacs:
-            score -= 0.4
+            score -= 0.5
         if a in force_include or b in force_include:
-            score += 0.4
+            score += 0.5
         if abs(ZODIAC_ORDER.index(a) - ZODIAC_ORDER.index(b)) <= 2:
-            score -= 0.6
+            score -= 0.8
         if a in pool_counter and b in pool_counter:
-            score += 0.3
+            score += 0.4
+        if a in top_special_zodiacs and b in top_special_zodiacs:
+            score -= 0.4
         return score
 
     best_pair = None
@@ -2205,36 +2209,40 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
     for z in zodiac_scores:
         score = float(zodiac_scores[z])
         omit = omission_map.get(z, len(rows))
-        if omit >= 8:
-            score += 2.5
-        elif omit >= 5:
-            score += 1.2
+        if omit >= 10:
+            score += 3.0
+        elif omit >= 6:
+            score += 1.8
+        elif omit >= 4:
+            score += 0.9
         if pool_counter.get(z, 0):
-            score += pool_counter.get(z, 0) * 0.8
+            score += pool_counter.get(z, 0) * 0.9
         if z in top_special_zodiacs:
-            score += 2.2
+            score += 2.6
         if xgb_zodiac == z:
-            score += 3.5
+            score += 3.8
         if z in recent_special_zodiacs:
-            score -= 0.2
+            score -= 0.3
         zodiac_scores[z] = score
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    candidates = [z for z, _ in ranked[:5]]
+    candidates = [z for z, _ in ranked[:7]]
     if xgb_zodiac and xgb_zodiac not in candidates:
         candidates.insert(0, xgb_zodiac)
-    candidates = list(dict.fromkeys(candidates))[:5]
+    candidates = list(dict.fromkeys(candidates))[:7]
 
     def single_score(z: str) -> float:
         score = float(zodiac_scores.get(z, 0.0))
         if z in top_special_zodiacs:
-            score += 0.8
-        if z == xgb_zodiac:
             score += 1.0
+        if z == xgb_zodiac:
+            score += 1.2
         if z in pool_counter:
-            score += 0.3
+            score += 0.4
         if z in recent_special_zodiacs:
-            score -= 0.1
+            score -= 0.15
+        if omission_map.get(z, 0) >= 6:
+            score += 0.3
         return score
 
     best = max(candidates, key=single_score) if candidates else ranked[0][0]
