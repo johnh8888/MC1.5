@@ -2426,6 +2426,7 @@ def evaluate_zodiac_rules(
     double_hits = double_samples = 0
     special_chain_hits = special_chain_samples = 0
     two_special_one_core_hits = two_special_one_core_samples = 0
+    two_special_two_core_hits = two_special_two_core_samples = 0
     three_special_one_core_hits = three_special_one_core_samples = 0
     three_special_two_core_hits = three_special_two_core_samples = 0
     four_special_four_core_hits = four_special_four_core_samples = 0
@@ -2460,6 +2461,16 @@ def evaluate_zodiac_rules(
         if (len(special_vote_zodiacs & winning_zodiacs) >= 1) and (len(core_top1_nums & set(win_main)) >= 1):
             special_chain_hits += 1
         special_chain_samples += 1
+
+        # 新增：2个特别生肖 + 2个核心号码（任意一个命中即算中）
+        special_votes2b = get_top_special_votes(conn, rows[i]["issue_no"], top_n=2)
+        special_vote_zodiacs2b = {get_zodiac_by_number(sp) for sp in special_votes2b}
+        core_top2b = sorted(_special_chain_core_top1(conn, rows[i]["issue_no"]).items(), key=lambda x: (-x[1], x[0]))[:2]
+        core_top2b_nums = {n for n, _ in core_top2b}
+        core_top2b_zodiacs = {get_zodiac_by_number(n) for n in core_top2b_nums}
+        if (len(special_vote_zodiacs2b & winning_zodiacs) >= 1) or (len(core_top2b_zodiacs & winning_zodiacs) >= 1):
+            two_special_two_core_hits += 1
+        two_special_two_core_samples += 1
 
         # 新增：3个特别生肖 + 1个核心号码（任意一个命中即算中）
         special_votes3 = get_top_special_votes(conn, rows[i]["issue_no"], top_n=3)
@@ -2508,6 +2519,10 @@ def evaluate_zodiac_rules(
         "two_special_one_core": {
             "samples": float(two_special_one_core_samples),
             "hit_rate": float(two_special_one_core_hits / two_special_one_core_samples) if two_special_one_core_samples else 0.0,
+        },
+        "two_special_two_core": {
+            "samples": float(two_special_two_core_samples),
+            "hit_rate": float(two_special_two_core_hits / two_special_two_core_samples) if two_special_two_core_samples else 0.0,
         },
         "three_special_one_core": {
             "samples": float(three_special_one_core_samples),
@@ -2900,7 +2915,7 @@ def get_special_zodiac_realtime_bundle(conn: sqlite3.Connection, issue_no: str) 
     core_numbers = [n for n, _ in core_numbers]
     core_zodiacs = [get_zodiac_by_number(n) for n in core_numbers]
 
-    main6, pool10, pool14, pool20, special = _weighted_consensus_pools(conn, issue_no)
+    main6, _, _, _, _ = _weighted_consensus_pools(conn, issue_no)
     pool_zodiacs = [get_zodiac_by_number(n) for n in main6] if main6 else []
     pool_counter = Counter(pool_zodiacs)
 
@@ -2912,6 +2927,18 @@ def get_special_zodiac_realtime_bundle(conn: sqlite3.Connection, issue_no: str) 
         "core_numbers": core_numbers,
         "core_zodiacs": core_zodiacs,
         "pool_zodiacs": [z for z, _ in pool_counter.most_common(4)],
+    }
+
+
+def get_special_zodiac_realtime_bundle_3_2(conn: sqlite3.Connection, issue_no: str) -> Dict[str, object]:
+    """实战版：3个特别生肖 + 2个核心号码。"""
+    bundle = get_special_zodiac_realtime_bundle(conn, issue_no)
+    return {
+        "primary_special_zodiac": bundle["primary_special_zodiac"],
+        "backup_special_zodiacs": bundle["backup_special_zodiacs"][:2],
+        "core_numbers": bundle["core_numbers"][:2],
+        "core_zodiacs": bundle["core_zodiacs"][:2],
+        "pool_zodiacs": bundle["pool_zodiacs"],
     }
 
 
@@ -3208,6 +3235,10 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"六策略特别号组: {strategy_special_text}")
     print(f"六策略生肖组: {strategy_zodiac_text}")
     print(f"六策略极强号: {strong_special_text} ({strong_zodiac_text})")
+    bundle_3_2 = get_special_zodiac_realtime_bundle_3_2(conn, issue_no)
+    bundle_4_4 = get_special_zodiac_realtime_bundle(conn, issue_no)
+    print(f"实战3+2: 主推 {bundle_3_2['primary_special_zodiac']} | 备选 { ' '.join(bundle_3_2['backup_special_zodiacs']) } | 核心 { ' '.join(_fmt_num(n) for n in bundle_3_2['core_numbers']) }")
+    print(f"实战4+4: 主推 {bundle_4_4['primary_special_zodiac']} | 备选 { ' '.join(bundle_4_4['backup_special_zodiacs']) } | 核心 { ' '.join(_fmt_num(n) for n in bundle_4_4['core_numbers']) }")
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
@@ -3362,6 +3393,10 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     print(
         f"  - 2个特别生肖 + 1个核心号码命中率={zodiac_eval['two_special_one_core']['hit_rate'] * 100:.1f}% "
         f"样本={int(zodiac_eval['two_special_one_core']['samples'])}"
+    )
+    print(
+        f"  - 2个特别生肖 + 2个核心号码命中率={zodiac_eval['two_special_two_core']['hit_rate'] * 100:.1f}% "
+        f"样本={int(zodiac_eval['two_special_two_core']['samples'])}"
     )
     print(
         f"  - 3个特别生肖 + 1个核心号码命中率={zodiac_eval['three_special_one_core']['hit_rate'] * 100:.1f}% "
