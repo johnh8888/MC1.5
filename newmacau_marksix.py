@@ -1924,6 +1924,19 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
 
         weights[strategy] = max(0.08, weights[strategy] * shrink)
 
+    # 生肖层/特别号层更适合近期动量、热号与集成投票；适当抬高其相对权重
+    bias_boost = {
+        "momentum_v1": 1.12,
+        "hot_v1": 1.08,
+        "ensemble_v2": 1.06,
+        "cold_rebound_v1": 0.98,
+        "balanced_v1": 0.96,
+        "pattern_mined_v1": 0.90,
+    }
+    for strategy, mul in bias_boost.items():
+        if strategy in weights:
+            weights[strategy] *= mul
+
     total = sum(weights.values())
     global _PROTECTION_PRINT_COUNTER
     for msg in protection_msgs:
@@ -2005,6 +2018,10 @@ def get_zodiac_by_number(number: int) -> str:
         if number in nums:
             return zodiac
     return "马"
+
+
+def get_numbers_by_zodiac(zodiac: str) -> List[int]:
+    return list(ZODIAC_MAP.get(zodiac, []))
 
 
 def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optional[str]:
@@ -2103,10 +2120,20 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     omission_map = _zodiac_omission_map(rows)
     force_include = [z for z, omit in omission_map.items() if omit >= 8]
 
+    main_rows = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 20",
+    ).fetchall()
+    main_counter = Counter()
+    for r in main_rows:
+        for n in json.loads(r["numbers_json"]):
+            main_counter[get_zodiac_by_number(int(n))] += 1
+
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     pool_zodiacs = [get_zodiac_by_number(n) for n in pool20] if pool20 else []
     pool_counter = Counter(pool_zodiacs)
 
+    special_support = _special_zodiac_support(conn, issue_no)
+    special_support = _special_zodiac_support(conn, issue_no)
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
     top_special_zodiacs = [get_zodiac_by_number(sp) for sp in top_special_votes]
     xgb_special = predict_special_number_xgb(conn, issue_no)
@@ -2123,11 +2150,14 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         elif omit >= 4:
             score += 0.8
         if pool_counter.get(z, 0):
-            score += pool_counter.get(z, 0) * 0.75
+            score += pool_counter.get(z, 0) * 0.8
+        if main_counter.get(z, 0):
+            score += main_counter.get(z, 0) * 0.15
+        score += float(special_support.get(z, 0.0))
         if z in top_special_zodiacs:
-            score += 1.8 * top_special_zodiacs.count(z)
+            score += 0.6 * top_special_zodiacs.count(z)
         if xgb_zodiac == z:
-            score += 3.6
+            score += 1.0
         if z in recent_special_zodiacs:
             score -= 0.35
         zodiac_scores[z] = score
@@ -2146,31 +2176,62 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
                 return hot_two[:2]
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    candidates = [z for z, _ in ranked[:10]]
+    hot_candidates = [z for z, _ in ranked[:4]]
+    cold_candidates = sorted([(z, omission_map.get(z, 0)) for z in ZODIAC_MAP.keys()], key=lambda x: (-x[1], x[0]))[:4]
+    candidates = list(dict.fromkeys(force_include + hot_candidates + [z for z, _ in cold_candidates]))[:6]
     if xgb_zodiac and xgb_zodiac not in candidates:
         candidates.insert(0, xgb_zodiac)
-    candidates = list(dict.fromkeys(force_include + candidates))[:10]
+    candidates = list(dict.fromkeys(candidates))[:6]
 
     def pair_score(a: str, b: str) -> float:
         sa = float(zodiac_scores.get(a, 0.0))
         sb = float(zodiac_scores.get(b, 0.0))
         score = sa + sb
+        oa = omission_map.get(a, 0)
+        ob = omission_map.get(b, 0)
+        ma = main_counter.get(a, 0)
+        mb = main_counter.get(b, 0)
+        pa = pool_counter.get(a, 0)
+        pb = pool_counter.get(b, 0)
+
+        # 主号覆盖：至少一个在主号池里高频，另一个可做互补
+        if ma >= 3 or mb >= 3:
+            score += 1.2
+        if ma >= 2 and mb >= 2:
+            score += 0.4
+
+        # 热冷互补：一热一冷更优
+        if (oa >= 7 and ob <= 4) or (ob >= 7 and oa <= 4):
+            score += 2.6
+        elif (oa >= 7 and ob >= 7) or (oa <= 4 and ob <= 4):
+            score -= 1.3
+
+        # 特别号/模型联动
         if a in top_special_zodiacs:
             score += 1.0
         if b in top_special_zodiacs:
             score += 1.0
         if a == xgb_zodiac or b == xgb_zodiac:
-            score += 1.3
+            score += 2.0
+
+        # 最近特别号抑制
         if a in recent_special_zodiacs or b in recent_special_zodiacs:
-            score -= 0.5
-        if a in force_include or b in force_include:
-            score += 0.5
-        if abs(ZODIAC_ORDER.index(a) - ZODIAC_ORDER.index(b)) <= 2:
             score -= 0.8
-        if a in pool_counter and b in pool_counter:
+
+        # 过近生肖惩罚，避免同质化
+        if abs(ZODIAC_ORDER.index(a) - ZODIAC_ORDER.index(b)) <= 2:
+            score -= 1.6
+
+        # 主号池覆盖奖励
+        if pa and pb:
+            score += 0.8
+        elif pa or pb:
             score += 0.4
+
+        # 双生肖都来自特别号热门则降权
         if a in top_special_zodiacs and b in top_special_zodiacs:
-            score -= 0.4
+            score -= 1.0
+
         return score
 
     best_pair = None
@@ -2183,7 +2244,9 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
                 best_pair = (a, b)
     if best_pair:
         return [best_pair[0], best_pair[1]]
-    return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
+    if len(ranked) >= 2:
+        return [ranked[0][0], ranked[1][0]]
+    return ["马", "蛇"]
 
 
 def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 20) -> str:
@@ -2200,52 +2263,42 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
     pool_zodiacs = [get_zodiac_by_number(n) for n in pool20] if pool20 else []
     pool_counter = Counter(pool_zodiacs)
 
+    special_support = _special_zodiac_support(conn, issue_no)
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
     top_special_zodiacs = [get_zodiac_by_number(sp) for sp in top_special_votes]
     xgb_special = predict_special_number_xgb(conn, issue_no)
     xgb_zodiac = get_zodiac_by_number(xgb_special) if xgb_special is not None else None
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
 
+    special_chain = _special_zodiac_support(conn, issue_no)
+    core_boost = _special_chain_core_top1(conn, issue_no)
     for z in zodiac_scores:
-        score = float(zodiac_scores[z])
+        score = 0.0
+        # 特别号投票
+        score += float(special_support.get(z, 0.0)) * 0.45
+        if z in top_special_zodiacs:
+            score += 0.25
+        # XGB 特别号
+        if z == xgb_zodiac:
+            score += 0.25
+        # 核心号码回灌
+        score += float(sum(core_boost.get(n, 0.0) for n in get_numbers_by_zodiac(z))) * 0.55
+        # 轻量主号池修正
+        score += pool_counter.get(z, 0) * 0.20
+        # 遗漏和近期热度修正
         omit = omission_map.get(z, len(rows))
         if omit >= 10:
-            score += 3.0
-        elif omit >= 6:
-            score += 1.8
+            score += 0.12
+        elif omit >= 7:
+            score += 0.08
         elif omit >= 4:
-            score += 0.9
-        if pool_counter.get(z, 0):
-            score += pool_counter.get(z, 0) * 0.9
-        if z in top_special_zodiacs:
-            score += 2.6
-        if xgb_zodiac == z:
-            score += 3.8
+            score += 0.04
         if z in recent_special_zodiacs:
-            score -= 0.3
+            score -= 0.06
         zodiac_scores[z] = score
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    candidates = [z for z, _ in ranked[:7]]
-    if xgb_zodiac and xgb_zodiac not in candidates:
-        candidates.insert(0, xgb_zodiac)
-    candidates = list(dict.fromkeys(candidates))[:7]
-
-    def single_score(z: str) -> float:
-        score = float(zodiac_scores.get(z, 0.0))
-        if z in top_special_zodiacs:
-            score += 1.0
-        if z == xgb_zodiac:
-            score += 1.2
-        if z in pool_counter:
-            score += 0.4
-        if z in recent_special_zodiacs:
-            score -= 0.15
-        if omission_map.get(z, 0) >= 6:
-            score += 0.3
-        return score
-
-    best = max(candidates, key=single_score) if candidates else ranked[0][0]
+    best = ranked[0][0] if ranked else "马"
     return best
 
 
@@ -2371,6 +2424,13 @@ def evaluate_zodiac_rules(
     start = max(history_window, len(rows) - lookback)
     single_hits = single_samples = 0
     double_hits = double_samples = 0
+    special_chain_hits = special_chain_samples = 0
+    two_special_one_core_hits = two_special_one_core_samples = 0
+    three_special_one_core_hits = three_special_one_core_samples = 0
+    three_special_two_core_hits = three_special_two_core_samples = 0
+    four_special_four_core_hits = four_special_four_core_samples = 0
+    four_special_four_core_zodiac_hits = four_special_four_core_zodiac_samples = 0
+    four_special_four_core_number_hits = four_special_four_core_number_samples = 0
     for i in range(start, len(rows)):
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
@@ -2387,6 +2447,51 @@ def evaluate_zodiac_rules(
             single_hits += 1
         if all(z in winning_zodiacs for z in double_picks):
             double_hits += 1
+
+        # 新增：2个特别生肖 + 1个核心号码（任意一个命中即算中）
+        special_votes = get_top_special_votes(conn, rows[i]["issue_no"], top_n=2)
+        special_vote_zodiacs = {get_zodiac_by_number(sp) for sp in special_votes}
+        core_top1 = sorted(_special_chain_core_top1(conn, rows[i]["issue_no"]).items(), key=lambda x: (-x[1], x[0]))[:1]
+        core_top1_nums = {n for n, _ in core_top1}
+        core_top1_zodiacs = {get_zodiac_by_number(n) for n in core_top1_nums}
+        if (len(special_vote_zodiacs & winning_zodiacs) >= 1) or (len(core_top1_zodiacs & winning_zodiacs) >= 1):
+            two_special_one_core_hits += 1
+        two_special_one_core_samples += 1
+        if (len(special_vote_zodiacs & winning_zodiacs) >= 1) and (len(core_top1_nums & set(win_main)) >= 1):
+            special_chain_hits += 1
+        special_chain_samples += 1
+
+        # 新增：3个特别生肖 + 1个核心号码（任意一个命中即算中）
+        special_votes3 = get_top_special_votes(conn, rows[i]["issue_no"], top_n=3)
+        special_vote_zodiacs3 = {get_zodiac_by_number(sp) for sp in special_votes3}
+        if (len(special_vote_zodiacs3 & winning_zodiacs) >= 1) or (len(core_top1_zodiacs & winning_zodiacs) >= 1):
+            three_special_one_core_hits += 1
+        three_special_one_core_samples += 1
+
+        # 新增：3个特别生肖 + 2个核心号码（任意一个命中即算中）
+        core_top2 = sorted(_special_chain_core_top1(conn, rows[i]["issue_no"]).items(), key=lambda x: (-x[1], x[0]))[:2]
+        core_top2_nums = {n for n, _ in core_top2}
+        core_top2_zodiacs = {get_zodiac_by_number(n) for n in core_top2_nums}
+        if (len(special_vote_zodiacs3 & winning_zodiacs) >= 1) or (len(core_top2_zodiacs & winning_zodiacs) >= 1):
+            three_special_two_core_hits += 1
+        three_special_two_core_samples += 1
+
+        # 新增：4个特别生肖 + 4个核心号码（分项真实统计）
+        special_votes4 = get_top_special_votes(conn, rows[i]["issue_no"], top_n=4)
+        special_vote_zodiacs4 = {get_zodiac_by_number(sp) for sp in special_votes4}
+        core_top4 = sorted(_special_chain_core_top1(conn, rows[i]["issue_no"]).items(), key=lambda x: (-x[1], x[0]))[:4]
+        core_top4_nums = {n for n, _ in core_top4}
+        core_top4_zodiacs = {get_zodiac_by_number(n) for n in core_top4_nums}
+
+        if special_vote_zodiacs4 & winning_zodiacs:
+            four_special_four_core_zodiac_hits += 1
+        four_special_four_core_zodiac_samples += 1
+        if core_top4_nums & set(win_main):
+            four_special_four_core_number_hits += 1
+        four_special_four_core_number_samples += 1
+        if (special_vote_zodiacs4 & winning_zodiacs) or (core_top4_zodiacs & winning_zodiacs):
+            four_special_four_core_hits += 1
+        four_special_four_core_samples += 1
     return {
         "single": {
             "samples": float(single_samples),
@@ -2395,6 +2500,34 @@ def evaluate_zodiac_rules(
         "double": {
             "samples": float(double_samples),
             "hit_rate": float(double_hits / double_samples) if double_samples else 0.0,
+        },
+        "special_chain": {
+            "samples": float(special_chain_samples),
+            "hit_rate": float(special_chain_hits / special_chain_samples) if special_chain_samples else 0.0,
+        },
+        "two_special_one_core": {
+            "samples": float(two_special_one_core_samples),
+            "hit_rate": float(two_special_one_core_hits / two_special_one_core_samples) if two_special_one_core_samples else 0.0,
+        },
+        "three_special_one_core": {
+            "samples": float(three_special_one_core_samples),
+            "hit_rate": float(three_special_one_core_hits / three_special_one_core_samples) if three_special_one_core_samples else 0.0,
+        },
+        "three_special_two_core": {
+            "samples": float(three_special_two_core_samples),
+            "hit_rate": float(three_special_two_core_hits / three_special_two_core_samples) if three_special_two_core_samples else 0.0,
+        },
+        "four_special_four_core": {
+            "samples": float(four_special_four_core_samples),
+            "hit_rate": float(four_special_four_core_hits / four_special_four_core_samples) if four_special_four_core_samples else 0.0,
+        },
+        "four_special_four_core_zodiac": {
+            "samples": float(four_special_four_core_zodiac_samples),
+            "hit_rate": float(four_special_four_core_zodiac_hits / four_special_four_core_zodiac_samples) if four_special_four_core_zodiac_samples else 0.0,
+        },
+        "four_special_four_core_number": {
+            "samples": float(four_special_four_core_number_samples),
+            "hit_rate": float(four_special_four_core_number_hits / four_special_four_core_number_samples) if four_special_four_core_number_samples else 0.0,
         },
     }
 
@@ -2682,21 +2815,117 @@ def predict_special_number_xgb(conn: sqlite3.Connection, issue_no: str) -> Optio
 
 
 def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 3) -> List[int]:
-    all_specials = []
+    strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
+    weighted_votes: Dict[int, float] = {}
     for strategy in STRATEGY_IDS:
         run = conn.execute(
             "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
             (issue_no, strategy)
         ).fetchone()
-        if run:
-            _, sp = get_picks_for_run(conn, run["id"])
-            if sp is not None:
-                all_specials.append(sp)
-    if not all_specials:
+        if not run:
+            continue
+        _, sp = get_picks_for_run(conn, run["id"])
+        if sp is None:
+            continue
+        w = float(strategy_weights.get(strategy, 1.0 / max(len(STRATEGY_IDS), 1)))
+        weighted_votes[int(sp)] = weighted_votes.get(int(sp), 0.0) + w
+    if not weighted_votes:
         return []
-    vote_counter = Counter(all_specials)
-    sorted_items = sorted(vote_counter.items(), key=lambda x: (-x[1], x[0]))
+    sorted_items = sorted(weighted_votes.items(), key=lambda x: (-x[1], x[0]))
     return [num for num, _ in sorted_items[:top_n]]
+
+
+def _special_zodiac_support(conn: sqlite3.Connection, issue_no: str) -> Dict[str, float]:
+    support: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    top_votes = get_top_special_votes(conn, issue_no, top_n=6)
+    for sp in top_votes:
+        support[get_zodiac_by_number(sp)] += 1.5
+    xgb_special = predict_special_number_xgb(conn, issue_no)
+    if xgb_special is not None:
+        support[get_zodiac_by_number(xgb_special)] += 2.0
+    specials, zodiac_list, strong_special, strong_zodiac = get_strong_special_from_strategies(conn, issue_no, [])
+    for z in zodiac_list:
+        support[z] += 0.6
+    if strong_zodiac:
+        support[strong_zodiac] += 1.0
+    return support
+
+
+def _special_zodiac_core_numbers(conn: sqlite3.Connection, issue_no: str) -> Dict[int, float]:
+    """只保留特别号驱动的核心号码，而不是全生肖均匀传导。"""
+    zodiac_support = _special_zodiac_support(conn, issue_no)
+    number_support: Dict[int, float] = {n: 0.0 for n in ALL_NUMBERS}
+    for zodiac, score in zodiac_support.items():
+        nums = get_numbers_by_zodiac(zodiac)
+        if not nums:
+            continue
+        ranked_nums = sorted(nums, key=lambda n: (n % 10, n))
+        core_nums = ranked_nums[:2] if len(ranked_nums) >= 2 else ranked_nums
+        if not core_nums:
+            continue
+        per_num = score / float(len(core_nums))
+        for n in core_nums:
+            number_support[n] += per_num
+    return number_support
+
+
+def _special_zodiac_number_support(conn: sqlite3.Connection, issue_no: str) -> Dict[int, float]:
+    zodiac_support = _special_zodiac_support(conn, issue_no)
+    number_support: Dict[int, float] = {n: 0.0 for n in ALL_NUMBERS}
+    for zodiac, score in zodiac_support.items():
+        nums = get_numbers_by_zodiac(zodiac)
+        if not nums:
+            continue
+        per_num = score / float(len(nums))
+        for n in nums:
+            number_support[n] += per_num
+    return number_support
+
+
+def get_special_zodiac_realtime_bundle(conn: sqlite3.Connection, issue_no: str) -> Dict[str, object]:
+    """实战版：4个特别生肖 + 4个核心号码。"""
+    special_votes = get_top_special_votes(conn, issue_no, top_n=4)
+    xgb_special = predict_special_number_xgb(conn, issue_no)
+    special_zodiacs = [get_zodiac_by_number(n) for n in special_votes]
+    if xgb_special is not None:
+        xgb_zodiac = get_zodiac_by_number(xgb_special)
+        if xgb_zodiac not in special_zodiacs:
+            special_zodiacs.insert(0, xgb_zodiac)
+    special_zodiacs = list(dict.fromkeys(special_zodiacs))[:4]
+
+    core_numbers = sorted(
+        _special_chain_core_number_boost(conn, issue_no).items(),
+        key=lambda x: (-x[1], x[0])
+    )[:4]
+    core_numbers = [n for n, _ in core_numbers]
+    core_zodiacs = [get_zodiac_by_number(n) for n in core_numbers]
+
+    main6, pool10, pool14, pool20, special = _weighted_consensus_pools(conn, issue_no)
+    pool_zodiacs = [get_zodiac_by_number(n) for n in main6] if main6 else []
+    pool_counter = Counter(pool_zodiacs)
+
+    primary = special_zodiacs[0] if special_zodiacs else "马"
+    backups = special_zodiacs[1:4]
+    return {
+        "primary_special_zodiac": primary,
+        "backup_special_zodiacs": backups,
+        "core_numbers": core_numbers,
+        "core_zodiacs": core_zodiacs,
+        "pool_zodiacs": [z for z, _ in pool_counter.most_common(4)],
+    }
+
+
+def _special_zodiac_number_support(conn: sqlite3.Connection, issue_no: str) -> Dict[int, float]:
+    zodiac_support = _special_zodiac_support(conn, issue_no)
+    number_support: Dict[int, float] = {n: 0.0 for n in ALL_NUMBERS}
+    for zodiac, score in zodiac_support.items():
+        nums = get_numbers_by_zodiac(zodiac)
+        if not nums:
+            continue
+        per_num = score / float(len(nums))
+        for n in nums:
+            number_support[n] += per_num
+    return number_support
 
 
 def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int]) -> Tuple[Optional[int], List[int], bool]:
@@ -2795,10 +3024,38 @@ def get_strong_special_from_strategies(
     return specials, zodiac_list, best, get_zodiac_by_number(best)
 
 
+def _special_chain_core_number_boost(conn: sqlite3.Connection, issue_no: str) -> Dict[int, float]:
+    """把特别号->生肖->核心号码链路直接映射到号码强约束上。"""
+    core_support = _special_zodiac_core_numbers(conn, issue_no)
+    if not core_support:
+        return {n: 0.0 for n in ALL_NUMBERS}
+    top_nums = sorted(core_support.items(), key=lambda x: (-x[1], x[0]))[:4]
+    boost = {n: 0.0 for n in ALL_NUMBERS}
+    for n, score in top_nums:
+        boost[n] = score
+    return boost
+
+
+def _special_chain_core_top1(conn: sqlite3.Connection, issue_no: str) -> Dict[int, float]:
+    """只保留特别号链路里的最强单个核心号码。"""
+    boost = _special_chain_core_number_boost(conn, issue_no)
+    if not boost:
+        return {n: 0.0 for n in ALL_NUMBERS}
+    top = sorted(boost.items(), key=lambda x: (-x[1], x[0]))[:1]
+    top1 = {n: 0.0 for n in ALL_NUMBERS}
+    for n, score in top:
+        top1[n] = score
+    return top1
+
+
 def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[List[int], List[int], List[int], List[int], Optional[int]]:
     strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
     number_scores: Dict[int, float] = {}
     special_scores: Dict[int, float] = {}
+    zodiac_special_support = _special_zodiac_support(conn, issue_no)
+    zodiac_core_number_support = _special_zodiac_core_numbers(conn, issue_no)
+    special_chain_core_boost = _special_chain_core_top1(conn, issue_no)
+    zodiac_number_support = _special_zodiac_number_support(conn, issue_no)
 
     for strategy in STRATEGY_IDS:
         run = conn.execute(
@@ -2814,12 +3071,23 @@ def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[
             if not (1 <= int(n) <= 49):
                 continue
             rank_boost = (20 - idx) / 20.0
-            number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * rank_boost
+            n_int = int(n)
+            number_scores[n_int] = number_scores.get(n_int, 0.0) + w * rank_boost
+            # 强化特别号 -> 生肖 -> 号码 的传导
+            number_scores[n_int] += 0.18 * zodiac_special_support.get(get_zodiac_by_number(n_int), 0.0)
+            number_scores[n_int] += 0.12 * zodiac_number_support.get(n_int, 0.0)
+            number_scores[n_int] += 0.45 * zodiac_core_number_support.get(n_int, 0.0)
+            number_scores[n_int] += 1.50 * special_chain_core_boost.get(n_int, 0.0)
 
         main6 = get_pool_numbers_for_run(conn, run_id, 6)
         for n in main6:
             if 1 <= int(n) <= 49:
-                number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * 0.35
+                n_int = int(n)
+                number_scores[n_int] = number_scores.get(n_int, 0.0) + w * 0.35
+                number_scores[n_int] += 0.12 * zodiac_special_support.get(get_zodiac_by_number(n_int), 0.0)
+                number_scores[n_int] += 0.08 * zodiac_number_support.get(n_int, 0.0)
+                number_scores[n_int] += 1.20 * special_chain_core_boost.get(n_int, 0.0)
+                number_scores[n_int] += 0.35 * zodiac_core_number_support.get(n_int, 0.0)
 
         _, special = get_picks_for_run(conn, run_id)
         if special is not None and 1 <= int(special) <= 49:
@@ -3018,7 +3286,7 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
         special_hit = 1 if special == actual_special else 0
         main_str = " ".join(_fmt_num(n) for n in main6)
         special_str = _fmt_num(special) if special is not None else "--"
-        lines.append(f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'✅' if special_hit else '❌'}")
+        lines.append(f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'YES' if special_hit else 'NO'}")
     lines.append("")
     return "\n".join(lines)
 
@@ -3086,6 +3354,34 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     print(
         f"  - 双生肖（必须两个都中）命中率={zodiac_eval['double']['hit_rate'] * 100:.1f}% "
         f"样本={int(zodiac_eval['double']['samples'])}"
+    )
+    print(
+        f"  - 特别号→生肖→核心号码命中率={zodiac_eval['special_chain']['hit_rate'] * 100:.1f}% "
+        f"样本={int(zodiac_eval['special_chain']['samples'])}"
+    )
+    print(
+        f"  - 2个特别生肖 + 1个核心号码命中率={zodiac_eval['two_special_one_core']['hit_rate'] * 100:.1f}% "
+        f"样本={int(zodiac_eval['two_special_one_core']['samples'])}"
+    )
+    print(
+        f"  - 3个特别生肖 + 1个核心号码命中率={zodiac_eval['three_special_one_core']['hit_rate'] * 100:.1f}% "
+        f"样本={int(zodiac_eval['three_special_one_core']['samples'])}"
+    )
+    print(
+        f"  - 3个特别生肖 + 2个核心号码命中率={zodiac_eval['three_special_two_core']['hit_rate'] * 100:.1f}% "
+        f"样本={int(zodiac_eval['three_special_two_core']['samples'])}"
+    )
+    print(
+        f"  - 4个特别生肖 + 4个核心号码任意命中率={zodiac_eval['four_special_four_core']['hit_rate'] * 100:.1f}% "
+        f"样本={int(zodiac_eval['four_special_four_core']['samples'])}"
+    )
+    print(
+        f"  - 4个特别生肖生肖命中率={zodiac_eval['four_special_four_core_zodiac']['hit_rate'] * 100:.1f}% "
+        f"样本={int(zodiac_eval['four_special_four_core_zodiac']['samples'])}"
+    )
+    print(
+        f"  - 4个核心号码号码命中率={zodiac_eval['four_special_four_core_number']['hit_rate'] * 100:.1f}% "
+        f"样本={int(zodiac_eval['four_special_four_core_number']['samples'])}"
     )
 
     print_final_recommendation(conn)
