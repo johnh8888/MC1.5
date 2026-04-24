@@ -2868,9 +2868,19 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if len(top_single) >= 2:
         top_double = [(top_single[0][0], top_single[1][0])]
     top_single_reason = zodiac_score_map[top_single[0][0]]["reason"] if top_single else "无"
-    top_double_reason = "；".join(
-        zodiac_score_map[z]["reason"] for z in top_double[0]
-    ) if top_double else "无"
+    top_double_reason = "；".join(zodiac_score_map[z]["reason"] for z in top_double[0]) if top_double else "无"
+    top_single_conf = 0.0
+    top_double_conf = 0.0
+    if top_single:
+        top_scores = [float(info["score"]) for _, info in top_single]
+        mx = max(top_scores)
+        mn = min(top_scores)
+        top_single_conf = round(min(0.99, 0.55 + (mx - mn) / (mx + 1e-9) * 0.35), 3)
+    if top_double:
+        a, b = top_double[0]
+        s1 = float(zodiac_score_map[a]["score"])
+        s2 = float(zodiac_score_map[b]["score"])
+        top_double_conf = round(min(0.99, 0.40 + ((s1 + s2) / 2.0) / (max(s1, s2) + 1e-9) * 0.35), 3)
     defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
     strategy_special_text = " ".join(_fmt_num(n) for n in strategy_specials) if strategy_specials else "无"
     strategy_zodiac_text = "、".join(strategy_special_zodiacs) if strategy_special_zodiacs else "无"
@@ -2880,10 +2890,6 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
     print(f"策略说明: 主号采用「多策略加权共识」(基于最近{FEATURE_WINDOW_DEFAULT}期特征 + 近{WEIGHT_WINDOW_DEFAULT}期动态权重)，特别号采用「加权投票」")
-    print(f"  6号池 : {p6} | 特别号: {special_text}")
-    print(f"  10号池: {p10} | 特别号: {special_text}")
-    print(f"  14号池: {p14} | 特别号: {special_text}")
-    print(f"  20号池: {p20} | 特别号: {special_text}")
     print(f"特别号建议: 主推 {special_text} | 防守 {defense_text}")
     print(f"六策略特别号组: {strategy_special_text}")
     print(f"六策略生肖组: {strategy_zodiac_text}")
@@ -2891,8 +2897,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
-    print(f"2生肖推荐: {zodiac_two_text}")
-    print(f"1生肖推荐: {zodiac_single_text}")
+    print(f"2生肖推荐: {zodiac_two_text} | 信心={top_double_conf:.3f}")
+    print(f"1生肖推荐: {zodiac_single_text} | 信心={top_single_conf:.3f}")
     if top_single:
         print("生肖Top3:")
         for zodiac, info in top_single:
@@ -3084,8 +3090,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"2生肖推荐：{zodiac_two_text}\n"
-                f"1生肖推荐：{zodiac_single_text}\n"
+                f"2生肖推荐：{zodiac_two_text} | 信心={top_double_conf:.3f}\n"
+                f"1生肖推荐：{zodiac_single_text} | 信心={top_single_conf:.3f}\n"
                 f"生肖Top3：{top_single_text}\n"
                 f"双生肖Top1组合：{top_double_text}\n"
                 f"特别号主推：{special_text}{conflict_tip}\n"
