@@ -1945,8 +1945,6 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
             _WEIGHT_PROTECTION_PRINTED.add(msg)
     if protection_msgs:
         _PROTECTION_PRINT_COUNTER += 1
-        if _PROTECTION_PRINT_COUNTER % 20 == 0:
-            print(f"[保护] 当前规律挖掘/冷号回补仍处于权重保护中 (已持续{_PROTECTION_PRINT_COUNTER}期)", flush=True)
     return {k: round(v / total, 4) for k, v in weights.items()}
 
 
@@ -2449,60 +2447,6 @@ def evaluate_zodiac_rules(
         if all(z in winning_zodiacs for z in double_picks):
             double_hits += 1
 
-        # 新增：2个特别生肖 + 1个核心号码（任意一个命中即算中）
-        special_votes = get_top_special_votes(conn, rows[i]["issue_no"], top_n=2)
-        special_vote_zodiacs = {get_zodiac_by_number(sp) for sp in special_votes}
-        core_top1 = sorted(_special_chain_core_top1(conn, rows[i]["issue_no"]).items(), key=lambda x: (-x[1], x[0]))[:1]
-        core_top1_nums = {n for n, _ in core_top1}
-        core_top1_zodiacs = {get_zodiac_by_number(n) for n in core_top1_nums}
-        if (len(special_vote_zodiacs & winning_zodiacs) >= 1) or (len(core_top1_zodiacs & winning_zodiacs) >= 1):
-            two_special_one_core_hits += 1
-        two_special_one_core_samples += 1
-        if (len(special_vote_zodiacs & winning_zodiacs) >= 1) and (len(core_top1_nums & set(win_main)) >= 1):
-            special_chain_hits += 1
-        special_chain_samples += 1
-
-        # 新增：2个特别生肖 + 2个核心号码（任意一个命中即算中）
-        special_votes2b = get_top_special_votes(conn, rows[i]["issue_no"], top_n=2)
-        special_vote_zodiacs2b = {get_zodiac_by_number(sp) for sp in special_votes2b}
-        core_top2b = sorted(_special_chain_core_top1(conn, rows[i]["issue_no"]).items(), key=lambda x: (-x[1], x[0]))[:2]
-        core_top2b_nums = {n for n, _ in core_top2b}
-        core_top2b_zodiacs = {get_zodiac_by_number(n) for n in core_top2b_nums}
-        if (len(special_vote_zodiacs2b & winning_zodiacs) >= 1) or (len(core_top2b_zodiacs & winning_zodiacs) >= 1):
-            two_special_two_core_hits += 1
-        two_special_two_core_samples += 1
-
-        # 新增：3个特别生肖 + 1个核心号码（任意一个命中即算中）
-        special_votes3 = get_top_special_votes(conn, rows[i]["issue_no"], top_n=3)
-        special_vote_zodiacs3 = {get_zodiac_by_number(sp) for sp in special_votes3}
-        if (len(special_vote_zodiacs3 & winning_zodiacs) >= 1) or (len(core_top1_zodiacs & winning_zodiacs) >= 1):
-            three_special_one_core_hits += 1
-        three_special_one_core_samples += 1
-
-        # 新增：3个特别生肖 + 2个核心号码（任意一个命中即算中）
-        core_top2 = sorted(_special_chain_core_top1(conn, rows[i]["issue_no"]).items(), key=lambda x: (-x[1], x[0]))[:2]
-        core_top2_nums = {n for n, _ in core_top2}
-        core_top2_zodiacs = {get_zodiac_by_number(n) for n in core_top2_nums}
-        if (len(special_vote_zodiacs3 & winning_zodiacs) >= 1) or (len(core_top2_zodiacs & winning_zodiacs) >= 1):
-            three_special_two_core_hits += 1
-        three_special_two_core_samples += 1
-
-        # 新增：4个特别生肖 + 4个核心号码（分项真实统计）
-        special_votes4 = get_top_special_votes(conn, rows[i]["issue_no"], top_n=4)
-        special_vote_zodiacs4 = {get_zodiac_by_number(sp) for sp in special_votes4}
-        core_top4 = sorted(_special_chain_core_top1(conn, rows[i]["issue_no"]).items(), key=lambda x: (-x[1], x[0]))[:4]
-        core_top4_nums = {n for n, _ in core_top4}
-        core_top4_zodiacs = {get_zodiac_by_number(n) for n in core_top4_nums}
-
-        if special_vote_zodiacs4 & winning_zodiacs:
-            four_special_four_core_zodiac_hits += 1
-        four_special_four_core_zodiac_samples += 1
-        if core_top4_nums & set(win_main):
-            four_special_four_core_number_hits += 1
-        four_special_four_core_number_samples += 1
-        if (special_vote_zodiacs4 & winning_zodiacs) or (core_top4_zodiacs & winning_zodiacs):
-            four_special_four_core_hits += 1
-        four_special_four_core_samples += 1
     return {
         "single": {
             "samples": float(single_samples),
@@ -2515,34 +2459,6 @@ def evaluate_zodiac_rules(
         "special_chain": {
             "samples": float(special_chain_samples),
             "hit_rate": float(special_chain_hits / special_chain_samples) if special_chain_samples else 0.0,
-        },
-        "two_special_one_core": {
-            "samples": float(two_special_one_core_samples),
-            "hit_rate": float(two_special_one_core_hits / two_special_one_core_samples) if two_special_one_core_samples else 0.0,
-        },
-        "two_special_two_core": {
-            "samples": float(two_special_two_core_samples),
-            "hit_rate": float(two_special_two_core_hits / two_special_two_core_samples) if two_special_two_core_samples else 0.0,
-        },
-        "three_special_one_core": {
-            "samples": float(three_special_one_core_samples),
-            "hit_rate": float(three_special_one_core_hits / three_special_one_core_samples) if three_special_one_core_samples else 0.0,
-        },
-        "three_special_two_core": {
-            "samples": float(three_special_two_core_samples),
-            "hit_rate": float(three_special_two_core_hits / three_special_two_core_samples) if three_special_two_core_samples else 0.0,
-        },
-        "four_special_four_core": {
-            "samples": float(four_special_four_core_samples),
-            "hit_rate": float(four_special_four_core_hits / four_special_four_core_samples) if four_special_four_core_samples else 0.0,
-        },
-        "four_special_four_core_zodiac": {
-            "samples": float(four_special_four_core_zodiac_samples),
-            "hit_rate": float(four_special_four_core_zodiac_hits / four_special_four_core_zodiac_samples) if four_special_four_core_zodiac_samples else 0.0,
-        },
-        "four_special_four_core_number": {
-            "samples": float(four_special_four_core_number_samples),
-            "hit_rate": float(four_special_four_core_number_hits / four_special_four_core_number_samples) if four_special_four_core_number_samples else 0.0,
         },
     }
 
@@ -3345,18 +3261,6 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"特别号命中率={s['special_rate'] * 100:.2f}% 至少中1个={s['hit1_rate'] * 100:.2f}% 至少中2个={s['hit2_rate'] * 100:.2f}%"
         )
 
-    print(f"\n策略健康度（最近{HEALTH_WINDOW_DEFAULT}期）:")
-    weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
-    health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
-    for strategy in STRATEGY_IDS:
-        strategy_name = STRATEGY_LABELS.get(strategy, strategy)
-        h = health.get(strategy, {})
-        samples = int(h.get("samples", 0.0))
-        avg_hit = float(h.get("recent_avg_hit", 0.0))
-        hit1 = float(h.get("hit1_rate", 0.0)) * 100.0
-        hit2 = float(h.get("hit2_rate", 0.0)) * 100.0
-        cold = int(h.get("cold_streak", 0.0))
-        weight = float(weights.get(strategy, 0.0)) * 100.0
         print(
             f"  - {strategy_name}: 样本={samples} 最近均中={avg_hit:.2f} "
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
