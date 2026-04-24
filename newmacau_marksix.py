@@ -3153,8 +3153,12 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"六策略极强号: {strong_special_text} ({strong_zodiac_text})")
     bundle_3_2 = get_special_zodiac_realtime_bundle_3_2(conn, issue_no)
     bundle_4_4 = get_special_zodiac_realtime_bundle(conn, issue_no)
-    print(f"实战3+2: 主推 {bundle_3_2['primary_special_zodiac']} | 备选 { ' '.join(bundle_3_2['backup_special_zodiacs']) } | 核心 { ' '.join(_fmt_num(n) for n in bundle_3_2['core_numbers']) }")
-    print(f"实战4+4: 主推 {bundle_4_4['primary_special_zodiac']} | 备选 { ' '.join(bundle_4_4['backup_special_zodiacs']) } | 核心 { ' '.join(_fmt_num(n) for n in bundle_4_4['core_numbers']) }")
+    p32 = " ".join(bundle_3_2['backup_special_zodiacs']) if bundle_3_2['backup_special_zodiacs'] else "-"
+    c32 = " ".join(_fmt_num(n) for n in bundle_3_2['core_numbers']) if bundle_3_2['core_numbers'] else "-"
+    p44 = " ".join(bundle_4_4['backup_special_zodiacs']) if bundle_4_4['backup_special_zodiacs'] else "-"
+    c44 = " ".join(_fmt_num(n) for n in bundle_4_4['core_numbers']) if bundle_4_4['core_numbers'] else "-"
+    print(f"实战3+2: 主推={bundle_3_2['primary_special_zodiac']} | 备选={p32} | 核心={c32}")
+    print(f"实战4+4: 主推={bundle_4_4['primary_special_zodiac']} | 备选={p44} | 核心={c44}")
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
@@ -3284,38 +3288,6 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     print(
         f"  - 双生肖（必须两个都中）命中率={zodiac_eval['double']['hit_rate'] * 100:.1f}% "
         f"样本={int(zodiac_eval['double']['samples'])}"
-    )
-    print(
-        f"  - 特别号→生肖→核心号码命中率={zodiac_eval['special_chain']['hit_rate'] * 100:.1f}% "
-        f"样本={int(zodiac_eval['special_chain']['samples'])}"
-    )
-    print(
-        f"  - 2个特别生肖 + 1个核心号码命中率={zodiac_eval['two_special_one_core']['hit_rate'] * 100:.1f}% "
-        f"样本={int(zodiac_eval['two_special_one_core']['samples'])}"
-    )
-    print(
-        f"  - 2个特别生肖 + 2个核心号码命中率={zodiac_eval['two_special_two_core']['hit_rate'] * 100:.1f}% "
-        f"样本={int(zodiac_eval['two_special_two_core']['samples'])}"
-    )
-    print(
-        f"  - 3个特别生肖 + 1个核心号码命中率={zodiac_eval['three_special_one_core']['hit_rate'] * 100:.1f}% "
-        f"样本={int(zodiac_eval['three_special_one_core']['samples'])}"
-    )
-    print(
-        f"  - 3个特别生肖 + 2个核心号码命中率={zodiac_eval['three_special_two_core']['hit_rate'] * 100:.1f}% "
-        f"样本={int(zodiac_eval['three_special_two_core']['samples'])}"
-    )
-    print(
-        f"  - 4个特别生肖 + 4个核心号码任意命中率={zodiac_eval['four_special_four_core']['hit_rate'] * 100:.1f}% "
-        f"样本={int(zodiac_eval['four_special_four_core']['samples'])}"
-    )
-    print(
-        f"  - 4个特别生肖生肖命中率={zodiac_eval['four_special_four_core_zodiac']['hit_rate'] * 100:.1f}% "
-        f"样本={int(zodiac_eval['four_special_four_core_zodiac']['samples'])}"
-    )
-    print(
-        f"  - 4个核心号码号码命中率={zodiac_eval['four_special_four_core_number']['hit_rate'] * 100:.1f}% "
-        f"样本={int(zodiac_eval['four_special_four_core_number']['samples'])}"
     )
 
     print_final_recommendation(conn)
