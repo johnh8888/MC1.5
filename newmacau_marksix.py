@@ -72,6 +72,7 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1"]
+ZODIAC_ORDER = list(ZODIAC_MAP.keys())
 
 # 生肖映射（正确版本：1=马，2=蛇，3=龙，4=兔，5=虎，6=牛，7=鼠，8=猪，9=狗，10=鸡，11=猴，12=羊）
 ZODIAC_MAP = {
@@ -2102,21 +2103,31 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     force_include = [z for z, omit in omission_map.items() if omit >= 8]
 
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    pool_zodiacs = []
-    if pool20:
-        pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
-        for z, cnt in Counter(pool_zodiacs).items():
-            zodiac_scores[z] += cnt * 0.6
+    pool_zodiacs = [get_zodiac_by_number(n) for n in pool20] if pool20 else []
+    pool_counter = Counter(pool_zodiacs)
 
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
-    for sp in top_special_votes:
-        zodiac_scores[get_zodiac_by_number(sp)] += 1.5
-
+    top_special_zodiacs = [get_zodiac_by_number(sp) for sp in top_special_votes]
     xgb_special = predict_special_number_xgb(conn, issue_no)
-    xgb_zodiac = None
-    if xgb_special is not None:
-        xgb_zodiac = get_zodiac_by_number(xgb_special)
-        zodiac_scores[xgb_zodiac] += 3.2
+    xgb_zodiac = get_zodiac_by_number(xgb_special) if xgb_special is not None else None
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+
+    for z in zodiac_scores:
+        score = float(zodiac_scores[z])
+        if omission_map.get(z, 0) >= 8:
+            score += 2.0
+        elif omission_map.get(z, 0) >= 5:
+            score += 1.0
+        pc = pool_counter.get(z, 0)
+        if pc:
+            score += pc * 0.6
+        if z in top_special_zodiacs:
+            score += 1.5 * top_special_zodiacs.count(z)
+        if xgb_zodiac == z:
+            score += 3.2
+        if z in recent_special_zodiacs:
+            score -= 0.2
+        zodiac_scores[z] = score
 
     prev_issue = _get_previous_issue(conn, issue_no)
     if prev_issue and not _check_two_zodiac_hit(conn, prev_issue):
@@ -2132,23 +2143,43 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
                 return hot_two[:2]
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    picks: List[str] = []
-    priority_sources = []
-    if xgb_zodiac:
-        priority_sources.append(xgb_zodiac)
-    priority_sources.extend([z for z in force_include if z not in priority_sources])
-    priority_sources.extend([z for z in (pool_zodiacs[:3] if pool_zodiacs else []) if z not in priority_sources])
-    for z in priority_sources:
-        if z not in picks:
-            picks.append(z)
-        if len(picks) == 2:
-            break
-    for z, _ in ranked:
-        if len(picks) >= 2:
-            break
-        if z not in picks:
-            picks.append(z)
-    return picks[:2]
+    candidates = [z for z, _ in ranked[:8]]
+    if xgb_zodiac and xgb_zodiac not in candidates:
+        candidates.insert(0, xgb_zodiac)
+    candidates = [z for z in force_include + candidates if z in ZODIAC_MAP and z not in []]
+    candidates = list(dict.fromkeys(candidates))[:8]
+
+    def pair_score(a: str, b: str) -> float:
+        sa = float(zodiac_scores.get(a, 0.0))
+        sb = float(zodiac_scores.get(b, 0.0))
+        bonus = 0.0
+        if a in top_special_zodiacs:
+            bonus += 0.7
+        if b in top_special_zodiacs:
+            bonus += 0.7
+        if a == xgb_zodiac or b == xgb_zodiac:
+            bonus += 1.0
+        if a in recent_special_zodiacs or b in recent_special_zodiacs:
+            bonus -= 0.4
+        if a in force_include or b in force_include:
+            bonus += 0.4
+        if abs(ZODIAC_ORDER.index(a) - ZODIAC_ORDER.index(b)) <= 2:
+            bonus -= 0.6
+        if (a in pool_counter and b in pool_counter):
+            bonus += 0.3
+        return sa + sb + bonus
+
+    best_pair = None
+    best_score = float("-inf")
+    for i, a in enumerate(candidates):
+        for b in candidates[i + 1:]:
+            s = pair_score(a, b)
+            if s > best_score:
+                best_score = s
+                best_pair = (a, b)
+    if best_pair:
+        return [best_pair[0], best_pair[1]]
+    return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
 
 def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 20) -> str:
