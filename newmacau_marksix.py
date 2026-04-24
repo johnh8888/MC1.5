@@ -2822,6 +2822,13 @@ def get_special_zodiac_realtime_bundle(conn: sqlite3.Connection, issue_no: str) 
         xgb_zodiac = get_zodiac_by_number(xgb_special)
         if xgb_zodiac not in special_zodiacs:
             special_zodiacs.insert(0, xgb_zodiac)
+    main6, _, _, _, _ = _weighted_consensus_pools(conn, issue_no)
+    pool_zodiacs = [get_zodiac_by_number(n) for n in main6] if main6 else []
+    for z in pool_zodiacs:
+        if z not in special_zodiacs:
+            special_zodiacs.append(z)
+        if len(special_zodiacs) >= 4:
+            break
     special_zodiacs = list(dict.fromkeys(special_zodiacs))[:4]
 
     core_numbers = sorted(
@@ -2829,10 +2836,14 @@ def get_special_zodiac_realtime_bundle(conn: sqlite3.Connection, issue_no: str) 
         key=lambda x: (-x[1], x[0])
     )[:4]
     core_numbers = [n for n, _ in core_numbers]
+    if len(core_numbers) < 4:
+        for n in main6:
+            if n not in core_numbers:
+                core_numbers.append(n)
+            if len(core_numbers) >= 4:
+                break
     core_zodiacs = [get_zodiac_by_number(n) for n in core_numbers]
 
-    main6, _, _, _, _ = _weighted_consensus_pools(conn, issue_no)
-    pool_zodiacs = [get_zodiac_by_number(n) for n in main6] if main6 else []
     pool_counter = Counter(pool_zodiacs)
 
     primary = special_zodiacs[0] if special_zodiacs else "马"
@@ -2840,8 +2851,8 @@ def get_special_zodiac_realtime_bundle(conn: sqlite3.Connection, issue_no: str) 
     return {
         "primary_special_zodiac": primary,
         "backup_special_zodiacs": backups,
-        "core_numbers": core_numbers,
-        "core_zodiacs": core_zodiacs,
+        "core_numbers": core_numbers[:4],
+        "core_zodiacs": core_zodiacs[:4],
         "pool_zodiacs": [z for z, _ in pool_counter.most_common(4)],
     }
 
