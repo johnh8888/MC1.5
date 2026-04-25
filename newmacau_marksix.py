@@ -1919,7 +1919,6 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
 
         if strategy == "pattern_mined_v1" and (cold_streak >= 2 or recent_avg < 0.6):
             shrink *= 0.48
-            protection_msgs.append(f"[保护] 规律挖掘连挂 {cold_streak} 期，权重大幅下调")
 
         weights[strategy] = max(0.08, weights[strategy] * shrink)
 
@@ -2912,20 +2911,28 @@ def get_special_cross_strategy_support(conn: sqlite3.Connection, issue_no: str) 
         if not run:
             continue
         run_id = int(run["id"])
-        seen_nums = set(get_pool_numbers_for_run(conn, run_id, 6))
-        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 10))
-        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 14))
-        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 20))
-        for n in seen_nums:
-            support[n] += 1.0
+        main6 = set(get_pool_numbers_for_run(conn, run_id, 6))
+        pool10 = set(get_pool_numbers_for_run(conn, run_id, 10))
+        pool14 = set(get_pool_numbers_for_run(conn, run_id, 14))
+        pool20 = set(get_pool_numbers_for_run(conn, run_id, 20))
+
+        # 主号层共识更重要，尤其是同时进入多个策略主号池的号码。
+        for n in main6:
+            support[n] += 1.4
+        for n in pool10:
+            support[n] += 0.8
+        for n in pool14:
+            support[n] += 0.5
+        for n in pool20:
+            support[n] += 0.3
     for n in list(support.keys()):
         cnt = int(support[n])
         if cnt >= 4:
-            support[n] = 2.4
+            support[n] = 3.2
         elif cnt >= 3:
-            support[n] = 1.7
+            support[n] = 2.2
         elif cnt >= 2:
-            support[n] = 1.0
+            support[n] = 1.4
         else:
             support[n] = 0.0
     return support
@@ -2951,14 +2958,15 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
     for n in top_votes:
         scores[int(n)] = scores.get(int(n), 0.0) + 1.0
     for n, bonus in cross_support.items():
-        scores[n] = scores.get(n, 0.0) + bonus
+        # 让“多策略主号共识号”更容易被抬升到特别号候选前列。
+        scores[n] = scores.get(n, 0.0) + bonus * 1.6
     for n in list(scores.keys()):
         if xgb_special is not None and n == xgb_special:
             scores[n] += 1.6
         if n in recent_special_counter:
             scores[n] -= 0.9
         if n in mains:
-            scores[n] -= 1.1
+            scores[n] -= 0.7
 
     # 确保冷号回补候选也能进最终竞争
     cold_boost = {n: 0.0 for n in ALL_NUMBERS}
@@ -3537,6 +3545,10 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
+        # 方案B：回测前先在线拉取最近开奖并增量同步到本地，再在本地做回测。
+        records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries)
+        total, inserted, updated = sync_from_records(conn, records, source="macau_api")
+        print(f"[backtest] online sync done. total={total}, inserted={inserted}, updated={updated}", flush=True)
         mined_cfg = ensure_mined_pattern_config(conn, force=args.remine)
         issues, runs = run_historical_backtest(
             conn,
