@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
 import argparse
 import csv
 import io
@@ -2748,6 +2747,8 @@ def predict_special_number_xgb(conn: sqlite3.Connection, issue_no: str) -> Optio
 def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 3) -> List[int]:
     strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
     weighted_votes: Dict[int, float] = {}
+    cross_strategy_support: Dict[int, int] = {}
+
     for strategy in STRATEGY_IDS:
         run = conn.execute(
             "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
@@ -2755,13 +2756,31 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
         ).fetchone()
         if not run:
             continue
-        _, sp = get_picks_for_run(conn, run["id"])
-        if sp is None:
-            continue
-        w = float(strategy_weights.get(strategy, 1.0 / max(len(STRATEGY_IDS), 1)))
-        weighted_votes[int(sp)] = weighted_votes.get(int(sp), 0.0) + w
-    if not weighted_votes:
+        run_id = int(run["id"])
+        _, sp = get_picks_for_run(conn, run_id)
+        if sp is not None:
+            w = float(strategy_weights.get(strategy, 1.0 / max(len(STRATEGY_IDS), 1)))
+            weighted_votes[int(sp)] = weighted_votes.get(int(sp), 0.0) + w
+
+        # 跨策略重复出现加分：如果一个号码同时出现在多个策略池里，特别号候选权重提高。
+        seen_nums = set(get_pool_numbers_for_run(conn, run_id, 6))
+        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 10))
+        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 14))
+        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 20))
+        for n in seen_nums:
+            cross_strategy_support[n] = cross_strategy_support.get(n, 0) + 1
+
+    if not weighted_votes and not cross_strategy_support:
         return []
+
+    for n, cnt in cross_strategy_support.items():
+        if cnt >= 2:
+            weighted_votes[n] = weighted_votes.get(n, 0.0) + 0.45 * (cnt - 1)
+        if cnt >= 3:
+            weighted_votes[n] += 0.40
+        if cnt >= 4:
+            weighted_votes[n] += 0.55
+
     sorted_items = sorted(weighted_votes.items(), key=lambda x: (-x[1], x[0]))
     return [num for num, _ in sorted_items[:top_n]]
 
@@ -2882,36 +2901,103 @@ def _special_zodiac_number_support(conn: sqlite3.Connection, issue_no: str) -> D
     return number_support
 
 
-def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int]) -> Tuple[Optional[int], List[int], bool]:
-    top_votes = get_top_special_votes(conn, issue_no, top_n=8)
+def get_special_cross_strategy_support(conn: sqlite3.Connection, issue_no: str) -> Dict[int, float]:
+    """统计号码在多个策略池中的重复出现，作为特别号额外加分信号。"""
+    support: Dict[int, float] = {n: 0.0 for n in ALL_NUMBERS}
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strategy),
+        ).fetchone()
+        if not run:
+            continue
+        run_id = int(run["id"])
+        seen_nums = set(get_pool_numbers_for_run(conn, run_id, 6))
+        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 10))
+        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 14))
+        seen_nums.update(get_pool_numbers_for_run(conn, run_id, 20))
+        for n in seen_nums:
+            support[n] += 1.0
+    for n in list(support.keys()):
+        cnt = int(support[n])
+        if cnt >= 4:
+            support[n] = 2.4
+        elif cnt >= 3:
+            support[n] = 1.7
+        elif cnt >= 2:
+            support[n] = 1.0
+        else:
+            support[n] = 0.0
+    return support
+
+
+def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int]) -> Tuple[Optional[int], List[int], bool, List[int]]:
+    top_votes = get_top_special_votes(conn, issue_no, top_n=12)
     if not top_votes:
-        return None, [], False
+        return None, [], False, []
+
     mains = {int(n) for n in main6}
     recent_3_specials = [int(r["special_number"]) for r in conn.execute(
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3"
     ).fetchall()]
-    primary = None
+
+    # 额外评分：跨策略重复出现、生肖链、XGB、冷号回补加权；主号冲突改为惩罚而非直接剔除。
+    cross_support = get_special_cross_strategy_support(conn, issue_no)
+    zodiac_support = _special_zodiac_support(conn, issue_no)
+    xgb_special = predict_special_number_xgb(conn, issue_no)
+
+    recent_special_counter = Counter(recent_3_specials)
+    scores: Dict[int, float] = {}
     for n in top_votes:
-        n_int = int(n)
-        if n_int not in mains and n_int not in recent_3_specials:
-            primary = n_int
-            break
-    if primary is None:
-        primary = int(top_votes[0])
+        scores[int(n)] = scores.get(int(n), 0.0) + 1.0
+    for n, bonus in cross_support.items():
+        scores[n] = scores.get(n, 0.0) + bonus
+    for n in list(scores.keys()):
+        z = get_zodiac_by_number(n)
+        scores[n] += float(zodiac_support.get(z, 0.0)) * 0.7
+        if xgb_special is not None and n == xgb_special:
+            scores[n] += 1.6
+        if n in recent_special_counter:
+            scores[n] -= 0.9
+        if n in mains:
+            scores[n] -= 1.1
+
+    # 确保冷号回补候选也能进最终竞争
+    cold_boost = {n: 0.0 for n in ALL_NUMBERS}
+    recent_specials = [int(r["special_number"]) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 60"
+    ).fetchall()]
+    omission = {n: 60 for n in ALL_NUMBERS}
+    for idx, n in enumerate(recent_specials):
+        omission[n] = min(omission.get(n, 60), idx + 1)
+    for n in ALL_NUMBERS:
+        if omission.get(n, 60) >= 12:
+            cold_boost[n] = min(2.2, (omission[n] - 10) / 10.0)
+        elif omission.get(n, 60) >= 8:
+            cold_boost[n] = 0.8
+    for n in cold_boost:
+        if cold_boost[n] > 0:
+            scores[n] = scores.get(n, 0.0) + cold_boost[n] * 0.8
+
+    if not scores:
+        return None, [], False, []
+
+    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+    primary = ranked[0][0]
     conflict = primary in mains
-    defenses = []
-    for n in top_votes:
-        n_int = int(n)
-        if n_int == primary or n_int in defenses:
+
+    defenses: List[int] = []
+    for n, _ in ranked[1:]:
+        if n == primary or n in defenses:
             continue
-        if n_int in mains:
+        if n in recent_3_specials:
             continue
-        if n_int in recent_3_specials:
-            continue
-        defenses.append(n_int)
+        defenses.append(n)
         if len(defenses) >= 3:
             break
-    return primary, defenses, conflict
+
+    top3 = [n for n, _ in ranked[:3]]
+    return primary, defenses[:3], conflict, top3
 
 
 def get_strong_special_from_strategies(
@@ -3085,9 +3171,10 @@ def get_final_recommendation(conn: sqlite3.Connection):
     main6, pool10, pool14, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if not main6 or not pool10 or not pool14 or not pool20:
         return None
-    special, special_defenses, special_conflict = get_special_recommendation(conn, issue_no, main6)
+    special, special_defenses, special_conflict, special_top3 = get_special_recommendation(conn, issue_no, main6)
     if special is None:
         return None
+    special_top3 = get_top_special_votes(conn, issue_no, top_n=3)
     strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = get_strong_special_from_strategies(
         conn, issue_no, main6
     )
@@ -3112,6 +3199,7 @@ def get_final_recommendation(conn: sqlite3.Connection):
         strategy_special_zodiacs,
         strategy_strong_special,
         strategy_strong_zodiac,
+        special_top3,
     )
 
 
@@ -3120,7 +3208,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
+    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac, special_top3 = rec
     special_text = _fmt_num(special)
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
@@ -3154,11 +3242,14 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     strategy_zodiac_text = "、".join(strategy_special_zodiacs) if strategy_special_zodiacs else "无"
     strong_special_text = _fmt_num(strategy_strong_special) if strategy_strong_special is not None else "无"
     strong_zodiac_text = strategy_strong_zodiac if strategy_strong_zodiac else "无"
+    special_top3_text = " ".join(_fmt_num(n) for n in special_top3) if special_top3 else "无"
 
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
     print(f"策略说明: 主号采用「多策略加权共识」(基于最近{FEATURE_WINDOW_DEFAULT}期特征 + 近{WEIGHT_WINDOW_DEFAULT}期动态权重)，特别号采用「加权投票」")
+    special_top3_text = " ".join(_fmt_num(n) for n in special_top3) if special_top3 else "无"
     print(f"特别号建议: 主推 {special_text} | 防守 {defense_text}")
+    print(f"特别号Top3: {special_top3_text}")
     print(f"六策略特别号组: {strategy_special_text}")
     print(f"六策略生肖组: {strategy_zodiac_text}")
     print(f"六策略极强号: {strong_special_text} ({strong_zodiac_text})")
@@ -3308,7 +3399,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
-            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
+            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac, special_top3 = rec
+            special_top3_text = " ".join(_fmt_num(n) for n in special_top3) if special_top3 else "无"
             special_text = _fmt_num(special)
             trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
             defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
