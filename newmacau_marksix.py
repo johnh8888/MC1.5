@@ -2787,17 +2787,18 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
 
 def _special_zodiac_support(conn: sqlite3.Connection, issue_no: str) -> Dict[str, float]:
     support: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    # 生肖不再反向驱动特别号；这里只保留特别号自身的影子。
     top_votes = get_top_special_votes(conn, issue_no, top_n=6)
     for sp in top_votes:
-        support[get_zodiac_by_number(sp)] += 1.5
+        support[get_zodiac_by_number(sp)] += 0.4
     xgb_special = predict_special_number_xgb(conn, issue_no)
     if xgb_special is not None:
-        support[get_zodiac_by_number(xgb_special)] += 2.0
+        support[get_zodiac_by_number(xgb_special)] += 0.6
     specials, zodiac_list, strong_special, strong_zodiac = get_strong_special_from_strategies(conn, issue_no, [])
     for z in zodiac_list:
-        support[z] += 0.6
+        support[z] += 0.1
     if strong_zodiac:
-        support[strong_zodiac] += 1.0
+        support[strong_zodiac] += 0.2
     return support
 
 
@@ -2841,14 +2842,13 @@ def get_special_zodiac_realtime_bundle(conn: sqlite3.Connection, issue_no: str) 
         xgb_zodiac = get_zodiac_by_number(xgb_special)
         if xgb_zodiac not in special_zodiacs:
             special_zodiacs.insert(0, xgb_zodiac)
+    special_zodiacs = list(dict.fromkeys(special_zodiacs))[:4]
+
+    # 生肖必须从特别号反推，而不是拿主号生肖去影响特别号。
     main6, _, _, _, _ = _weighted_consensus_pools(conn, issue_no)
     pool_zodiacs = [get_zodiac_by_number(n) for n in main6] if main6 else []
-    for z in pool_zodiacs:
-        if z not in special_zodiacs:
-            special_zodiacs.append(z)
-        if len(special_zodiacs) >= 4:
-            break
-    special_zodiacs = list(dict.fromkeys(special_zodiacs))[:4]
+    if pool_zodiacs and not special_zodiacs:
+        special_zodiacs = list(dict.fromkeys(pool_zodiacs[:4]))
 
     core_numbers = sorted(
         _special_chain_core_number_boost(conn, issue_no).items(),
@@ -2941,7 +2941,7 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3"
     ).fetchall()]
 
-    # 额外评分：跨策略重复出现、生肖链、XGB、冷号回补加权；主号冲突改为惩罚而非直接剔除。
+    # 额外评分：跨策略重复出现、XGB、冷号回补加权；主号冲突改为惩罚而非直接剔除。
     cross_support = get_special_cross_strategy_support(conn, issue_no)
     zodiac_support = _special_zodiac_support(conn, issue_no)
     xgb_special = predict_special_number_xgb(conn, issue_no)
@@ -2953,8 +2953,6 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
     for n, bonus in cross_support.items():
         scores[n] = scores.get(n, 0.0) + bonus
     for n in list(scores.keys()):
-        z = get_zodiac_by_number(n)
-        scores[n] += float(zodiac_support.get(z, 0.0)) * 0.7
         if xgb_special is not None and n == xgb_special:
             scores[n] += 1.6
         if n in recent_special_counter:
