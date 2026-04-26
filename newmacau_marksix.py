@@ -1108,31 +1108,31 @@ def _generate_special_number_v4(
         if prev_special is not None:
             diff = abs(n - prev_special)
             if diff == 1:
-                score += 7.5
+                score += 8.8
             elif diff == 2:
-                score += 5.6
+                score += 6.6
             elif diff == 3:
-                score += 3.2
+                score += 3.8
             if diff == 0:
                 score -= 3.5
 
         if n in near_miss_boosts:
             if any(abs(n - x) == 1 for x in near_miss_boosts):
-                score += 4.0
+                score += 7.2
             elif any(abs(n - x) == 2 for x in near_miss_boosts):
-                score += 2.8
+                score += 5.0
 
         if n in recent_hit_neighbors:
             if any(abs(n - x) == 1 for x in recent_hit_neighbors):
-                score += 2.8
+                score += 5.6
             elif any(abs(n - x) == 2 for x in recent_hit_neighbors):
-                score += 1.9
+                score += 3.8
 
         if n % 10 == coldest_tail:
             score += 3.6
 
         if get_zodiac_by_number(n) in missing_zodiacs:
-            score += 5.0
+            score += 0.0
 
         if (main_odd_ratio > 0.65 and n % 2 == 0) or (main_odd_ratio < 0.35 and n % 2 == 1):
             score += 2.0
@@ -1903,12 +1903,20 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
             shrink *= 0.90 ** ((0.7 - recent_avg) * 8)
         if hit1_rate < 0.52:
             shrink *= 0.87
-        if cold_streak >= 3:
-            shrink *= 0.72
+        if cold_streak >= 1:
+            shrink *= 0.78
+        if cold_streak >= 2:
+            shrink *= 0.88
 
-        if strategy == "pattern_mined_v1" and (cold_streak >= 2 or recent_avg < 0.6):
+        if strategy == "pattern_mined_v1" and (cold_streak >= 1 or recent_avg < 0.6):
             shrink *= 0.48
             protection_msgs.append(f"[保护] 规律挖掘连挂 {cold_streak} 期，权重大幅下调")
+        elif strategy == "combination_v1" and (cold_streak >= 1 or recent_avg < 0.82):
+            shrink *= 0.34
+            protection_msgs.append(f"[保护] 组合策略连挂 {cold_streak} 期，进入保护模式并下调")
+        elif strategy == "hot_v1" and cold_streak >= 2:
+            shrink *= 0.70
+            protection_msgs.append(f"[保护] 热号策略连挂 {cold_streak} 期，额外下调")
 
         weights[strategy] = max(0.08, weights[strategy] * shrink)
 
@@ -2234,9 +2242,18 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
-    for z in recent_special_zodiacs:
-        zodiac_scores[z] -= 0.2
+
+    # 更偏向特别号所在生肖，增强单双生肖的“特别号导向”
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
+    zodiac_counter = Counter(recent_special_zodiacs)
+    for z, cnt in zodiac_counter.items():
+        zodiac_scores[z] += cnt * 0.8
+
+    # 最近3期不再过度惩罚，只轻微降噪
+    for z in rows[:3]:
+        recent_z = get_zodiac_by_number(int(z["special_number"]))
+        zodiac_scores[recent_z] -= 0.08
+
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
@@ -2250,15 +2267,16 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
     zodiac_counter = Counter(recent_zodiacs)
     if zodiac_counter:
-        coldest = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
-        zodiac_scores[coldest] += 4.0
+        # 单生肖更偏向“最近特别号最多出现的生肖”
+        hottest = max(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
+        zodiac_scores[hottest] += 3.0
 
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
-        zodiac_scores[z] -= 0.4
+        zodiac_scores[z] -= 0.12
 
     for z in two_zodiac:
-        zodiac_scores[z] += 3.0
+        zodiac_scores[z] += 1.8
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     for candidate, _ in ranked:
@@ -2383,19 +2401,38 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
 
     def _special_distance_bias(n: int) -> float:
         score = 0.0
-        for sp in recent_12_specials:
+        recent_1_special = recent_12_specials[0] if recent_12_specials else None
+
+        # 最近一期单独强权重
+        if recent_1_special is not None:
+            diff1 = abs(n - recent_1_special)
+            if diff1 == 1:
+                score += 6.5
+            elif diff1 == 2:
+                score += 4.6
+            elif diff1 == 3:
+                score += 2.2
+
+        # 最近12期累计邻近
+        for sp in recent_12_specials[1:]:
             diff = abs(n - sp)
             if diff == 1:
-                score += 2.4
+                score += 3.2
             elif diff == 2:
-                score += 1.7
+                score += 2.4
             elif diff == 3:
-                score += 1.0
+                score += 1.2
+
+        # 最近8期扩散邻近
         for sp in recent_8_specials[:5]:
+            if abs(n - sp) == 1:
+                score += 1.4
+            elif abs(n - sp) == 2:
+                score += 0.9
             if (n - 1) // 10 == (sp - 1) // 10:
-                score += 0.8
+                score += 0.2
             if n % 10 == sp % 10:
-                score += 0.6
+                score += 0.1
         return score
 
     vote_scores = Counter(top_votes)
@@ -2409,13 +2446,10 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
         if recent_12_specials:
             recent_special_tail = recent_12_specials[0] % 10
             recent_special_zone = (recent_12_specials[0] - 1) // 10
-            recent_special_zodiac = get_zodiac_by_number(recent_12_specials[0])
             if n % 10 == recent_special_tail:
-                score += 1.4
+                score += 0.3
             if (n - 1) // 10 == recent_special_zone:
-                score += 1.1
-            if get_zodiac_by_number(n) == recent_special_zodiac:
-                score += 1.8
+                score += 0.2
         if n in recent_3_specials:
             score *= 0.30
         combined.append((n, score))
@@ -2504,6 +2538,82 @@ def get_strong_special_from_strategies(
     if best is None:
         return specials, zodiac_list, None, None
     return specials, zodiac_list, best, get_zodiac_by_number(best)
+
+
+def get_special_rule_contribution_report(conn: sqlite3.Connection, lookback: int = 60) -> str:
+    rows = _draws_ordered_asc(conn)
+    if len(rows) <= 1:
+        return "特别号规则贡献回测：数据不足"
+
+    start = max(1, len(rows) - lookback)
+    stats = {
+        "neighbor_1": {"hits": 0, "samples": 0},
+        "neighbor_2": {"hits": 0, "samples": 0},
+        "tail": {"hits": 0, "samples": 0},
+        "zone": {"hits": 0, "samples": 0},
+        "zodiac": {"hits": 0, "samples": 0},
+        "omit20": {"hits": 0, "samples": 0},
+    }
+
+    for i in range(start, len(rows)):
+        history = rows[max(0, i - 12):i]
+        if len(history) < 3:
+            continue
+        current = rows[i]
+        prev_specials = [int(r["special_number"]) for r in rows[max(0, i - 12):i]]
+        prev_special = prev_specials[0] if prev_specials else None
+        actual_special = int(current["special_number"])
+        tail = prev_special % 10 if prev_special is not None else None
+        zone = (prev_special - 1) // 10 if prev_special is not None else None
+        zodiac = get_zodiac_by_number(prev_special) if prev_special is not None else None
+
+        omission = {n: 80 for n in ALL_NUMBERS}
+        for idx, n in enumerate(prev_specials):
+            omission[n] = min(omission.get(n, 80), idx + 1)
+        omit20_best = max(omission.items(), key=lambda x: x[1])[0]
+
+        neighbor_1 = {n for sp in prev_specials[:12] for n in (sp - 1, sp + 1) if 1 <= n <= 49}
+        neighbor_2 = {n for sp in prev_specials[:12] for n in (sp - 2, sp + 2) if 1 <= n <= 49}
+
+        stats["neighbor_1"]["samples"] += 1
+        stats["neighbor_1"]["hits"] += 1 if actual_special in neighbor_1 else 0
+        stats["neighbor_2"]["samples"] += 1
+        stats["neighbor_2"]["hits"] += 1 if actual_special in neighbor_2 else 0
+        if tail is not None:
+            stats["tail"]["samples"] += 1
+            stats["tail"]["hits"] += 1 if actual_special % 10 == tail else 0
+        if zone is not None:
+            stats["zone"]["samples"] += 1
+            stats["zone"]["hits"] += 1 if (actual_special - 1) // 10 == zone else 0
+        if zodiac is not None:
+            stats["zodiac"]["samples"] += 1
+            stats["zodiac"]["hits"] += 1 if get_zodiac_by_number(actual_special) == zodiac else 0
+        stats["omit20"]["samples"] += 1
+        stats["omit20"]["hits"] += 1 if actual_special == omit20_best else 0
+
+    def fmt(name: str) -> str:
+        s = stats[name]
+        rate = (s["hits"] / s["samples"] * 100.0) if s["samples"] else 0.0
+        return f"{name}: 样本={s['samples']} 命中={s['hits']} 命中率={rate:.2f}%"
+
+    return "\n".join([
+        f"特别号规则贡献回测（最近{lookback}期）:",
+        f"  - {fmt('neighbor_1')}",
+        f"  - {fmt('neighbor_2')}",
+        f"  - {fmt('tail')}",
+        f"  - {fmt('zone')}",
+        f"  - {fmt('zodiac')}",
+        f"  - {fmt('omit20')}",
+    ])
+
+
+def get_special_rule_contribution_report_multi(conn: sqlite3.Connection) -> str:
+    parts = [
+        get_special_rule_contribution_report(conn, lookback=20),
+        get_special_rule_contribution_report(conn, lookback=60),
+        get_special_rule_contribution_report(conn, lookback=100),
+    ]
+    return "\n\n".join(parts)
 
 
 def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[List[int], List[int], List[int], List[int], Optional[int]]:
@@ -2769,6 +2879,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     print_final_recommendation(conn)
 
     print("\n" + review_latest_prediction(conn))
+    print("\n" + get_special_rule_contribution_report_multi(conn))
 
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
