@@ -1375,9 +1375,9 @@ def generate_strategy(
 # ===================== 全自动参数调优系统 =====================
 def tune_special_params(
     conn: sqlite3.Connection,
-    eval_issues: int = 50,
+    eval_issues: int = 80,
     min_history: int = 80,
-    max_combos: int = 40
+    max_combos: int = 100
 ) -> Dict[str, float]:
     rows = _draws_ordered_asc(conn)
     total = len(rows)
@@ -1450,8 +1450,8 @@ def ensure_optimal_params(
         return {"alpha": 3.0, "long_window": 120,
                 "w_omit": 2.0, "w_assoc": 2.6, "w_freq": 0.45, "w_mom": 0.25}
 
-    print("🚀 每期完整参数优化启动（预计 20‑40 秒）...")
-    best = tune_special_params(conn, eval_issues=50, max_combos=50)
+    print("🚀 每期完整参数优化启动（命中率优先模式）...")
+    best = tune_special_params(conn, eval_issues=80, max_combos=100)
     set_model_state(conn, CACHE_KEY, json.dumps(best))
     conn.commit()
     return best
