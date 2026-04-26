@@ -2235,36 +2235,61 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
         return ["马", "蛇"]
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
 
-    # 强制引入最近特别号生肖
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
+    # 双生肖主轴：1 热 + 1 保护，进一步缩短窗口
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     zodiac_counter = Counter(recent_special_zodiacs)
+    special_hot = None
     if zodiac_counter:
         special_hot = max(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
-        zodiac_scores[special_hot] += 5.0
+        zodiac_scores[special_hot] += 12.0
     for z, cnt in zodiac_counter.items():
-        zodiac_scores[z] += cnt * 0.45
+        zodiac_scores[z] += cnt * 1.0
 
-    # 强制引入最近主号出现最多的生肖
+    # 保护生肖优先选择：最近遗漏最高的生肖，且尽量与热生肖不同
+    omission_zodiac: Dict[str, int] = {z: 0 for z in ZODIAC_MAP.keys()}
+    for idx, r in enumerate(rows[:5]):
+        oz = get_zodiac_by_number(int(r["special_number"]))
+        omission_zodiac[oz] = max(omission_zodiac.get(oz, 0), 5 - idx)
+    protect_zodiac = None
+    for z, _ in sorted(omission_zodiac.items(), key=lambda x: (-x[1], x[0])):
+        if z != special_hot:
+            protect_zodiac = z
+            break
+    if protect_zodiac is not None:
+        zodiac_scores[protect_zodiac] += 5.0
+
+    # 主号只做极弱补充
     main_zodiacs = []
-    for r in rows[:8]:
+    for r in rows[:3]:
         main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
     main_counter = Counter(main_zodiacs)
     if main_counter:
         main_hot = max(main_counter.keys(), key=lambda z: main_counter[z])
-        zodiac_scores[main_hot] += 4.0
+        zodiac_scores[main_hot] += 0.2
 
-    # 强制引入最近5~8期高频生肖
+    # 最近 4 期高频生肖少量辅助
     for z, cnt in Counter(main_zodiacs + recent_special_zodiacs).items():
-        if cnt >= 3:
-            zodiac_scores[z] += 1.2
+        if cnt >= 2:
+            zodiac_scores[z] += 0.3
 
-    # 连空触发保护：最近3期轻微降噪，但避免过度削弱主热生肖
-    recent_noise = {get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]}
+    # 连空触发保护：近 2 期重复生肖极轻微降噪
+    recent_noise = {get_zodiac_by_number(int(r["special_number"])) for r in rows[:2]}
     for z in recent_noise:
-        zodiac_scores[z] -= 0.05
+        zodiac_scores[z] -= 0.005
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
+
+    # 防守切换：如果近 3 期特别号生肖高度重复，则优先把第二只换成遗漏更高的生肖
+    if len(ranked) >= 2:
+        top1 = ranked[0][0]
+        top2 = ranked[1][0]
+        if len(recent_special_zodiacs) >= 3 and len(set(recent_special_zodiacs[:3])) <= 2:
+            for z, _ in sorted(omission_zodiac.items(), key=lambda x: (-x[1], x[0])):
+                if z != top1 and z != top2:
+                    top2 = z
+                    break
+        return [top1, top2]
+    return ["马", "蛇"]
 
 
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
@@ -2274,26 +2299,31 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.12)
 
-    # 单生肖：更偏向最近特别号生肖，但避免完全被主号拉散
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:6]]
+    # 单生肖：跟随双生肖里更热的那个方向，减少分散
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     zodiac_counter = Counter(recent_special_zodiacs)
     if zodiac_counter:
         hottest = max(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
-        zodiac_scores[hottest] += 5.0
+        zodiac_scores[hottest] += 12.0
     for z, cnt in zodiac_counter.items():
-        zodiac_scores[z] += cnt * 0.25
+        zodiac_scores[z] += cnt * 0.7
 
-    # 连空触发保护：如果近段空窗太长，强化特别号热生肖与主热生肖
+    # 连空触发保护：近段空窗太长时再轻微补主热生肖
     main_zodiacs = []
-    for r in rows[:6]:
+    for r in rows[:3]:
         main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
     main_counter = Counter(main_zodiacs)
     if main_counter:
         main_hot = max(main_counter.keys(), key=lambda z: main_counter[z])
-        zodiac_scores[main_hot] += 1.8
+        zodiac_scores[main_hot] += 0.15
 
     for z in two_zodiac:
-        zodiac_scores[z] += 1.1
+        zodiac_scores[z] += 0.02
+
+    # 单生肖跟随双生肖的主热方向，但若最近特别号已重复，则更偏向补位生肖
+    if len(recent_special_zodiacs) >= 3 and len(set(recent_special_zodiacs[:3])) <= 2:
+        for z in two_zodiac:
+            zodiac_scores[z] += 0.25
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return ranked[0][0]
@@ -2536,21 +2566,59 @@ def get_strong_special_from_strategies(
         recent_main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(row["numbers_json"]))
     recent_zodiac_counter = Counter(recent_special_zodiacs + recent_main_zodiacs)
 
+    # 四生肖特别号模型：2热 + 1冷 + 1保护
+    model_score: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    for z, cnt in zodiac_counter.items():
+        model_score[z] += cnt * 3.2
+    for z, cnt in recent_zodiac_counter.items():
+        model_score[z] += cnt * 0.3
+
+    # 最近特别号热生肖
+    hot_special = [z for z, _ in Counter(recent_special_zodiacs).most_common(2)]
+    for z in hot_special:
+        model_score[z] += 3.2
+
+    # 最近特别号遗漏生肖
+    omission_zodiac: Dict[str, int] = {z: 0 for z in ZODIAC_MAP.keys()}
+    for idx, sp in enumerate(recent_specials):
+        oz = get_zodiac_by_number(sp)
+        omission_zodiac[oz] = max(omission_zodiac.get(oz, 0), 30 - idx)
+    cold_zodiacs = [z for z, _ in sorted(omission_zodiac.items(), key=lambda x: (-x[1], x[0]))[:1]]
+    for z in cold_zodiacs:
+        model_score[z] += 3.0
+
+    # 连空保护：如果有生肖近5期没覆盖到，则额外加权
+    for z in ZODIAC_MAP.keys():
+        if omission_zodiac.get(z, 0) >= 5:
+            model_score[z] += 2.2
+
+    ranked_zodiacs = sorted(model_score.items(), key=lambda x: (-x[1], x[0]))
+    top_zodiacs = [z for z, _ in ranked_zodiacs[:2]]
+    if len(top_zodiacs) < 2:
+        for z, _ in ranked_zodiacs:
+            if z not in top_zodiacs:
+                top_zodiacs.append(z)
+            if len(top_zodiacs) == 2:
+                break
+
+    # 生肖优先的特别号挑选
     mains = {int(x) for x in main6}
     candidate_scores: Dict[int, float] = {}
     for n in sorted(set(specials)):
         zodiac = get_zodiac_by_number(n)
+        if zodiac not in top_zodiacs:
+            continue
         score = 0.0
-        score += number_votes.get(n, 0) * 2.2
-        score += weighted_scores.get(n, 0.0) * 2.0
-        score += zodiac_counter.get(zodiac, 0) * 1.1
-        score += recent_zodiac_counter.get(zodiac, 0) * 0.35
-        score += min(1.5, float(omission.get(n, 31)) / 22.0)
+        score += number_votes.get(n, 0) * 2.4
+        score += weighted_scores.get(n, 0.0) * 1.6
+        score += zodiac_counter.get(zodiac, 0) * 1.0
+        score += min(1.2, float(omission.get(n, 31)) / 24.0)
         if n in mains:
-            score -= 1.0
-        # 连空保护：若该生肖近8期未被六策略覆盖，则额外加权
-        if recent_zodiac_counter.get(zodiac, 0) == 0:
+            score -= 0.8
+        if zodiac in hot_special:
             score += 0.9
+        if zodiac in cold_zodiacs:
+            score += 0.6
         candidate_scores[n] = score
 
     ranked = sorted(candidate_scores.items(), key=lambda x: (-x[1], x[0]))
@@ -2562,8 +2630,8 @@ def get_strong_special_from_strategies(
     if best is None and ranked:
         best = ranked[0][0]
     if best is None:
-        return specials, zodiac_list, None, None
-    return specials, zodiac_list, best, get_zodiac_by_number(best)
+        return specials, top_zodiacs, None, None
+    return specials, top_zodiacs, best, get_zodiac_by_number(best)
 
 
 def get_special_rule_contribution_report(conn: sqlite3.Connection, lookback: int = 60) -> str:
@@ -2763,11 +2831,6 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
 
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"策略说明: 主号采用「多策略加权共识」(基于最近{FEATURE_WINDOW_DEFAULT}期特征 + 近{WEIGHT_WINDOW_DEFAULT}期动态权重)，特别号采用「加权投票」")
-    print(f"  6号池 : {p6} | 特别号: {special_text}")
-    print(f"  10号池: {p10} | 特别号: {special_text}")
-    print(f"  14号池: {p14} | 特别号: {special_text}")
-    print(f"  20号池: {p20} | 特别号: {special_text}")
     print(f"特别号建议: 主推 {special_text} | 防守 {defense_text}")
     print(f"六策略特别号组: {strategy_special_text}")
     print(f"六策略生肖组: {strategy_zodiac_text}")
