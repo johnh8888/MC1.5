@@ -1,17 +1,17 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import csv
 import io
 import json
-import math
 import os
-import random
 import re
 import socket
 import sqlite3
-import sys
 import time
 from urllib.error import URLError
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +22,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
 CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
 
+# 澳门数据源（使用 marksix6.net API 中的“新澳门彩”）
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 API_TIMEOUT_DEFAULT = 20
 API_RETRIES_DEFAULT = 4
@@ -30,7 +31,9 @@ API_RETRY_BACKOFF_SECONDS = 2.0
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 
+# ==================== 【优化后常量】 ====================
 FEATURE_WINDOW_DEFAULT = 10
+
 STRATEGY_BASE_WINDOWS = {
     "hot_v1": 6,
     "momentum_v1": 7,
@@ -39,10 +42,15 @@ STRATEGY_BASE_WINDOWS = {
     "pattern_mined_v1": 6,
     "ensemble_v2": 10,
 }
+
 WEIGHT_WINDOW_DEFAULT = 30
 HEALTH_WINDOW_DEFAULT = 18
 BACKTEST_ISSUES_DEFAULT = 120
+
+# Ensemble v3.1 配置
 ENSEMBLE_DIVERSITY_BONUS = 0.18
+
+# 偏态检测阈值（已调整）
 BIAS_THRESHOLD = 0.65
 BIAS_ADJUSTMENT = 0.40
 FORCED_BIAS_COEFFICIENT = 0.75
@@ -57,6 +65,8 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1"]
+
+# 生肖映射（正确版本：1=马，2=蛇，3=龙，4=兔，5=虎，6=牛，7=鼠，8=猪，9=狗，10=鸡，11=猴，12=羊）
 ZODIAC_MAP = {
     "马": [1, 13, 25, 37, 49],
     "蛇": [2, 14, 26, 38],
@@ -72,12 +82,11 @@ ZODIAC_MAP = {
     "羊": [12, 24, 36, 48],
 }
 
+# PushPlus 配置
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+_WEIGHT_PROTECTION_PRINTED: set[str] = set()
+_PROTECTION_PRINT_COUNTER = 0
 
 
 @dataclass
@@ -490,6 +499,18 @@ def fetch_macau_records(
     )
 
 
+def fetch_macau_recent_records(
+    limit: int = 120,
+    timeout: int = API_TIMEOUT_DEFAULT,
+    retries: int = API_RETRIES_DEFAULT,
+    backoff_seconds: float = API_RETRY_BACKOFF_SECONDS,
+) -> List[DrawRecord]:
+    records = fetch_macau_records(timeout=timeout, retries=retries, backoff_seconds=backoff_seconds)
+    if limit > 0:
+        records = records[-int(limit):]
+    return records
+
+
 def upsert_draw(conn: sqlite3.Connection, record: DrawRecord, source: str) -> str:
     now = utc_now()
     existing = conn.execute("SELECT issue_no FROM draws WHERE issue_no = ?", (record.issue_no,)).fetchone()
@@ -678,6 +699,22 @@ def _zone_heat_map(draws: List[List[int]], window: int = 3) -> Dict[int, float]:
     return {n: zone_score[min(4, (n - 1) // 10)] for n in ALL_NUMBERS}
 
 
+def _adjacency_compensation_map(draws: List[List[int]], window: int = 5) -> Dict[int, float]:
+    """基于最近开奖的邻近补偿：强化与历史开奖号相差1/2的号码"""
+    adjacency = {n: 0.0 for n in ALL_NUMBERS}
+    w = draws[:window]
+    if not w:
+        return adjacency
+    for idx, draw in enumerate(w):
+        recency_w = 1.0 / (1.0 + idx * 0.35)
+        for base in draw:
+            for delta, bonus in ((1, 1.6), (2, 1.0), (3, 0.5)):
+                for candidate in (base - delta, base + delta):
+                    if 1 <= candidate <= 49:
+                        adjacency[candidate] += bonus * recency_w
+    return adjacency
+
+
 def _pick_top_six(scores: Dict[int, float], reason: str) -> List[Tuple[int, int, float, str]]:
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     picked: List[Tuple[int, float]] = []
@@ -728,10 +765,11 @@ def _default_mined_config() -> Dict[str, float]:
     return {
         "window": 6.0,
         "w_freq": 0.30,
-        "w_omit": 0.50,
-        "w_mom": 0.20,
+        "w_omit": 0.45,
+        "w_mom": 0.15,
         "w_pair": 0.00,
         "w_zone": 0.10,
+        "w_adj": 0.10,
         "special_bonus": 0.10,
     }
 
@@ -767,6 +805,7 @@ def _candidate_mined_configs() -> List[Dict[str, float]]:
                         "w_mom": wm,
                         "w_pair": wp,
                         "w_zone": wz,
+                        "w_adj": 0.10,
                         "special_bonus": 0.10,
                     }
                 )
@@ -785,12 +824,14 @@ def _apply_weight_config(
     momentum = _normalize(_momentum_map(window))
     pair = _normalize(_pair_affinity_map(window, window=min(3, len(window))))
     zone = _normalize(_zone_heat_map(window, window=min(3, len(window))))
+    adjacency = _normalize(_adjacency_compensation_map(window, window=min(5, len(window))))
 
-    w_freq = float(config.get("w_freq", 0.45))
-    w_omit = float(config.get("w_omit", 0.35))
-    w_mom = float(config.get("w_mom", 0.20))
+    w_freq = float(config.get("w_freq", 0.40))
+    w_omit = float(config.get("w_omit", 0.28))
+    w_mom = float(config.get("w_mom", 0.16))
     w_pair = float(config.get("w_pair", 0.00))
-    w_zone = float(config.get("w_zone", 0.00))
+    w_zone = float(config.get("w_zone", 0.06))
+    w_adj = float(config.get("w_adj", 0.10))
 
     scores: Dict[int, float] = {}
     for n in ALL_NUMBERS:
@@ -800,6 +841,7 @@ def _apply_weight_config(
             + momentum[n] * w_mom
             + pair[n] * w_pair
             + zone[n] * w_zone
+            + adjacency[n] * w_adj
         )
 
     main_picks = _pick_top_six(scores, reason)
@@ -940,6 +982,7 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     recent_avg = float(h.get("recent_avg_hit", 0.65))
     cold_streak = int(h.get("cold_streak", 0))
 
+    # 冷号回补特殊处理：统计长期遗漏号码数量
     if strategy == "cold_rebound_v1":
         rows = conn.execute(
             "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 60"
@@ -949,8 +992,8 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
             all_nums.extend(json.loads(r["numbers_json"]))
         freq = Counter(all_nums)
         cold_count = sum(1 for n in ALL_NUMBERS if freq.get(n, 0) == 0)
-        if cold_count >= 5:
-            return min(20, base + 8)
+        if cold_count >= 5:   # 遗漏≥60期的号码超过5个
+            return min(20, base + 8)   # 大幅扩大窗口
 
     if recent_avg >= 0.95:
         return max(5, base - 2)
@@ -963,7 +1006,9 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     return base
 
 
+# ========== 偏态检测函数（强制偏态模式） ==========
 def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
+    """强制偏态模式：固定偏态系数 0.75"""
     return 0.75, {
         "forced": True,
         "zone_bias": 0.75,
@@ -988,97 +1033,13 @@ def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dic
     return adjusted
 
 
-# ===================== Bayesian 辅助函数 =====================
-def _build_omission_cond_counts(conn, window=120, alpha=3.0):
-    rows = conn.execute(
-        "SELECT special_number FROM draws ORDER BY draw_date ASC LIMIT ?",
-        (window,)
-    ).fetchall()
-    specials = [int(r[0]) for r in rows]
-
-    last_seen = {}
-    omit_at = []
-    for i, sp in enumerate(specials[:-1]):
-        omit = i - last_seen[sp] if sp in last_seen else window
-        omit_at.append(omit)
-        last_seen[sp] = i
-
-    cond_counts = defaultdict(Counter)
-    cond_totals = defaultdict(int)
-    for i, omit in enumerate(omit_at):
-        next_sp = specials[i + 1]
-        cond_counts[omit][next_sp] += 1
-        cond_totals[omit] += 1
-
-    cum_counts = {}
-    cum_totals = {}
-    running = Counter()
-    run_total = 0
-    for k in range(window, 0, -1):
-        if k in cond_counts:
-            running += cond_counts[k]
-            run_total += cond_totals[k]
-        cum_counts[k] = Counter(running)
-        cum_totals[k] = run_total
-    cum_counts[window] = Counter(running)
-    cum_totals[window] = run_total
-    return cum_counts, cum_totals
-
-
-def _build_association_cond_counts(conn, window=120, alpha=3.0):
-    rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date ASC LIMIT ?",
-        (window,)
-    ).fetchall()
-    tail_cond = defaultdict(Counter)
-    neigh_cond = defaultdict(Counter)
-    zodiac_cond = defaultdict(Counter)
-    for r in rows[:-1]:
-        mains = json.loads(r["numbers_json"])
-        sp = int(r["special_number"])
-        for m in mains:
-            tail_cond[m % 10][sp] += 1
-            for d in [-2, -1, 1, 2]:
-                neigh_cond[(m, d)][sp] += 1
-        for z in {get_zodiac_by_number(m) for m in mains}:
-            zodiac_cond[z][sp] += 1
-    return tail_cond, neigh_cond, zodiac_cond
-
-
-def _generate_special_number_bayesian_v6(
+# ========== 特别号 v4 增强版 ==========
+def _generate_special_number_v4(
     conn: sqlite3.Connection,
     main_pool: List[int],
-    issue_no: str,
-    alpha: float = 3.0,
-    long_window: int = 120,
-    w_omit: float = 2.0,
-    w_assoc: float = 2.6,
-    w_freq: float = 0.45,
-    w_mom: float = 0.25,
+    issue_no: str
 ) -> Tuple[int, float, List[int]]:
-    draw_sig = conn.execute("SELECT COUNT(*) AS c, MAX(draw_date) AS d FROM draws").fetchone()
-    cache_key = (int(draw_sig["c"] or 0), str(draw_sig["d"] or ""), int(long_window), float(alpha))
-
-    omit_cache_key = getattr(_generate_special_number_bayesian_v6, "omit_cache_key", None)
-    if omit_cache_key != cache_key:
-        _generate_special_number_bayesian_v6.omit_cache = _build_omission_cond_counts(conn, window=long_window, alpha=alpha)
-        _generate_special_number_bayesian_v6.omit_cache_key = cache_key
-    omit_cum_counts, omit_cum_totals = _generate_special_number_bayesian_v6.omit_cache
-
-    assoc_cache_key = getattr(_generate_special_number_bayesian_v6, "assoc_cache_key", None)
-    if assoc_cache_key != cache_key:
-        _generate_special_number_bayesian_v6.assoc_cache = _build_association_cond_counts(conn, window=long_window, alpha=alpha)
-        _generate_special_number_bayesian_v6.assoc_cache_key = cache_key
-    tail_cond, neigh_cond, zodiac_cond = _generate_special_number_bayesian_v6.assoc_cache
-
-    all_specials_seq = [int(r["special_number"]) for r in conn.execute(
-        f"SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT {long_window}"
-    ).fetchall()]
-    omission_raw = {n: long_window for n in ALL_NUMBERS}
-    for idx, sp in enumerate(all_specials_seq):
-        if omission_raw[sp] == long_window:
-            omission_raw[sp] = idx + 1
-
+    """增强版 v4.6 特别号生成器 - 强化近期开奖邻近与错因修正"""
     special_votes = []
     for strategy in STRATEGY_IDS:
         run = conn.execute(
@@ -1091,81 +1052,106 @@ def _generate_special_number_bayesian_v6(
                 special_votes.append(sp)
     vote_counter = Counter(special_votes)
 
-    recent_specials = all_specials_seq[:20]
-    recent_weights = {sp: 0.0 for sp in ALL_NUMBERS}
-    for idx, sp in enumerate(recent_specials):
-        recent_weights[sp] += 1.0 / (1.0 + idx * 0.35)
-    recent_weight_total = sum(recent_weights.values()) or 1.0
+    recent_specials = [int(r["special_number"]) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 80"
+    ).fetchall()]
+    prev_special = recent_specials[0] if recent_specials else None
+
+    omission = {n: 80 for n in ALL_NUMBERS}
+    for i, num in enumerate(recent_specials):
+        omission[num] = min(omission.get(num, 80), i + 1)
+
+    tail_counter = Counter([n % 10 for n in recent_specials[:40]])
+    coldest_tail = min(tail_counter.keys(), key=lambda t: tail_counter[t]) if tail_counter else 0
 
     main_set = set(main_pool)
-    main_tails = {m % 10 for m in main_pool}
-    main_zodiacs = {get_zodiac_by_number(m) for m in main_pool}
+    main_zones = {(m - 1) // 10 for m in main_pool}
+    main_zodiacs = [get_zodiac_by_number(m) for m in main_pool]
+    missing_zodiacs = set(ZODIAC_MAP.keys()) - set(main_zodiacs)
+    main_odd_ratio = sum(1 for m in main_pool if m % 2 == 1) / 6.0
+
+    near_miss_boosts = set()
+    for row in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 12"
+    ).fetchall():
+        sp = int(row["special_number"])
+        near_miss_boosts.update({sp - 2, sp - 1, sp + 1, sp + 2})
+    near_miss_boosts = {n for n in near_miss_boosts if 1 <= n <= 49}
+
+    recent_hit_neighbors = set()
+    for row in conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 8"
+    ).fetchall():
+        nums = json.loads(row["numbers_json"])
+        for x in nums:
+            recent_hit_neighbors.update({int(x) - 1, int(x) + 1, int(x) - 2, int(x) + 2})
+        sp = int(row["special_number"])
+        recent_hit_neighbors.update({sp - 1, sp + 1, sp - 2, sp + 2})
+    recent_hit_neighbors = {n for n in recent_hit_neighbors if 1 <= n <= 49}
 
     scores = {}
     for n in ALL_NUMBERS:
         if n in main_set:
             continue
+        score = 0.0
 
-        cur_omit = min(omission_raw.get(n, long_window), long_window)
-        o_cnt = omit_cum_counts.get(cur_omit, Counter()).get(n, 0)
-        o_total = omit_cum_totals.get(cur_omit, 0)
-        ll_omit = math.log((o_cnt + alpha) / (o_total + alpha * 49) + 1e-12) if o_total > 0 else 0.0
+        score += vote_counter.get(n, 0) * 5.2
 
-        ll_tail = 0.0
-        for t in main_tails:
-            t_counter = tail_cond.get(t, Counter())
-            t_total = sum(t_counter.values())
-            if t_total > 0:
-                t_cnt = t_counter.get(n, 0)
-                ll_tail += math.log((t_cnt + alpha) / (t_total + alpha * 49) + 1e-12)
+        omit = omission.get(n, 80)
+        if omit >= 24:
+            score += ((80 - omit) / 80.0) * 7.2
+        elif omit >= 12:
+            score += ((80 - omit) / 80.0) * 4.3
+        else:
+            score += ((80 - omit) / 80.0) * 2.2
 
-        ll_neigh = 0.0
-        for m in main_pool:
-            for d in [-2, -1, 1, 2]:
-                n_counter = neigh_cond.get((m, d), Counter())
-                n_total = sum(n_counter.values())
-                if n_total > 0:
-                    nc = n_counter.get(n, 0)
-                    ll_neigh += math.log((nc + alpha) / (n_total + alpha * 49) + 1e-12)
+        if prev_special is not None:
+            diff = abs(n - prev_special)
+            if diff == 1:
+                score += 7.5
+            elif diff == 2:
+                score += 5.6
+            elif diff == 3:
+                score += 3.2
+            if diff == 0:
+                score -= 3.5
 
-        ll_zodiac = 0.0
-        for z in main_zodiacs:
-            z_counter = zodiac_cond.get(z, Counter())
-            z_total = sum(z_counter.values())
-            if z_total > 0:
-                zc = z_counter.get(n, 0)
-                ll_zodiac += math.log((zc + alpha) / (z_total + alpha * 49) + 1e-12)
+        if n in near_miss_boosts:
+            if any(abs(n - x) == 1 for x in near_miss_boosts):
+                score += 4.0
+            elif any(abs(n - x) == 2 for x in near_miss_boosts):
+                score += 2.8
 
-        ll_assoc = (ll_tail * 1.5 + ll_neigh * 2.0 + ll_zodiac * 0.8) / 3.0
+        if n in recent_hit_neighbors:
+            if any(abs(n - x) == 1 for x in recent_hit_neighbors):
+                score += 2.8
+            elif any(abs(n - x) == 2 for x in recent_hit_neighbors):
+                score += 1.9
 
-        vote_support = vote_counter.get(n, 0)
-        ll_freq = math.log((vote_support + 1.0) / (len(special_votes) + 49.0) + 1e-12)
+        if n % 10 == coldest_tail:
+            score += 3.6
 
-        recency_support = recent_weights.get(n, 0.0) / recent_weight_total
-        ll_mom = math.log((recency_support + 1e-12) / (1.0 / 49.0) + 1e-12)
+        if get_zodiac_by_number(n) in missing_zodiacs:
+            score += 5.0
 
-        log_prior = math.log(1.0 / 49.0 + 1e-12)
-        scores[n] = (
-            log_prior * 1.0
-            + ll_omit * w_omit
-            + ll_assoc * w_assoc
-            + ll_freq * w_freq
-            + ll_mom * w_mom
-        )
+        if (main_odd_ratio > 0.65 and n % 2 == 0) or (main_odd_ratio < 0.35 and n % 2 == 1):
+            score += 2.0
+        if (n - 1) // 10 not in main_zones:
+            score += 2.3
+
+        if n in recent_specials[:3]:
+            score *= 0.25
+
+        scores[n] = max(0.0, score)
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best = ranked[0][0]
-    confidence = min(1.0, (ranked[0][1] - ranked[-1][1]) / 15.0) if len(ranked) > 1 else 1.0
-    defenses = [n for n, _ in ranked[1:4]]
+    confidence = min(1.0, ranked[0][1] / 29.0)
+    defenses = [n for n, _ in ranked[1:] if n not in main_set][:3]
+
+    print(f"[特别号 v4.6] 主推: {best} (置信 {confidence:.2f}) | 上期: {prev_special} | 冷尾: {coldest_tail}", flush=True)
+
     return best, round(confidence, 3), defenses
-
-
-def _generate_special_number_v4(
-    conn: sqlite3.Connection,
-    main_pool: List[int],
-    issue_no: str
-) -> Tuple[int, float, List[int]]:
-    return _generate_special_number_bayesian_v6(conn, main_pool, issue_no)
 
 
 # ========== 三中三优化版 v2 ==========
@@ -1247,9 +1233,9 @@ def _ensemble_strategy_v3_1(
     adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
 
     if bias_score > BIAS_THRESHOLD:
-        print(f"[集成策略] 偏态模式激活，偏态系数={bias_score:.2f}", flush=True)
+        print(f"[集成策略] 🔥 偏态模式激活，偏态系数={bias_score:.2f} 🔥", flush=True)
         cold_weight = adjusted_weights.get("cold_rebound_v1", 0.0)
-        print(f"   -> 冷号回补当前权重: {cold_weight:.3f}", flush=True)
+        print(f"   → 冷号回补当前权重: {cold_weight:.3f}", flush=True)
     else:
         print(f"[集成策略] 正常模式，偏态系数={bias_score:.2f}", flush=True)
 
@@ -1264,13 +1250,13 @@ def _ensemble_strategy_v3_1(
         else:
             config = {"window": float(win_size)}
             if sub == "hot_v1":
-                config.update({"w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17})
+                config.update({"w_freq": 0.74, "w_omit": 0.06, "w_mom": 0.14, "w_zone": 0.06, "w_adj": 0.10})
             elif sub == "cold_rebound_v1":
-                config.update({"w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27})
+                config.update({"w_freq": 0.06, "w_omit": 0.62, "w_mom": 0.22, "w_zone": 0.05, "w_adj": 0.12})
             elif sub == "momentum_v1":
-                config.update({"w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83})
+                config.update({"w_freq": 0.10, "w_omit": 0.05, "w_mom": 0.75, "w_zone": 0.05, "w_adj": 0.05})
             else:
-                config.update({"w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20})
+                config.update({"w_freq": 0.36, "w_omit": 0.26, "w_mom": 0.18, "w_zone": 0.06, "w_adj": 0.14})
             _, _, _, score_map = _apply_weight_config(sub_draws, config, STRATEGY_LABELS.get(sub, sub))
 
         score_maps.append(score_map)
@@ -1284,9 +1270,11 @@ def _ensemble_strategy_v3_1(
         for rank, (n, _) in enumerate(ranked):
             votes[n] += w * (49 - rank)
 
+    # === 新增：强化冷号回补策略的贡献 ===
     cold_picks = sub_picks.get("cold_rebound_v1", [])
     for idx, n in enumerate(cold_picks):
         votes[n] += 0.8 * (6 - idx)
+    # ===================================
 
     for n in ALL_NUMBERS:
         appear = sum(1 for p in sub_picks.values() if n in p)
@@ -1296,8 +1284,7 @@ def _ensemble_strategy_v3_1(
     main_picked = _pick_top_six(voted, "集成投票v3.1")
 
     main6 = [n for n, _, _, _ in main_picked]
-    optimal_params = ensure_optimal_params(conn)
-    special_number, confidence, _ = _generate_special_number_bayesian_v6(conn, main6, issue_no, **optimal_params)
+    special_number, confidence, _ = _generate_special_number_v4(conn, main6, issue_no)
 
     return main_picked, special_number, confidence, voted
 
@@ -1317,19 +1304,19 @@ def generate_strategy(
     if strategy == "hot_v1":
         return _apply_weight_config(
             strategy_draws,
-            {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17},
+            {"window": float(window_size), "w_freq": 0.74, "w_omit": 0.06, "w_mom": 0.14, "w_zone": 0.06, "w_adj": 0.10},
             "热号策略"
         )
     elif strategy == "cold_rebound_v1":
         return _apply_weight_config(
             strategy_draws,
-            {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27},
+            {"window": float(window_size), "w_freq": 0.06, "w_omit": 0.62, "w_mom": 0.22, "w_zone": 0.05, "w_adj": 0.12},
             "冷号回补"
         )
     elif strategy == "momentum_v1":
         return _apply_weight_config(
             strategy_draws,
-            {"window": float(window_size), "w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83},
+            {"window": float(window_size), "w_freq": 0.10, "w_omit": 0.05, "w_mom": 0.75, "w_zone": 0.05, "w_adj": 0.05},
             "近期动量"
         )
     elif strategy == "balanced_v1":
@@ -1337,11 +1324,12 @@ def generate_strategy(
             strategy_draws,
             {
                 "window": float(window_size),
-                "w_freq": 0.40,
-                "w_omit": 0.30,
-                "w_mom": 0.20,
+                "w_freq": 0.36,
+                "w_omit": 0.26,
+                "w_mom": 0.18,
                 "w_pair": 0.05,
-                "w_zone": 0.05,
+                "w_zone": 0.06,
+                "w_adj": 0.14,
             },
             "组合策略",
         )
@@ -1372,91 +1360,6 @@ def generate_strategy(
     )
 
 
-# ===================== 全自动参数调优系统 =====================
-def tune_special_params(
-    conn: sqlite3.Connection,
-    eval_issues: int = 80,
-    min_history: int = 80,
-    max_combos: int = 100
-) -> Dict[str, float]:
-    rows = _draws_ordered_asc(conn)
-    total = len(rows)
-    if total < min_history + eval_issues:
-        return {"alpha": 3.0, "long_window": 120,
-                "w_omit": 2.0, "w_assoc": 2.6, "w_freq": 0.45, "w_mom": 0.25}
-
-    test_start = total - eval_issues
-
-    param_space = {
-        "alpha": [1.0, 2.0, 3.0, 4.0, 5.0],
-        "long_window": [80, 120, 160, 200],
-        "w_omit": [1.0, 2.0, 3.0, 4.0],
-        "w_assoc": [1.5, 2.2, 2.8, 3.5],
-        "w_freq": [0.3, 0.45, 0.6, 0.8],
-        "w_mom": [0.15, 0.25, 0.4, 0.5]
-    }
-    keys = list(param_space.keys())
-    all_combos = list(__import__('itertools').product(*param_space.values()))
-    if len(all_combos) > max_combos:
-        all_combos = random.sample(all_combos, max_combos)
-
-    best_score = -1.0
-    best_params = None
-    print(f"🔍 自动调优开始：验证 {eval_issues} 期，测试 {len(all_combos)} 组参数...")
-
-    for idx, combo in enumerate(all_combos):
-        params = dict(zip(keys, combo))
-        hits = 0
-        valid = 0
-        for i in range(test_start, total):
-            if i < min_history:
-                continue
-            issue_no = rows[i]["issue_no"]
-            mains = json.loads(rows[i]["numbers_json"])
-            real_sp = int(rows[i]["special_number"])
-            try:
-                pred_sp, _, _ = _generate_special_number_bayesian_v6(
-                    conn, mains, issue_no,
-                    alpha=params["alpha"],
-                    long_window=int(params["long_window"]),
-                    w_omit=params["w_omit"],
-                    w_assoc=params["w_assoc"],
-                    w_freq=params["w_freq"],
-                    w_mom=params["w_mom"]
-                )
-            except Exception:
-                continue
-            if pred_sp == real_sp:
-                hits += 1
-            valid += 1
-        score = hits / valid if valid > 0 else 0.0
-        if score > best_score:
-            best_score = score
-            best_params = params
-        if (idx + 1) % 5 == 0:
-            print(f"  进度 {idx+1}/{len(all_combos)}，当前最佳命中率={best_score:.4f}")
-
-    print(f"✅ 调优完成，最佳命中率={best_score:.4f}，参数={best_params}")
-    return best_params
-
-
-def ensure_optimal_params(
-    conn: sqlite3.Connection,
-    mode: str = "full"
-) -> Dict[str, float]:
-    CACHE_KEY = "bayesian_v6_optimal_params"
-    total_issues = conn.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
-    if total_issues < 80:
-        return {"alpha": 3.0, "long_window": 120,
-                "w_omit": 2.0, "w_assoc": 2.6, "w_freq": 0.45, "w_mom": 0.25}
-
-    print("🚀 每期完整参数优化启动（命中率优先模式）...")
-    best = tune_special_params(conn, eval_issues=80, max_combos=100)
-    set_model_state(conn, CACHE_KEY, json.dumps(best))
-    conn.commit()
-    return best
-
-
 def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = None) -> str:
     row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if not row:
@@ -1466,9 +1369,6 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
     if len(draws) < 3:
         raise RuntimeError("Need at least 3 draws to generate predictions.")
     mined_cfg = ensure_mined_pattern_config(conn, force=False)
-
-    optimal_params = ensure_optimal_params(conn)
-    print(f"本期最优贝叶斯参数：{optimal_params}")
 
     strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
 
@@ -1969,7 +1869,7 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-# ========== 动态权重 ==========
+# ========== 动态权重相关函数 ==========
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
@@ -1982,6 +1882,8 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
 
     baseline = 0.6
     weights = {s: baseline for s in STRATEGY_IDS}
+    protection_msgs: List[str] = []
+
     for r in rows:
         strategy = str(r["strategy"])
         avg_hit = float(r["avg_hit"] or 0.0)
@@ -1995,6 +1897,7 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         recent_avg = float(h.get("recent_avg_hit", 0.0))
         hit1_rate = float(h.get("hit1_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
+
         shrink = 1.0
         if recent_avg < 0.7:
             shrink *= 0.90 ** ((0.7 - recent_avg) * 8)
@@ -2002,11 +1905,23 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
             shrink *= 0.87
         if cold_streak >= 3:
             shrink *= 0.72
+
         if strategy == "pattern_mined_v1" and (cold_streak >= 2 or recent_avg < 0.6):
             shrink *= 0.48
+            protection_msgs.append(f"[保护] 规律挖掘连挂 {cold_streak} 期，权重大幅下调")
+
         weights[strategy] = max(0.08, weights[strategy] * shrink)
 
     total = sum(weights.values())
+    global _PROTECTION_PRINT_COUNTER
+    for msg in protection_msgs:
+        if msg not in _WEIGHT_PROTECTION_PRINTED:
+            print(msg, flush=True)
+            _WEIGHT_PROTECTION_PRINTED.add(msg)
+    if protection_msgs:
+        _PROTECTION_PRINT_COUNTER += 1
+        if _PROTECTION_PRINT_COUNTER % 20 == 0:
+            print(f"[保护] 当前规律挖掘/冷号回补仍处于权重保护中 (已持续{_PROTECTION_PRINT_COUNTER}期)", flush=True)
     return {k: round(v / total, 4) for k, v in weights.items()}
 
 
@@ -2040,19 +1955,28 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
             (strategy, window),
         ).fetchall()
         if not rows:
-            health[strategy] = {"samples": 0.0, "recent_avg_hit": 0.0, "hit1_rate": 0.0, "hit2_rate": 0.0, "cold_streak": 0.0}
+            health[strategy] = {
+                "samples": 0.0,
+                "recent_avg_hit": 0.0,
+                "hit1_rate": 0.0,
+                "hit2_rate": 0.0,
+                "cold_streak": 0.0,
+            }
             continue
+
         hit_counts = [int(r["hit_count"] or 0) for r in rows]
         samples = len(hit_counts)
         hit1_rate = sum(1 for x in hit_counts if x >= 1) / samples
         hit2_rate = sum(1 for x in hit_counts if x >= 2) / samples
         recent_avg_hit = sum(hit_counts) / samples
+
         cold_streak = 0
         for x in hit_counts:
             if x == 0:
                 cold_streak += 1
             else:
                 break
+
         health[strategy] = {
             "samples": float(samples),
             "recent_avg_hit": float(recent_avg_hit),
@@ -2063,12 +1987,12 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
     return health
 
 
+# ========== 生肖相关函数（优化版） ==========
 def get_zodiac_by_number(number: int) -> str:
     for zodiac, nums in ZODIAC_MAP.items():
         if number in nums:
             return zodiac
     return "马"
-
 
 
 def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optional[str]:
@@ -2441,24 +2365,70 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
 
 
 def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int]) -> Tuple[Optional[int], List[int], bool]:
+    """特别号独立推荐：以特别号序列为主，主号仅作冲突过滤。"""
     top_votes = get_top_special_votes(conn, issue_no, top_n=8)
     if not top_votes:
         return None, [], False
+
     mains = {int(n) for n in main6}
     recent_3_specials = [int(r["special_number"]) for r in conn.execute(
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3"
     ).fetchall()]
-    primary = None
-    for n in top_votes:
-        n_int = int(n)
-        if n_int not in mains and n_int not in recent_3_specials:
-            primary = n_int
-            break
-    if primary is None:
-        primary = int(top_votes[0])
+    recent_12_specials = [int(r["special_number"]) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 12"
+    ).fetchall()]
+    recent_8_specials = [int(r["special_number"]) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 8"
+    ).fetchall()]
+
+    def _special_distance_bias(n: int) -> float:
+        score = 0.0
+        for sp in recent_12_specials:
+            diff = abs(n - sp)
+            if diff == 1:
+                score += 2.4
+            elif diff == 2:
+                score += 1.7
+            elif diff == 3:
+                score += 1.0
+        for sp in recent_8_specials[:5]:
+            if (n - 1) // 10 == (sp - 1) // 10:
+                score += 0.8
+            if n % 10 == sp % 10:
+                score += 0.6
+        return score
+
+    vote_scores = Counter(top_votes)
+    candidates = sorted(set(top_votes) | set(recent_12_specials) | set(recent_8_specials))
+    combined = []
+    for n in candidates:
+        if n in mains:
+            continue
+        score = vote_scores.get(n, 0) * 3.2
+        score += _special_distance_bias(n)
+        if recent_12_specials:
+            recent_special_tail = recent_12_specials[0] % 10
+            recent_special_zone = (recent_12_specials[0] - 1) // 10
+            recent_special_zodiac = get_zodiac_by_number(recent_12_specials[0])
+            if n % 10 == recent_special_tail:
+                score += 1.4
+            if (n - 1) // 10 == recent_special_zone:
+                score += 1.1
+            if get_zodiac_by_number(n) == recent_special_zodiac:
+                score += 1.8
+        if n in recent_3_specials:
+            score *= 0.30
+        combined.append((n, score))
+
+    if not combined:
+        return None, [], False
+
+    combined.sort(key=lambda x: (-x[1], x[0]))
+    primary = int(combined[0][0])
     conflict = primary in mains
+
     defenses = []
-    for n in top_votes:
+    for n, _ in combined[1:]:
         n_int = int(n)
         if n_int == primary or n_int in defenses:
             continue
@@ -2669,8 +2639,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
-    print(f"[zodiac] 2生肖推荐: {zodiac_two_text}")
-    print(f"[zodiac] 1生肖推荐: {zodiac_single_text}")
+    print(f"🎯 2生肖推荐: {zodiac_two_text}")
+    print(f"🎯 1生肖推荐: {zodiac_single_text}")
     print("=" * 50)
 
 
@@ -2722,7 +2692,7 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
         return f"最新一期 {issue_no} 无预测记录（可能未运行预测）。"
 
     lines = []
-    lines.append(f"[stats] 复盘最新一期 {issue_no}（{draw_date}）")
+    lines.append(f"📊 复盘最新一期 {issue_no}（{draw_date}）")
     lines.append(f"实际开奖: 主号 {actual_main_str}  特别号 {actual_special_str}")
     lines.append("")
     lines.append("各策略预测与命中情况：")
@@ -2736,7 +2706,7 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
         special_hit = 1 if special == actual_special else 0
         main_str = " ".join(_fmt_num(n) for n in main6)
         special_str = _fmt_num(special) if special is not None else "--"
-        lines.append(f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'Y' if special_hit else 'N'}")
+        lines.append(f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'✅' if special_hit else '❌'}")
     lines.append("")
     return "\n".join(lines)
 
@@ -2837,17 +2807,17 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"2生肖推荐：{zodiac_two_text}\n"
-                f"1生肖推荐：{zodiac_single_text}\n"
-                f"特别号主推：{special_text}{conflict_tip}\n"
-                f"特别号防守：{defense_text}\n"
-                f"六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
-                f"六策略特别号组：{strategy_special_text}\n"
-                f"六策略生肖组：{strategy_zodiac_text}\n"
-                f"特别号综合汇总（各策略去重）：{all_specials_str}\n"
-                f"最终投票特别号（前三热门）：{top_special_str}\n"
-                f"三中三预测（综合20码池+动态权重）：{trio_str}\n"
-                f"详情请运行 python newmacau_marksix.py show"
+                f"🎯 2生肖推荐：{zodiac_two_text}\n"
+                f"🎯 1生肖推荐：{zodiac_single_text}\n"
+                f"🔮 特别号主推：{special_text}{conflict_tip}\n"
+                f"🛡 特别号防守：{defense_text}\n"
+                f"🔥 六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
+                f"🧩 六策略特别号组：{strategy_special_text}\n"
+                f"🧬 六策略生肖组：{strategy_zodiac_text}\n"
+                f"📊 特别号综合汇总（各策略去重）：{all_specials_str}\n"
+                f"⭐ 最终投票特别号（前三热门）：{top_special_str}\n"
+                f"🏆 三中三预测（综合20码池+动态权重）：{trio_str}\n"
+                f"📊 详情请运行 python newmacau_marksix.py show"
             )
             send_pushplus_notification(f"新澳门预测 {issue_no}", content)
 
@@ -2892,6 +2862,21 @@ def cmd_sync(args: argparse.Namespace) -> None:
             print(f"Backtest updated. issues={bt_issues}, strategy_runs={bt_runs}")
         if patched > 0:
             print(f"Patched missing special picks: {patched}")
+    finally:
+        conn.close()
+
+
+def cmd_sync_recent(args: argparse.Namespace) -> None:
+    conn = connect_db(args.db)
+    try:
+        init_db(conn)
+        records = fetch_macau_recent_records(
+            limit=args.limit,
+            timeout=args.api_timeout,
+            retries=args.api_retries,
+        )
+        total, inserted, updated = sync_from_records(conn, records, source="macau_api_recent")
+        print(f"Recent sync done. limit={args.limit}, total={total}, inserted={inserted}, updated={updated}")
     finally:
         conn.close()
 
@@ -2975,6 +2960,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync = sub.add_parser("sync", help="Sync draws from API, review latest, generate next prediction")
     p_sync.add_argument("--with-backtest", action="store_true", help=f"Run incremental backtest after sync (default last {BACKTEST_ISSUES_DEFAULT} issues)")
     p_sync.set_defaults(func=cmd_sync)
+
+    p_recent = sub.add_parser("recent", help="Fetch and store only the latest N draws from API")
+    p_recent.add_argument("--limit", type=int, default=120, help="Number of recent issues to fetch")
+    p_recent.set_defaults(func=cmd_sync_recent)
 
     p_predict = sub.add_parser("predict", help="Generate predictions for next or specified issue")
     p_predict.add_argument("--issue", help="Target issue, e.g. 26/023")
