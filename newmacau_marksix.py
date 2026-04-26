@@ -2789,6 +2789,7 @@ def get_final_recommendation(conn: sqlite3.Connection):
 
     zodiac_single = get_single_zodiac_pick(conn, issue_no, window=16)
     zodiac_two = get_two_zodiac_picks(conn, issue_no, window=16)
+    special_zodiacs = [get_zodiac_by_number(n) for n in strategy_specials[:4]] if strategy_specials else []
     return (
         issue_no,
         main6,
@@ -2801,6 +2802,7 @@ def get_final_recommendation(conn: sqlite3.Connection):
         special_conflict,
         zodiac_single,
         zodiac_two,
+        special_zodiacs,
         strategy_specials,
         strategy_special_zodiacs,
         strategy_strong_special,
@@ -2813,7 +2815,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
+    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, special_zodiacs, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
     special_text = _fmt_num(special)
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
@@ -2824,6 +2826,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
     zodiac_two_text = "、".join(zodiac_two) if zodiac_two else "数据不足"
     defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
+    special_zodiacs_text = "、".join(special_zodiacs) if special_zodiacs else "无"
     strategy_special_text = " ".join(_fmt_num(n) for n in strategy_specials) if strategy_specials else "无"
     strategy_zodiac_text = "、".join(strategy_special_zodiacs) if strategy_special_zodiacs else "无"
     strong_special_text = _fmt_num(strategy_strong_special) if strategy_strong_special is not None else "无"
@@ -2832,6 +2835,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
     print(f"特别号建议: 主推 {special_text} | 防守 {defense_text}")
+    print(f"特别生肖推荐: {special_zodiacs_text}")
     print(f"六策略特别号组: {strategy_special_text}")
     print(f"六策略生肖组: {strategy_zodiac_text}")
     print(f"六策略极强号: {strong_special_text} ({strong_zodiac_text})")
@@ -2968,17 +2972,18 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     print_final_recommendation(conn)
 
     print("\n" + review_latest_prediction(conn))
-    print("\n" + get_special_rule_contribution_report_multi(conn))
+    # 精简最终展示：不再输出特别号规则贡献回测详情
 
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
-            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
+            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, special_zodiacs, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
             special_text = _fmt_num(special)
             trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
             defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
             strong_special_text = _fmt_num(strategy_strong_special) if strategy_strong_special is not None else "无"
             strong_zodiac_text = strategy_strong_zodiac if strategy_strong_zodiac else "无"
+            special_zodiacs_text = "、".join(special_zodiacs) if special_zodiacs else "无"
             strategy_special_text = " ".join(_fmt_num(n) for n in strategy_specials) if strategy_specials else "无"
             strategy_zodiac_text = "、".join(strategy_special_zodiacs) if strategy_special_zodiacs else "无"
 
@@ -3009,6 +3014,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
                 f"【新澳门·{issue_no}期推荐】\n"
                 f"🎯 2生肖推荐：{zodiac_two_text}\n"
                 f"🎯 1生肖推荐：{zodiac_single_text}\n"
+                f"🧬 特别生肖推荐：{special_zodiacs_text}\n"
                 f"🔮 特别号主推：{special_text}{conflict_tip}\n"
                 f"🛡 特别号防守：{defense_text}\n"
                 f"🔥 六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
