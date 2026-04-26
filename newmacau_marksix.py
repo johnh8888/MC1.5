@@ -1,3 +1,62 @@
+import argparse
+import csv
+import io
+import json
+import math
+import os
+import random
+import re
+import socket
+import sqlite3
+import sys
+import time
+from urllib.error import URLError
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.request import Request, urlopen
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
+CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
+
+MACAU_API_URL = "https://marksix6.net/index.php?api=1"
+API_TIMEOUT_DEFAULT = 20
+API_RETRIES_DEFAULT = 4
+API_RETRY_BACKOFF_SECONDS = 2.0
+
+MINED_CONFIG_KEY = "mined_strategy_config_v1"
+ALL_NUMBERS = list(range(1, 50))
+
+FEATURE_WINDOW_DEFAULT = 10
+STRATEGY_BASE_WINDOWS = {
+    "hot_v1": 6,
+    "momentum_v1": 7,
+    "cold_rebound_v1": 13,
+    "balanced_v1": 10,
+    "pattern_mined_v1": 6,
+    "ensemble_v2": 10,
+}
+WEIGHT_WINDOW_DEFAULT = 30
+HEALTH_WINDOW_DEFAULT = 18
+BACKTEST_ISSUES_DEFAULT = 120
+ENSEMBLE_DIVERSITY_BONUS = 0.18
+BIAS_THRESHOLD = 0.65
+BIAS_ADJUSTMENT = 0.40
+FORCED_BIAS_COEFFICIENT = 0.75
+
+STRATEGY_LABELS = {
+    "balanced_v1": "组合策略",
+    "hot_v1": "热号策略",
+    "cold_rebound_v1": "冷号回补",
+    "momentum_v1": "近期动量",
+    "ensemble_v2": "集成投票",
+    "pattern_mined_v1": "规律挖掘",
+}
+STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
+SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1"]
 ZODIAC_MAP = {
     "马": [1, 13, 25, 37, 49],
     "蛇": [2, 14, 26, 38],
