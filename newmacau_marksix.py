@@ -2789,7 +2789,13 @@ def get_final_recommendation(conn: sqlite3.Connection):
 
     zodiac_single = get_single_zodiac_pick(conn, issue_no, window=16)
     zodiac_two = get_two_zodiac_picks(conn, issue_no, window=16)
-    special_zodiacs = [get_zodiac_by_number(n) for n in strategy_specials[:4]] if strategy_specials else []
+    special_zodiacs = []
+    if strategy_special_zodiacs:
+        for z in strategy_special_zodiacs:
+            if z not in special_zodiacs:
+                special_zodiacs.append(z)
+            if len(special_zodiacs) == 4:
+                break
     return (
         issue_no,
         main6,
