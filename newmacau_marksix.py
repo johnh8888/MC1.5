@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
+from xgb_ensemble import load_or_train_ensemble_model, ensemble_predict, compute_market_temperature
+from tail_predictor import get_best_tail, backtest_tail
+from zodiac_strict import get_three_zodiac_picks, backtest_zodiac_full_match
+from risk_manager import RiskManager
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
 CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
@@ -1225,68 +1230,20 @@ def _ensemble_strategy_v3_1(
     conn: sqlite3.Connection,
     issue_no: str
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
+    model = load_or_train_ensemble_model(conn, generate_strategy, load_recent_draws)
     sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
-    score_maps = []
-    sub_picks = {}
-
-    bias_score, _ = detect_bias(conn, window=10)
-    adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
-
-    if bias_score > BIAS_THRESHOLD:
-        print(f"[集成策略] 🔥 偏态模式激活，偏态系数={bias_score:.2f} 🔥", flush=True)
-        cold_weight = adjusted_weights.get("cold_rebound_v1", 0.0)
-        print(f"   → 冷号回补当前权重: {cold_weight:.3f}", flush=True)
-    else:
-        print(f"[集成策略] 正常模式，偏态系数={bias_score:.2f}", flush=True)
+    sub_scores_dict: Dict[str, Dict[int, float]] = {}
 
     for sub in sub_strategies:
-        win_size = get_adaptive_strategy_window(sub, conn)
-        sub_draws = draws[:win_size] if len(draws) > win_size else draws
+        _, _, _, score_map = generate_strategy(draws, sub, mined_config=mined_config, strategy_weights=strategy_weights, conn=conn, issue_no=issue_no)
+        sub_scores_dict[sub] = score_map
 
-        if sub == "pattern_mined_v1":
-            cfg = mined_config or _default_mined_config()
-            cfg["window"] = float(win_size)
-            _, _, _, score_map = _apply_weight_config(sub_draws, cfg, "规律挖掘")
-        else:
-            config = {"window": float(win_size)}
-            if sub == "hot_v1":
-                config.update({"w_freq": 0.74, "w_omit": 0.06, "w_mom": 0.14, "w_zone": 0.06, "w_adj": 0.10})
-            elif sub == "cold_rebound_v1":
-                config.update({"w_freq": 0.06, "w_omit": 0.62, "w_mom": 0.22, "w_zone": 0.05, "w_adj": 0.12})
-            elif sub == "momentum_v1":
-                config.update({"w_freq": 0.10, "w_omit": 0.05, "w_mom": 0.75, "w_zone": 0.05, "w_adj": 0.05})
-            else:
-                config.update({"w_freq": 0.36, "w_omit": 0.26, "w_mom": 0.18, "w_zone": 0.06, "w_adj": 0.14})
-            _, _, _, score_map = _apply_weight_config(sub_draws, config, STRATEGY_LABELS.get(sub, sub))
-
-        score_maps.append(score_map)
-        ranked = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
-        sub_picks[sub] = [n for n, _ in ranked[:6]]
-
-    votes = {n: 0.0 for n in ALL_NUMBERS}
-    for idx, sub in enumerate(sub_strategies):
-        w = adjusted_weights.get(sub, 0.2)
-        ranked = sorted(score_maps[idx].items(), key=lambda x: x[1], reverse=True)
-        for rank, (n, _) in enumerate(ranked):
-            votes[n] += w * (49 - rank)
-
-    # === 新增：强化冷号回补策略的贡献 ===
-    cold_picks = sub_picks.get("cold_rebound_v1", [])
-    for idx, n in enumerate(cold_picks):
-        votes[n] += 0.8 * (6 - idx)
-    # ===================================
-
-    for n in ALL_NUMBERS:
-        appear = sum(1 for p in sub_picks.values() if n in p)
-        votes[n] += (6 - appear) * ENSEMBLE_DIVERSITY_BONUS * 1.2
-
-    voted = _normalize(votes)
-    main_picked = _pick_top_six(voted, "集成投票v3.1")
-
+    temperature = compute_market_temperature(draws)
+    score_map = ensemble_predict(sub_scores_dict, temperature, model)
+    main_picked = _pick_top_six(score_map, "XGB元集成")
     main6 = [n for n, _, _, _ in main_picked]
     special_number, confidence, _ = _generate_special_number_v4(conn, main6, issue_no)
-
-    return main_picked, special_number, confidence, voted
+    return main_picked, special_number, confidence, score_map
 
 
 def generate_strategy(
@@ -2426,7 +2383,7 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
     return [num for num, _ in sorted_items[:top_n]]
 
 
-def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int]) -> Tuple[Optional[int], List[int], bool]:
+def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int], zodiac_two: Optional[Sequence[str]] = None) -> Tuple[Optional[int], List[int], bool]:
     """特别号独立推荐：以特别号序列为主，主号仅作冲突过滤。"""
     top_votes = get_top_special_votes(conn, issue_no, top_n=8)
     if not top_votes:
@@ -2481,6 +2438,13 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
 
     vote_scores = Counter(top_votes)
     candidates = sorted(set(top_votes) | set(recent_12_specials) | set(recent_8_specials))
+    if zodiac_two:
+        allowed = set()
+        for z in zodiac_two:
+            allowed.update(ZODIAC_MAP.get(z, []))
+        filtered = [n for n in candidates if n in allowed]
+        if filtered:
+            candidates = filtered
     combined = []
     for n in candidates:
         if n in mains:
@@ -2838,6 +2802,22 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     strong_special_text = _fmt_num(strategy_strong_special) if strategy_strong_special is not None else "无"
     strong_zodiac_text = strategy_strong_zodiac if strategy_strong_zodiac else "无"
 
+    tail_rate, tail_samples, tail_max_miss = backtest_tail(conn)
+    best_tail = get_best_tail(conn)
+    zodiac_three = get_three_zodiac_picks(conn)
+    zodiac_two_rate, zodiac_two_max_miss = backtest_zodiac_full_match(conn, mode="exact_2")
+    strict_two_rate, strict_two_max_miss = backtest_zodiac_full_match(conn, mode="strict_two")
+    rm = RiskManager(bankroll=1000.0)
+    tail_rec = rm.get_bet_recommendation("tail", tail_rate, 1.8, rm.bankroll)
+    zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", strict_two_rate, 5.0, rm.bankroll)
+    special_hist_rate = 0.0
+    special_samples = 0
+    reviewed = conn.execute("SELECT COALESCE(special_hit, 0) AS special_hit FROM prediction_runs WHERE status='REVIEWED'").fetchall()
+    if reviewed:
+        special_samples = len(reviewed)
+        special_hist_rate = sum(int(r["special_hit"]) for r in reviewed) / float(special_samples)
+    special_rec = rm.get_bet_recommendation("special", special_hist_rate, 45.0, rm.bankroll)
+
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
     print(f"特别号建议: 主推 {special_text} | 防守 {defense_text}")
@@ -2848,8 +2828,15 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
-    print(f"🎯 2生肖推荐: {zodiac_two_text}")
-    print(f"🎯 1生肖推荐: {zodiac_single_text}")
+    print(f"2生肖推荐: {zodiac_two_text}")
+    print(f"1生肖推荐: {zodiac_single_text}")
+    print(f"尾数推荐: {best_tail} | 回测命中率: {tail_rate*100:.1f}% | 样本: {tail_samples} | 最大连空: {tail_max_miss}")
+    print(f"三生肖推荐: {'、'.join(zodiac_three)} | 2中命中率: {zodiac_two_rate*100:.1f}% | 末端连空: {zodiac_two_max_miss}")
+    print(f"风控建议 - 生肖严格双码: {'暂停' if zodiac_rec['suspended'] else '继续'} | 半Kelly建议资金: {zodiac_rec['recommended_stake']:.2f}")
+    print(f"风控建议 - 尾数: {'暂停' if tail_rec['suspended'] else '继续'} | 半Kelly建议资金: {tail_rec['recommended_stake']:.2f}")
+    print(f"风控建议 - 特别号: {'暂停' if special_rec['suspended'] else '继续'} | 半Kelly建议资金: {special_rec['recommended_stake']:.2f}")
+    if zodiac_rec['suspended'] or tail_rec['suspended'] or special_rec['suspended']:
+        print("警告: 至少一个信号已触发暂停条件")
     print("=" * 50)
 
 
@@ -2901,7 +2888,7 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
         return f"最新一期 {issue_no} 无预测记录（可能未运行预测）。"
 
     lines = []
-    lines.append(f"📊 复盘最新一期 {issue_no}（{draw_date}）")
+    lines.append(f"复盘最新一期 {issue_no}（{draw_date}）")
     lines.append(f"实际开奖: 主号 {actual_main_str}  特别号 {actual_special_str}")
     lines.append("")
     lines.append("各策略预测与命中情况：")
@@ -2915,7 +2902,7 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
         special_hit = 1 if special == actual_special else 0
         main_str = " ".join(_fmt_num(n) for n in main6)
         special_str = _fmt_num(special) if special is not None else "--"
-        lines.append(f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'✅' if special_hit else '❌'}")
+        lines.append(f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'Y' if special_hit else 'N'}")
     lines.append("")
     return "\n".join(lines)
 
@@ -3018,18 +3005,18 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"🎯 2生肖推荐：{zodiac_two_text}\n"
-                f"🎯 1生肖推荐：{zodiac_single_text}\n"
-                f"🧬 特别生肖推荐：{special_zodiacs_text}\n"
-                f"🔮 特别号主推：{special_text}{conflict_tip}\n"
-                f"🛡 特别号防守：{defense_text}\n"
-                f"🔥 六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
-                f"🧩 六策略特别号组：{strategy_special_text}\n"
-                f"🧬 六策略生肖组：{strategy_zodiac_text}\n"
-                f"📊 特别号综合汇总（各策略去重）：{all_specials_str}\n"
-                f"⭐ 最终投票特别号（前三热门）：{top_special_str}\n"
-                f"🏆 三中三预测（综合20码池+动态权重）：{trio_str}\n"
-                f"📊 详情请运行 python newmacau_marksix.py show"
+                f"2生肖推荐：{zodiac_two_text}\n"
+                f"1生肖推荐：{zodiac_single_text}\n"
+                f"特别生肖推荐：{special_zodiacs_text}\n"
+                f"特别号主推：{special_text}{conflict_tip}\n"
+                f"特别号防守：{defense_text}\n"
+                f"六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
+                f"六策略特别号组：{strategy_special_text}\n"
+                f"六策略生肖组：{strategy_zodiac_text}\n"
+                f"特别号综合汇总（各策略去重）：{all_specials_str}\n"
+                f"最终投票特别号（前三热门）：{top_special_str}\n"
+                f"三中三预测（综合20码池+动态权重）：{trio_str}\n"
+                f"详情请运行 python newmacau_marksix.py show"
             )
             send_pushplus_notification(f"新澳门预测 {issue_no}", content)
 
@@ -3159,6 +3146,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
+    p.add_argument("--retrain", action="store_true", help="Force retrain XGB model before running")
+    p.add_argument("--tail-backtest", action="store_true", help="Run tail backtest and print report")
     p.add_argument("--api-timeout", type=int, default=API_TIMEOUT_DEFAULT, help="API timeout seconds per request")
     p.add_argument("--api-retries", type=int, default=API_RETRIES_DEFAULT, help="API retry attempts when network timeout/error occurs")
     p.add_argument("--require-continuity", action="store_true", default=True, help="Fail update when issue sequence has gaps")
@@ -3205,9 +3194,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if args.retrain:
+        model_path = SCRIPT_DIR / "xgb_ensemble_model.pkl"
+        if model_path.exists():
+            model_path.unlink()
     if args.update:
         cmd_sync(args)
         return
+    if args.tail_backtest:
+        conn = connect_db(args.db)
+        try:
+            init_db(conn)
+            hit_rate, samples, max_miss = backtest_tail(conn)
+            print(f"Tail backtest: hit_rate={hit_rate*100:.1f}% samples={samples} max_miss={max_miss}")
+        finally:
+            conn.close()
+        if not args.command:
+            return
     if not args.command:
         parser.error("Please provide a subcommand, or use --update.")
     args.func(args)
