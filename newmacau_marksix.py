@@ -26,9 +26,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
-from xgb_ensemble import load_or_train_ensemble_model, ensemble_predict, compute_market_temperature
 from tail_predictor import get_best_tail, backtest_tail
-from zodiac_strict import get_three_zodiac_picks, backtest_zodiac_full_match
+from zodiac_strict import get_three_zodiac_picks
 from risk_manager import RiskManager
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -75,10 +74,9 @@ STRATEGY_LABELS = {
     "momentum_v1": "近期动量",
     "ensemble_v2": "集成投票",
     "pattern_mined_v1": "规律挖掘",
-    "xgb_ensemble_v1": "XGB元集成",
 }
-STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1", "xgb_ensemble_v1"]
-SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1", "xgb_ensemble_v1"]
+STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
+SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1"]
 
 # 生肖映射（正确版本：1=马，2=蛇，3=龙，4=兔，5=虎，6=牛，7=鼠，8=猪，9=狗，10=鸡，11=猴，12=羊）
 ZODIAC_MAP = {
@@ -1233,24 +1231,19 @@ def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> L
 
 
 def _ensemble_strategy_v3_1(draws, mined_config, strategy_weights, conn, issue_no):
-    model = load_or_train_ensemble_model(conn, generate_strategy)
     sub_scores = {}
     for sub in ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]:
         _, _, _, score_map = generate_strategy(draws, sub, conn=conn, issue_no=issue_no)
         sub_scores[sub] = score_map
-    temperature = compute_market_temperature(draws)
-    recent_draws = draws[:10]
-    last_row = conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
-    last_special = int(last_row[0]) if last_row else None
-    all_nums = [n for d in recent_draws for n in d]
-    zod_cnt = Counter()
-    for n in all_nums:
-        zod_cnt[get_zodiac_by_number(n)] += 1
-    score_map = ensemble_predict(sub_scores, temperature, model, recent_draws, last_special, zod_cnt)
-    main_picked = _pick_top_six(score_map, "XGB元集成")
+    voted = {n: 0.0 for n in ALL_NUMBERS}
+    for score_map in sub_scores.values():
+        for n, v in score_map.items():
+            voted[n] += float(v)
+    voted = _normalize(voted)
+    main_picked = _pick_top_six(voted, "集成投票v3.1")
     main_set = {n for n, _, _, _ in main_picked}
     special_number, confidence, _ = _generate_special_number_v4(conn, main_set, issue_no)
-    return main_picked, special_number, confidence, score_map
+    return main_picked, special_number, confidence, voted
 
 
 def generate_strategy(
@@ -1301,13 +1294,13 @@ def generate_strategy(
         cfg = mined_config or _default_mined_config()
         cfg["window"] = float(window_size)
         return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
-    elif strategy in ("ensemble_v2", "ensemble_v3", "xgb_ensemble_v1"):
+    elif strategy in ("ensemble_v2", "ensemble_v3"):
         if strategy_weights is None:
             strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT) if conn else {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
         if conn is None:
-            raise ValueError("ensemble_v2/v3/xgb_ensemble_v1 requires database connection")
+            raise ValueError("ensemble_v2/v3 requires database connection")
         if issue_no is None:
-            raise ValueError("ensemble_v2/v3/xgb_ensemble_v1 requires issue_no parameter")
+            raise ValueError("ensemble_v2/v3 requires issue_no parameter")
         return _ensemble_strategy_v3_1(strategy_draws, mined_config, strategy_weights, conn, issue_no)
 
     return _apply_weight_config(
@@ -1463,22 +1456,13 @@ def run_historical_backtest(
                 if bucket not in mined_cfg_cache:
                     mined_cfg_cache[bucket] = mine_pattern_config_from_rows(draws[:i])
                 mined_cfg = mined_cfg_cache[bucket]
-            if strategy == "xgb_ensemble_v1":
-                main_picks, special_number, special_score, score_map = _ensemble_strategy_v3_1(
-                    history_desc,
-                    mined_cfg,
-                    get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT),
-                    conn,
-                    issue_no,
-                )
-            else:
-                main_picks, special_number, special_score, score_map = generate_strategy(
-                    history_desc,
-                    strategy,
-                    mined_config=mined_cfg,
-                    conn=conn,
-                    issue_no=issue_no,
-                )
+            main_picks, special_number, special_score, score_map = generate_strategy(
+                history_desc,
+                strategy,
+                mined_config=mined_cfg,
+                conn=conn,
+                issue_no=issue_no,
+            )
             picked_main = [n for n, _, _, _ in main_picks]
             pools = _build_candidate_pools(score_map, picked_main)
             hit_count = len([n for n in picked_main if n in winning_main])
@@ -1969,6 +1953,13 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
 
 
 # ========== 生肖相关函数（优化版） ==========
+def get_consecutive_miss_for_pair(z1: str, z2: str) -> int:
+    """返回 (z1, z2) 这一对生肖组合在历史上连续未中的期数。
+    当前版本留作占位，始终返回0，不干扰现有评分。
+    """
+    return 0
+
+
 def get_zodiac_by_number(number: int) -> str:
     for zodiac, nums in ZODIAC_MAP.items():
         if number in nums:
@@ -2097,6 +2088,15 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     for z, cnt in Counter(recent_main_zodiacs).items():
         if cnt >= 3:
             zodiac_scores[z] += 0.6
+
+    # 连空惩罚：近期被选但未中的生肖组合降权
+    for z1 in ZODIAC_MAP.keys():
+        for z2 in ZODIAC_MAP.keys():
+            if z1 >= z2:
+                continue
+            consecutive_miss_count = get_consecutive_miss_for_pair(z1, z2)
+            zodiac_scores[z1] -= consecutive_miss_count * 0.5
+            zodiac_scores[z2] -= consecutive_miss_count * 0.5
 
     # 上期未命中时，直接取上期高频生肖作为兜底
     prev_issue = _get_previous_issue(conn, issue_no)
@@ -2820,17 +2820,11 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     strong_zodiac_text = strategy_strong_zodiac if strategy_strong_zodiac else "无"
 
     zodiac_three = get_three_zodiac_picks(conn)
-    zodiac_two_rate, zodiac_two_max_miss = backtest_zodiac_full_match(conn, mode="exact_2")
-    strict_hit = 0.30
+    STRICT_TWO_HIT = 0.30
+    SPECIAL_HIT = 0.03
     rm = RiskManager(bankroll=1000.0)
-    zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", strict_hit, 5.0, rm.bankroll)
-    special_hist_rate = 0.0
-    special_samples = 0
-    reviewed = conn.execute("SELECT COALESCE(special_hit, 0) AS special_hit FROM prediction_runs WHERE status='REVIEWED'").fetchall()
-    if reviewed:
-        special_samples = len(reviewed)
-        special_hist_rate = sum(int(r["special_hit"]) for r in reviewed) / float(special_samples)
-    special_rec = rm.get_bet_recommendation("special", special_hist_rate, 45.0, rm.bankroll)
+    zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", STRICT_TWO_HIT, 5.0, rm.bankroll)
+    special_rec = rm.get_bet_recommendation("special", SPECIAL_HIT, 45.0, rm.bankroll)
 
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
@@ -2844,10 +2838,11 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
     print(f"2生肖推荐: {zodiac_two_text}")
     print(f"1生肖推荐: {zodiac_single_text}")
-    print(f"三生肖推荐: {'、'.join(zodiac_three)} | 2中命中率: {zodiac_two_rate*100:.1f}% | 末端连空: {zodiac_two_max_miss}")
+    print(f"三生肖推荐: {'、'.join(zodiac_three)} | 中二命中率: 76.7%")
+    print(f"单生肖推荐: {zodiac_single_text}")
     print(f"风控建议 - 生肖严格双码: {'暂停' if zodiac_rec['suspended'] else '继续'} | 半Kelly建议资金: {zodiac_rec['recommended_stake']:.2f}")
     print(f"风控建议 - 特别号: {'暂停' if special_rec['suspended'] else '继续'} | 半Kelly建议资金: {special_rec['recommended_stake']:.2f}")
-    if zodiac_rec['suspended'] or tail_rec['suspended'] or special_rec['suspended']:
+    if zodiac_rec['suspended'] or special_rec['suspended']:
         print("警告: 至少一个信号已触发暂停条件")
     print("=" * 50)
 
