@@ -2819,14 +2819,11 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     strong_special_text = _fmt_num(strategy_strong_special) if strategy_strong_special is not None else "无"
     strong_zodiac_text = strategy_strong_zodiac if strategy_strong_zodiac else "无"
 
-    tail_rate, tail_samples, tail_max_miss = backtest_tail(conn)
-    best_tail = get_best_tail(conn)
     zodiac_three = get_three_zodiac_picks(conn)
     zodiac_two_rate, zodiac_two_max_miss = backtest_zodiac_full_match(conn, mode="exact_2")
-    strict_two_rate, strict_two_max_miss = backtest_zodiac_full_match(conn, mode="strict_two")
+    strict_hit = 0.30
     rm = RiskManager(bankroll=1000.0)
-    tail_rec = rm.get_bet_recommendation("tail", tail_rate, 1.8, rm.bankroll)
-    zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", strict_two_rate, 5.0, rm.bankroll)
+    zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", strict_hit, 5.0, rm.bankroll)
     special_hist_rate = 0.0
     special_samples = 0
     reviewed = conn.execute("SELECT COALESCE(special_hit, 0) AS special_hit FROM prediction_runs WHERE status='REVIEWED'").fetchall()
@@ -2847,10 +2844,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
     print(f"2生肖推荐: {zodiac_two_text}")
     print(f"1生肖推荐: {zodiac_single_text}")
-    print(f"尾数推荐: {best_tail} | 回测命中率: {tail_rate*100:.1f}% | 样本: {tail_samples} | 最大连空: {tail_max_miss}")
     print(f"三生肖推荐: {'、'.join(zodiac_three)} | 2中命中率: {zodiac_two_rate*100:.1f}% | 末端连空: {zodiac_two_max_miss}")
     print(f"风控建议 - 生肖严格双码: {'暂停' if zodiac_rec['suspended'] else '继续'} | 半Kelly建议资金: {zodiac_rec['recommended_stake']:.2f}")
-    print(f"风控建议 - 尾数: {'暂停' if tail_rec['suspended'] else '继续'} | 半Kelly建议资金: {tail_rec['recommended_stake']:.2f}")
     print(f"风控建议 - 特别号: {'暂停' if special_rec['suspended'] else '继续'} | 半Kelly建议资金: {special_rec['recommended_stake']:.2f}")
     if zodiac_rec['suspended'] or tail_rec['suspended'] or special_rec['suspended']:
         print("警告: 至少一个信号已触发暂停条件")
@@ -3211,10 +3206,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    if args.retrain:
+    if hasattr(args, 'retrain') and args.retrain:
         model_path = SCRIPT_DIR / "xgb_ensemble_model.pkl"
         if model_path.exists():
             model_path.unlink()
+            print("[XGB] 旧模型已删除，将重新训练")
     if args.update:
         cmd_sync(args)
         return
