@@ -2319,7 +2319,7 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
 def _get_five_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Optional[sqlite3.Connection] = None) -> List[str]:
     """五生肖版 – 基于原 v5.4 增强，返回 5 个生肖"""
     if len(rows) < 3:
-        return ["马", "蛇", "龙", "兔"]
+        return ["马", "蛇", "龙", "兔", "虎"]
 
     specials = [int(row["special_number"]) for row in rows]
     zodiac_series = [get_zodiac_by_number(sp) for sp in specials]
@@ -3210,7 +3210,6 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     p10 = " ".join(_fmt_num(n) for n in pool10)
     p14 = " ".join(_fmt_num(n) for n in pool14)
     p20 = " ".join(_fmt_num(n) for n in pool20)
-    xgb_suffix = " (XGB)" if xgb_pool20 is not None and len(xgb_pool20) >= 20 else ""
     trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
 
     zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
@@ -3239,8 +3238,6 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     print(f"一生肖推荐: {zodiac_single_text}")
     print(f"二生肖推荐: {zodiac_two_text}")
     print(f"三生肖推荐: {zodiac_three_text}")
-    print(f"特别生肖推荐: {special_zodiacs_text}")
-
     # ---------- 五生肖推荐（特肖） ----------
     history_rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 16"
@@ -3258,7 +3255,7 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     if precise_specials:
         ps_str = " ".join(_fmt_num(n) for n in precise_specials)
         ps_detail = ", ".join(f"{_fmt_num(n)}({get_zodiac_by_number(n)})" for n in precise_specials)
-        print(f"精选特别号 (3码): {ps_str}  ({ps_detail}){xgb_tag}")
+        print(f"精选特别号 (3码): {ps_str}  ({ps_detail})")
 
     # ---------- 五生肖仓位建议（规则：投入4元，中1肖得6元含本，净赚2元） ----------
     km = KellyManager(bankroll=1000.0)
@@ -3276,7 +3273,6 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     if km.loss_streak >= 2:
         print("⚠️ 提醒: 模拟账户连续亏损，当前仓位已自动减半。")
     print(f"风控建议 - 生肖严格双码: {'暂停' if zodiac_rec['suspended'] else '继续'} | 半Kelly建议资金: {zodiac_rec['recommended_stake']:.2f}")
-    print(f"风控建议 - 特别号: {'暂停' if special_rec['suspended'] else '继续'} | 半Kelly建议资金: {special_rec['recommended_stake']:.2f}")
     print(f"风控建议 - 特别号: {'暂停' if special_rec['suspended'] else '继续'} | 半Kelly建议资金: {special_rec['recommended_stake']:.2f}")
     if zodiac_rec['suspended'] or special_rec['suspended']:
         print("警告: 至少一个信号已触发暂停条件")
@@ -3361,10 +3357,10 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
     print_recommendation_sheet(conn, limit=8)
 
     print("\n策略最近10期平均命中率:")
-    stats = get_review_stats(conn, window=10)
-    if not stats:
-        print("  (暂无复盘)")
-    for s in stats:
+    stats_10 = get_review_stats(conn, window=10)
+    if not stats_10:
+        print("  (近期暂无复盘数据，请先运行 sync)")
+    for s in stats_10:
         strategy_name = STRATEGY_LABELS.get(s["strategy"], s["strategy"])
         print(
             f"  - {strategy_name}: 次数={s['c']} 平均命中={s['avg_hit']:.2f} "
