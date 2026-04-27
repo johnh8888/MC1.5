@@ -2758,6 +2758,9 @@ def get_final_recommendation(conn: sqlite3.Connection):
     main6, pool10, pool14, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if not main6 or not pool10 or not pool14 or not pool20:
         return None
+
+    zodiac_single = get_single_zodiac_pick(conn, issue_no, window=16)
+    zodiac_two = get_two_zodiac_picks(conn, issue_no, window=16)
     special, special_defenses, special_conflict = get_special_recommendation(conn, issue_no, main6, zodiac_two)
     if special is None:
         return None
@@ -2767,8 +2770,6 @@ def get_final_recommendation(conn: sqlite3.Connection):
 
     predict_trio = get_trio_from_merged_pool20(conn, issue_no)
 
-    zodiac_single = get_single_zodiac_pick(conn, issue_no, window=16)
-    zodiac_two = get_two_zodiac_picks(conn, issue_no, window=16)
     special_zodiacs = []
     if strategy_special_zodiacs:
         for z in strategy_special_zodiacs:
