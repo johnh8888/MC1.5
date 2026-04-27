@@ -21,7 +21,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install xgboost scikit-learn numpy
+          pip install xgboost scikit-learn numpy pandas
 
       - name: 配置 PushPlus Token
         run: echo "PUSHPLUS_TOKEN=${{ secrets.PUSHPLUS_TOKEN }}" >> $GITHUB_ENV
@@ -36,13 +36,16 @@ jobs:
       - name: 同步最新开奖并生成预测
         run: |
           echo "同步最新数据..."
-          # 使用默认超时与重试次数，保证兼容
           python newmacau_marksix.py sync --with-backtest
 
-      - name: 强制重训 XGB 模型并显示结果
+      - name: 训练 XGBoost 模型
         run: |
-          echo "重训 XGBoost 模型..."
-          python newmacau_marksix.py --retrain show
+          echo "训练 XGBoost 模型..."
+          python newmacau_marksix.py train-xgb
+
+      - name: 显示最终推荐并自动推送
+        run: |
+          python newmacau_marksix.py show
 
       - name: 上传数据库（备份）
         uses: actions/upload-artifact@v4
