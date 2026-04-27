@@ -36,7 +36,8 @@ jobs:
       - name: 同步最新开奖并生成预测
         run: |
           echo "同步最新数据..."
-          python newmacau_marksix.py sync --with-backtest --api-timeout 30 --api-retries 6
+          # 使用默认超时与重试次数，保证兼容
+          python newmacau_marksix.py sync --with-backtest
 
       - name: 强制重训 XGB 模型并显示结果
         run: |
