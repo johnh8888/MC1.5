@@ -2488,6 +2488,45 @@ def get_recent_two_zodiac_report(
     }
 
 
+def get_recent_three_zodiac_report(
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 16,
+) -> Dict[str, float]:
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < history_window + 1:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    start = max(history_window, len(rows) - lookback)
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
+    for i in range(start, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        picks = get_three_zodiac_picks(conn)
+        win_main = json.loads(rows[i]["numbers_json"])
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
+        hits += hit
+        samples += 1
+        if hit == 0:
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
+        else:
+            miss_streak = 0
+    if samples == 0:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    return {
+        "samples": float(samples),
+        "hit_rate": float(hits / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
+
+
 def get_recent_four_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
@@ -3052,13 +3091,13 @@ def get_final_recommendation(conn: sqlite3.Connection):
         for z in strategy_special_zodiacs:
             if z not in special_zodiacs:
                 special_zodiacs.append(z)
-            if len(special_zodiacs) == 4:
+            if len(special_zodiacs) == 5:
                 break
-    while len(special_zodiacs) < 4:
+    while len(special_zodiacs) < 5:
         for z in ZODIAC_MAP.keys():
             if z not in special_zodiacs:
                 special_zodiacs.append(z)
-            if len(special_zodiacs) == 4:
+            if len(special_zodiacs) == 5:
                 break
     return (
         issue_no,
@@ -3110,16 +3149,6 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     rm = RiskManager(bankroll=1000.0)
     zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", STRICT_TWO_HIT, 5.0, rm.bankroll)
     special_rec = rm.get_bet_recommendation("special", SPECIAL_HIT, 45.0, rm.bankroll)
-
-    # ---------- 动态权重 v2 ----------
-    dyn_weights = get_dynamic_weights_v2(conn)
-    print("")
-    print("【动态策略权重 (综合长期命中率+近期动量+连空惩罚)】")
-    for s in STRATEGY_IDS:
-        w = dyn_weights.get(s, 0.0) * 100
-        name = STRATEGY_LABELS.get(s, s)
-        bar = "█" * int(w / 2)
-        print(f"  {name}: {w:5.1f}% {bar}")
 
     # ---------- 生肖推荐（恢复显示） ----------
     zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
@@ -3292,6 +3321,13 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"  - 最近样本={int(zodiac_four_report['samples'])}期 "
         f"命中率={zodiac_four_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_four_report['max_miss_streak'])}"
+    )
+    zodiac_three_report = get_recent_three_zodiac_report(conn, lookback=20, history_window=16)
+    print("三生肖复盘（最近20期，任意中1只即算命中）:")
+    print(
+        f"  - 最近样本={int(zodiac_three_report['samples'])}期 "
+        f"命中率={zodiac_three_report['hit_rate'] * 100:.1f}% "
+        f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
     )
 
     print_final_recommendation(conn)
