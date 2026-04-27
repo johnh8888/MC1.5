@@ -75,9 +75,10 @@ STRATEGY_LABELS = {
     "momentum_v1": "近期动量",
     "ensemble_v2": "集成投票",
     "pattern_mined_v1": "规律挖掘",
+    "xgb_ensemble_v1": "XGB元集成",
 }
-STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
-SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1"]
+STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1", "xgb_ensemble_v1"]
+SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1", "xgb_ensemble_v1"]
 
 # 生肖映射（正确版本：1=马，2=蛇，3=龙，4=兔，5=虎，6=牛，7=鼠，8=猪，9=狗，10=鸡，11=猴，12=羊）
 ZODIAC_MAP = {
@@ -1302,13 +1303,13 @@ def generate_strategy(
         cfg = mined_config or _default_mined_config()
         cfg["window"] = float(window_size)
         return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
-    elif strategy in ("ensemble_v2", "ensemble_v3"):
+    elif strategy in ("ensemble_v2", "ensemble_v3", "xgb_ensemble_v1"):
         if strategy_weights is None:
             strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT) if conn else {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
         if conn is None:
-            raise ValueError("ensemble_v2/v3 requires database connection")
+            raise ValueError("ensemble_v2/v3/xgb_ensemble_v1 requires database connection")
         if issue_no is None:
-            raise ValueError("ensemble_v2/v3 requires issue_no parameter")
+            raise ValueError("ensemble_v2/v3/xgb_ensemble_v1 requires issue_no parameter")
         return _ensemble_strategy_v3_1(strategy_draws, mined_config, strategy_weights, conn, issue_no)
 
     return _apply_weight_config(
@@ -1464,13 +1465,22 @@ def run_historical_backtest(
                 if bucket not in mined_cfg_cache:
                     mined_cfg_cache[bucket] = mine_pattern_config_from_rows(draws[:i])
                 mined_cfg = mined_cfg_cache[bucket]
-            main_picks, special_number, special_score, score_map = generate_strategy(
-                history_desc,
-                strategy,
-                mined_config=mined_cfg,
-                conn=conn,
-                issue_no=issue_no,
-            )
+            if strategy == "xgb_ensemble_v1":
+                main_picks, special_number, special_score, score_map = _ensemble_strategy_v3_1(
+                    history_desc,
+                    mined_cfg,
+                    get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT),
+                    conn,
+                    issue_no,
+                )
+            else:
+                main_picks, special_number, special_score, score_map = generate_strategy(
+                    history_desc,
+                    strategy,
+                    mined_config=mined_cfg,
+                    conn=conn,
+                    issue_no=issue_no,
+                )
             picked_main = [n for n, _, _, _ in main_picks]
             pools = _build_candidate_pools(score_map, picked_main)
             hit_count = len([n for n in picked_main if n in winning_main])
