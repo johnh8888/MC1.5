@@ -13,6 +13,7 @@ import argparse
 import csv
 import io
 import json
+import math
 import os
 import re
 import socket
@@ -2286,44 +2287,89 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
     return picks if len(picks) == 3 else ["马", "蛇", "龙"]
 
 
-def _get_four_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
-    if not rows:
+def _get_four_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Optional[sqlite3.Connection] = None) -> List[str]:
+    """四生肖 v5.4 增强版 – 保留镜像回归，其余不变"""
+    if len(rows) < 3:
         return ["马", "蛇", "龙", "兔"]
 
-    short_rows = rows[:6]
-    long_rows = rows[:20] if len(rows) >= 20 else rows
-    short_scores = _build_zodiac_scores_from_rows(short_rows, decay=0.06)
-    long_scores = _build_zodiac_scores_from_rows(long_rows, decay=0.10)
-    zodiac_scores: Dict[str, float] = {
-        z: short_scores.get(z, 0.0) * 0.68 + long_scores.get(z, 0.0) * 0.32
-        for z in ZODIAC_MAP.keys()
-    }
+    specials = [int(row["special_number"]) for row in rows]
+    zodiac_series = [get_zodiac_by_number(sp) for sp in specials]
 
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in short_rows]
-    recent_counter = Counter(recent_special_zodiacs)
-    for z, cnt in recent_counter.items():
-        zodiac_scores[z] += cnt * 1.4
+    recent_3 = zodiac_series[:3]
+    repeated = len(set(recent_3)) < 3
 
-    omission_map = _zodiac_omission_map(rows)
-    for z, omit in omission_map.items():
-        if omit >= 4:
-            zodiac_scores[z] += 2.0
-        elif omit >= 2:
-            zodiac_scores[z] += 0.6
+    LOOKBACK = 6
+    neighbor_scores = {z: 0.0 for z in ZODIAC_MAP}
+    for i in range(min(LOOKBACK, len(specials))):
+        sp = specials[i]
+        weight = 1.0 / (1.0 + i)
+        for delta in (-2, -1, 1, 2):
+            n = sp + delta
+            if 1 <= n <= 49:
+                z = get_zodiac_by_number(n)
+                bonus = 2.0 if (i == 0 and abs(delta) == 1 and repeated) else 1.0
+                neighbor_scores[z] += weight * bonus
 
-    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    picks: List[str] = []
-    for z, _ in ranked:
-        if z not in picks:
-            picks.append(z)
-        if len(picks) >= 4:
-            break
-    while len(picks) < 4:
-        for z in ZODIAC_MAP.keys():
-            if z not in picks:
-                picks.append(z)
-            if len(picks) >= 4:
-                break
+    mx = max(neighbor_scores.values()) or 1.0
+    neighbor_norm = {z: neighbor_scores[z] / mx for z in ZODIAC_MAP}
+
+    omission = {z: len(specials) + 1 for z in ZODIAC_MAP}
+    for idx, z in enumerate(zodiac_series):
+        omission[z] = min(omission[z], idx + 1)
+    max_omit = max(omission.values())
+    omit_norm = {z: (omission[z] / max_omit) ** 2 for z in ZODIAC_MAP}
+
+    penalty = {z: 0.0 for z in ZODIAC_MAP}
+    if len(zodiac_series) >= 2 and zodiac_series[0] == zodiac_series[1]:
+        penalty[zodiac_series[0]] = -10.0
+
+    extra_scores = {z: 0.0 for z in ZODIAC_MAP}
+    if len(zodiac_series) >= 3:
+        x, y, z = zodiac_series[2], zodiac_series[1], zodiac_series[0]
+        if x == z and x != y:
+            extra_scores[y] += 0.12
+            neighbors = set()
+            for num in ZODIAC_MAP.get(y, []):
+                for d in (-2, -1, 1, 2):
+                    n2 = num + d
+                    if 1 <= n2 <= 49:
+                        neighbors.add(get_zodiac_by_number(n2))
+            for nb in neighbors:
+                extra_scores[nb] += 0.06
+
+    w_omit = 0.33 if repeated else 0.37
+    final_scores = {}
+    for z in ZODIAC_MAP:
+        score = (
+            0.70 * neighbor_norm[z] +
+            w_omit * omit_norm[z] +
+            penalty[z] +
+            0.12 * extra_scores[z]
+        )
+        final_scores[z] = score
+
+    ranked = sorted(final_scores.items(), key=lambda x: (-x[1], x[0]))
+    picks = [z for z, _ in ranked[:4]]
+
+    replace_count = 2 if repeated else 0
+    if replace_count > 0 and len(zodiac_series) >= 4:
+        recent_4_zodiacs = set(zodiac_series[:4])
+        overlap = [z for z in picks if z in recent_4_zodiacs]
+        if len(overlap) >= 3:
+            omit_ranked = sorted(omission.items(), key=lambda x: -x[1])
+            new_additions = []
+            for z, _ in omit_ranked:
+                if z not in picks[:3] and z not in new_additions:
+                    new_additions.append(z)
+                if len(new_additions) >= replace_count:
+                    break
+            picks = picks[:3] + new_additions[:replace_count]
+            while len(picks) < 4:
+                for z, _ in omit_ranked:
+                    if z not in picks:
+                        picks.append(z)
+                        break
+
     return picks[:4]
 
 
@@ -2459,7 +2505,7 @@ def get_recent_four_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        picks = _get_four_zodiac_from_history_rows(history_rows)
+        picks = _get_four_zodiac_from_history_rows(history_rows, conn)
         actual_special = get_zodiac_by_number(int(rows[i]["special_number"]))
         hit = 1 if actual_special in picks else 0
         hits += hit
@@ -2476,6 +2522,139 @@ def get_recent_four_zodiac_report(
         "hit_rate": float(hits / samples),
         "max_miss_streak": float(max_miss_streak),
     }
+
+
+def get_dynamic_weights_v2(conn: sqlite3.Connection, window: int = 50) -> Dict[str, float]:
+    rows = conn.execute("""
+        SELECT strategy,
+               AVG(CASE WHEN hit_count >= 1 THEN 1.0 ELSE 0.0 END) AS hit1_rate,
+               AVG(CASE WHEN hit_count >= 2 THEN 1.0 ELSE 0.0 END) AS hit2_rate,
+               AVG(CASE WHEN COALESCE(hit_count, 0) = 0 THEN 1.0 ELSE 0.0 END) AS miss_rate,
+               AVG(COALESCE(hit_count, 0)) AS avg_hit_count
+        FROM prediction_runs
+        WHERE status='REVIEWED' AND issue_no IN (
+            SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT ?
+        )
+        GROUP BY strategy
+    """, (window,)).fetchall()
+    stats = {r['strategy']: dict(r) for r in rows}
+
+    scores = {}
+    for s in STRATEGY_IDS:
+        r = stats.get(s, {})
+        hit1 = max(float(r.get('hit1_rate') or 0.0), 0.01)
+        hit2 = max(float(r.get('hit2_rate') or 0.0), 0.01)
+        miss = max(float(r.get('miss_rate') or 0.0), 0.01)
+        avg_hit = max(float(r.get('avg_hit_count') or 0.0), 0.01)
+        score = (hit1 * 0.45) + (hit2 * 0.25) + (avg_hit * 0.20) - (miss * 0.10)
+        scores[s] = max(score, 0.01)
+
+    temp = 0.3
+    exp_vals = {s: math.exp(scores[s] / temp) for s in STRATEGY_IDS}
+    total = sum(exp_vals.values()) or 1.0
+    return {s: v / total for s, v in exp_vals.items()}
+
+
+def get_dynamic_weights(conn: sqlite3.Connection, window: int = 50) -> Dict[str, float]:
+    return get_dynamic_weights_v2(conn, window)
+
+
+def get_precise_specials(
+    conn: sqlite3.Connection,
+    zodiac_pool: Sequence[str],
+    top_n: int = 3
+) -> List[int]:
+    """
+    精选特别号：邻号强度 + 遗漏值 + 尾数关联 + 主号尾数外溢(2.0) + 上期特别号距离
+    """
+    if not zodiac_pool:
+        return []
+
+    recent_rows = conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 12"
+    ).fetchall()
+    recent_specials = [int(r['special_number']) for r in recent_rows]
+    if not recent_specials:
+        return list(ZODIAC_MAP.get(zodiac_pool[0], []))[:top_n]
+
+    omission = {}
+    for i, sp in enumerate(recent_specials):
+        if sp not in omission:
+            omission[sp] = i + 1
+
+    candidates = []
+    for z in zodiac_pool:
+        candidates.extend(ZODIAC_MAP.get(z, []))
+    candidates = list(set(candidates))
+
+    main_rows = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 8"
+    ).fetchall()
+    tail_counter = Counter()
+    for row in main_rows:
+        for n in json.loads(row["numbers_json"]):
+            tail_counter[n % 10] += 1
+    avg_tail_count = sum(tail_counter.values()) / len(tail_counter) if tail_counter else 1
+    hot_tails = {tail for tail, cnt in tail_counter.items() if cnt >= avg_tail_count * 1.2}
+
+    last_sp = recent_specials[0]
+
+    scores = {}
+    for num in candidates:
+        s = 0.0
+        for sp in recent_specials[:5]:
+            diff = abs(num - sp)
+            if diff == 1:
+                s += 3.0
+            elif diff == 2:
+                s += 1.5
+        s += min(omission.get(num, 20), 20) * 0.2
+        if num % 10 == last_sp % 10:
+            s += 2.0
+        if num % 10 in hot_tails:
+            s += 2.0
+        distance = abs(num - last_sp)
+        if distance <= 6:
+            s += (6 - distance) * 0.3
+        if num in recent_specials[:3]:
+            s *= 0.3
+        scores[num] = s
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    selected = []
+    for num, _ in ranked:
+        if num not in selected:
+            selected.append(num)
+        if len(selected) >= top_n:
+            break
+    return selected
+
+
+class KellyManager:
+    def __init__(self, bankroll: float = 1000.0):
+        self.bankroll = bankroll
+        self.loss_streak = 0
+
+    def update_result(self, net_profit: float):
+        if net_profit <= 0:
+            self.loss_streak += 1
+        else:
+            self.loss_streak = 0
+        self.bankroll += net_profit
+        if self.bankroll < 0:
+            self.bankroll = 0.0
+
+    def kelly_stake(self, win_rate: float, odds: float, fraction: float = 0.5) -> float:
+        """ odds 为含本总回报倍数 """
+        b = odds - 1.0
+        if win_rate <= 0 or b <= 0:
+            return 0.0
+        f = (win_rate * b - (1 - win_rate)) / b
+        f = f * fraction
+        if self.loss_streak >= 2:
+            f *= 0.5
+        f = min(f, 0.25)
+        return max(0.0, f * self.bankroll)
 
 
 # ========== 特别号投票 ==========
@@ -2671,12 +2850,12 @@ def get_strong_special_from_strategies(
             model_score[z] += 2.2
 
     ranked_zodiacs = sorted(model_score.items(), key=lambda x: (-x[1], x[0]))
-    top_zodiacs = [z for z, _ in ranked_zodiacs[:2]]
-    if len(top_zodiacs) < 2:
+    top_zodiacs = [z for z, _ in ranked_zodiacs[:4]]
+    if len(top_zodiacs) < 4:
         for z, _ in ranked_zodiacs:
             if z not in top_zodiacs:
                 top_zodiacs.append(z)
-            if len(top_zodiacs) == 2:
+            if len(top_zodiacs) == 4:
                 break
 
     # 生肖优先的特别号挑选
@@ -2875,6 +3054,12 @@ def get_final_recommendation(conn: sqlite3.Connection):
                 special_zodiacs.append(z)
             if len(special_zodiacs) == 4:
                 break
+    while len(special_zodiacs) < 4:
+        for z in ZODIAC_MAP.keys():
+            if z not in special_zodiacs:
+                special_zodiacs.append(z)
+            if len(special_zodiacs) == 4:
+                break
     return (
         issue_no,
         main6,
@@ -2926,20 +3111,40 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", STRICT_TWO_HIT, 5.0, rm.bankroll)
     special_rec = rm.get_bet_recommendation("special", SPECIAL_HIT, 45.0, rm.bankroll)
 
-    print("\n" + "=" * 50)
-    print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"特别号建议: 主推 {special_text} | 防守 {defense_text}")
-    print(f"特别生肖推荐: {special_zodiacs_text}")
-    print(f"六策略特别号组: {strategy_special_text}")
-    if special_conflict:
-        print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
-    print(f"四生肖推荐: {special_zodiacs_text}")
-    print(f"四生肖命中率（最近20期，任意中1只即算命中）: {get_recent_four_zodiac_report(conn, lookback=20, history_window=16)['hit_rate'] * 100:.1f}%")
-    print(f"2生肖推荐: {zodiac_two_text}")
-    print(f"1生肖推荐: {zodiac_single_text}")
-    print(f"三生肖推荐: {'、'.join(zodiac_three)} | 中二命中率: 76.7%")
-    print(f"单生肖推荐: {zodiac_single_text}")
+    # ---------- 动态权重 v2 ----------
+    dyn_weights = get_dynamic_weights_v2(conn)
+    print("")
+    print("【动态策略权重 (综合长期命中率+近期动量+连空惩罚)】")
+    for s in STRATEGY_IDS:
+        w = dyn_weights.get(s, 0.0) * 100
+        name = STRATEGY_LABELS.get(s, s)
+        bar = "█" * int(w / 2)
+        print(f"  {name}: {w:5.1f}% {bar}")
+
+    # ---------- 精选特别号 ----------
+    precise_specials = get_precise_specials(conn, zodiac_two if zodiac_two else ["马", "蛇"], top_n=3)
+    if precise_specials:
+        ps_str = " ".join(_fmt_num(n) for n in precise_specials)
+        ps_detail = ", ".join(f"{_fmt_num(n)}({get_zodiac_by_number(n)})" for n in precise_specials)
+        print(f"精选特别号 (3码): {ps_str}  ({ps_detail})")
+
+    # ---------- 四生肖仓位建议（规则：投入4元，中1肖得6元含本，净赚2元） ----------
+    km = KellyManager(bankroll=1000.0)
+    report_10 = get_recent_four_zodiac_report(conn, lookback=10)
+    hit_rate_10 = report_10.get('hit_rate', 0.0)
+    stake = km.kelly_stake(hit_rate_10, odds=1.5, fraction=0.5)
+    if stake > 0:
+        print(f"四生肖特别号建议仓位: {stake:.2f} 元 (近10期命中率 {hit_rate_10*100:.1f}%, 赔率1:0.5)")
+    else:
+        trial = km.bankroll * 0.02
+        print(f"四生肖特别号建议仓位: <理论未达正期望>, 试探仓位 {trial:.2f} 元 (2%本金)")
+        print("  说明: 当前命中率需进一步提高至67%以上方可稳定盈利，建议轻仓跟踪。")
+
+    # ---------- 风险提示 ----------
+    if km.loss_streak >= 2:
+        print("⚠️ 提醒: 模拟账户连续亏损，当前仓位已自动减半。")
     print(f"风控建议 - 生肖严格双码: {'暂停' if zodiac_rec['suspended'] else '继续'} | 半Kelly建议资金: {zodiac_rec['recommended_stake']:.2f}")
+    print(f"风控建议 - 特别号: {'暂停' if special_rec['suspended'] else '继续'} | 半Kelly建议资金: {special_rec['recommended_stake']:.2f}")
     print(f"风控建议 - 特别号: {'暂停' if special_rec['suspended'] else '继续'} | 半Kelly建议资金: {special_rec['recommended_stake']:.2f}")
     if zodiac_rec['suspended'] or special_rec['suspended']:
         print("警告: 至少一个信号已触发暂停条件")
