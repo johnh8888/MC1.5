@@ -2556,6 +2556,45 @@ def get_recent_three_zodiac_report(
     }
 
 
+def get_recent_five_zodiac_report(
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 16,
+) -> Dict[str, float]:
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < history_window + 1:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    start = max(history_window, len(rows) - lookback)
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
+    for i in range(start, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        picks = _get_five_zodiac_from_history_rows(history_rows, conn)
+        win_main = json.loads(rows[i]["numbers_json"])
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
+        hits += hit
+        samples += 1
+        if hit == 0:
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
+        else:
+            miss_streak = 0
+    if samples == 0:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    return {
+        "samples": float(samples),
+        "hit_rate": float(hits / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
+
+
 def get_recent_four_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
@@ -3199,7 +3238,17 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     print(f"一生肖推荐: {zodiac_single_text}")
     print(f"二生肖推荐: {zodiac_two_text}")
     print(f"三生肖推荐: {zodiac_three_text}")
-    print(f"特别生肖推荐: {special_zodiacs_text}{xgb_tag}")
+    print(f"特别生肖推荐: {special_zodiacs_text}")
+
+    # ---------- 五生肖推荐（特肖） ----------
+    history_rows = _draws_ordered_asc(conn)[-16:]
+    five_zodiacs = _get_five_zodiac_from_history_rows(history_rows, conn)
+    five_zodiacs_text = "、".join(five_zodiacs)
+    print(f"五生肖推荐（特肖）: {five_zodiacs_text}{xgb_tag}")
+
+    # ---------- 五生肖复盘 ----------
+    five_report = get_recent_five_zodiac_report(conn, lookback=20)
+    print(f"五生肖近20期命中率: {five_report['hit_rate']*100:.1f}%  最大连空: {int(five_report['max_miss_streak'])}{xgb_tag}")
 
     # ---------- 精选特别号 ----------
     precise_specials = get_precise_specials(conn, zodiac_two if zodiac_two else ["马", "蛇"], top_n=3)
