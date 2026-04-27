@@ -3198,7 +3198,7 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
      strategy_strong_special, strategy_strong_zodiac) = rec
     special_text = _fmt_num(special)
     xgb_tag = ""
-    if xgb_pool20 is not None and len(xgb_pool20) >= 6:
+    if xgb_pool20 is not None and len(xgb_pool20) >= 20:
         pool20 = xgb_pool20[:20]
         pool14 = pool20[:14]
         pool10 = pool20[:10]
@@ -3210,6 +3210,7 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     p10 = " ".join(_fmt_num(n) for n in pool10)
     p14 = " ".join(_fmt_num(n) for n in pool14)
     p20 = " ".join(_fmt_num(n) for n in pool20)
+    xgb_suffix = " (XGB)" if xgb_pool20 is not None and len(xgb_pool20) >= 20 else ""
     trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
 
     zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
@@ -3241,14 +3242,16 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     print(f"特别生肖推荐: {special_zodiacs_text}")
 
     # ---------- 五生肖推荐（特肖） ----------
-    history_rows = _draws_ordered_asc(conn)[-16:]
+    history_rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 16"
+    ).fetchall()
     five_zodiacs = _get_five_zodiac_from_history_rows(history_rows, conn)
     five_zodiacs_text = "、".join(five_zodiacs)
-    print(f"五生肖推荐（特肖）: {five_zodiacs_text}{xgb_tag}")
+    print(f"五生肖推荐（特肖）: {five_zodiacs_text}")
 
     # ---------- 五生肖复盘 ----------
     five_report = get_recent_five_zodiac_report(conn, lookback=20)
-    print(f"五生肖近20期命中率: {five_report['hit_rate']*100:.1f}%  最大连空: {int(five_report['max_miss_streak'])}{xgb_tag}")
+    print(f"五生肖近20期命中率: {five_report['hit_rate']*100:.1f}%  最大连空: {int(five_report['max_miss_streak'])}")
 
     # ---------- 精选特别号 ----------
     precise_specials = get_precise_specials(conn, zodiac_two if zodiac_two else ["马", "蛇"], top_n=3)
@@ -3263,10 +3266,10 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     hit_rate_10 = report_10.get('hit_rate', 0.0)
     stake = km.kelly_stake(hit_rate_10, odds=1.5, fraction=0.5)
     if stake > 0:
-        print(f"五生肖特别号建议仓位: {stake:.2f} 元 (近10期命中率 {hit_rate_10*100:.1f}%, 赔率1:0.5){xgb_tag}")
+        print(f"五生肖特别号建议仓位: {stake:.2f} 元 (近10期命中率 {hit_rate_10*100:.1f}%, 赔率1:0.5)")
     else:
         trial = km.bankroll * 0.02
-        print(f"五生肖特别号建议仓位: <理论未达正期望>, 试探仓位 {trial:.2f} 元 (2%本金){xgb_tag}")
+        print(f"五生肖特别号建议仓位: <理论未达正期望>, 试探仓位 {trial:.2f} 元 (2%本金)")
         print("  说明: 当前命中率需进一步提高至67%以上方可稳定盈利，建议轻仓跟踪。")
 
     # ---------- 风险提示 ----------
@@ -3416,26 +3419,6 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
         f"命中率={zodiac_three_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
     )
-
-    # 临时回测：五生肖前 N 名命中率
-    rows = _draws_ordered_asc(conn)
-    hit_counts = {1: 0, 2: 0, 3: 0, 5: 0}
-    total = 0
-    history_window = 16
-    for i in range(history_window, len(rows)):
-        history_rows = rows[max(0, i - history_window):i]
-        if len(history_rows) < history_window:
-            continue
-        five = _get_five_zodiac_from_history_rows(history_rows, conn)
-        actual_zodiac = get_zodiac_by_number(int(rows[i]["special_number"]))
-        total += 1
-        for n in [1, 2, 3, 5]:
-            if actual_zodiac in five[:n]:
-                hit_counts[n] += 1
-    print("五生肖前N名临时回测（最近真实数据）:")
-    for n in [1, 2, 3, 5]:
-        rate = (hit_counts[n] / total * 100.0) if total else 0.0
-        print(f"  - 前{n}名命中率={rate:.1f}%")
 
     print_final_recommendation(conn, xgb_pool20=xgb_pool20)
 
