@@ -2287,8 +2287,8 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
     return picks if len(picks) == 3 else ["马", "蛇", "龙"]
 
 
-def _get_four_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Optional[sqlite3.Connection] = None) -> List[str]:
-    """四生肖 v5.4 增强版 – 保留镜像回归，其余不变"""
+def _get_five_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Optional[sqlite3.Connection] = None) -> List[str]:
+    """五生肖版 – 基于原 v5.4 增强，返回 5 个生肖"""
     if len(rows) < 3:
         return ["马", "蛇", "龙", "兔"]
 
@@ -2349,7 +2349,7 @@ def _get_four_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Option
         final_scores[z] = score
 
     ranked = sorted(final_scores.items(), key=lambda x: (-x[1], x[0]))
-    picks = [z for z, _ in ranked[:4]]
+    picks = [z for z, _ in ranked[:5]]
 
     replace_count = 2 if repeated else 0
     if replace_count > 0 and len(zodiac_series) >= 4:
@@ -2370,7 +2370,7 @@ def _get_four_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Option
                         picks.append(z)
                         break
 
-    return picks[:4]
+    return picks[:5]
 
 
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
@@ -2505,7 +2505,7 @@ def get_recent_four_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        picks = _get_four_zodiac_from_history_rows(history_rows, conn)
+        picks = _get_five_zodiac_from_history_rows(history_rows, conn)
         actual_special = get_zodiac_by_number(int(rows[i]["special_number"]))
         hit = 1 if actual_special in picks else 0
         hits += hit
@@ -2823,7 +2823,7 @@ def get_strong_special_from_strategies(
         recent_main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(row["numbers_json"]))
     recent_zodiac_counter = Counter(recent_special_zodiacs + recent_main_zodiacs)
 
-    # 四生肖特别号模型：2热 + 1冷 + 1保护
+    # 五生肖特别号模型：2热 + 1冷 + 2保护
     model_score: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
     for z, cnt in zodiac_counter.items():
         model_score[z] += cnt * 3.2
@@ -3121,6 +3121,19 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
         bar = "█" * int(w / 2)
         print(f"  {name}: {w:5.1f}% {bar}")
 
+    # ---------- 生肖推荐（恢复显示） ----------
+    zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
+    zodiac_two_text = "、".join(zodiac_two) if zodiac_two else "数据不足"
+    zodiac_three = get_three_zodiac_picks(conn)
+    zodiac_three_text = "、".join(zodiac_three)
+    special_zodiacs_text = "、".join(special_zodiacs) if special_zodiacs else "无"
+
+    print("")
+    print(f"一生肖推荐: {zodiac_single_text}")
+    print(f"二生肖推荐: {zodiac_two_text}")
+    print(f"三生肖推荐: {zodiac_three_text}")
+    print(f"特别生肖推荐: {special_zodiacs_text}")
+
     # ---------- 精选特别号 ----------
     precise_specials = get_precise_specials(conn, zodiac_two if zodiac_two else ["马", "蛇"], top_n=3)
     if precise_specials:
@@ -3128,16 +3141,16 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
         ps_detail = ", ".join(f"{_fmt_num(n)}({get_zodiac_by_number(n)})" for n in precise_specials)
         print(f"精选特别号 (3码): {ps_str}  ({ps_detail})")
 
-    # ---------- 四生肖仓位建议（规则：投入4元，中1肖得6元含本，净赚2元） ----------
+    # ---------- 五生肖仓位建议（规则：投入4元，中1肖得6元含本，净赚2元） ----------
     km = KellyManager(bankroll=1000.0)
     report_10 = get_recent_four_zodiac_report(conn, lookback=10)
     hit_rate_10 = report_10.get('hit_rate', 0.0)
     stake = km.kelly_stake(hit_rate_10, odds=1.5, fraction=0.5)
     if stake > 0:
-        print(f"四生肖特别号建议仓位: {stake:.2f} 元 (近10期命中率 {hit_rate_10*100:.1f}%, 赔率1:0.5)")
+        print(f"五生肖特别号建议仓位: {stake:.2f} 元 (近10期命中率 {hit_rate_10*100:.1f}%, 赔率1:0.5)")
     else:
         trial = km.bankroll * 0.02
-        print(f"四生肖特别号建议仓位: <理论未达正期望>, 试探仓位 {trial:.2f} 元 (2%本金)")
+        print(f"五生肖特别号建议仓位: <理论未达正期望>, 试探仓位 {trial:.2f} 元 (2%本金)")
         print("  说明: 当前命中率需进一步提高至67%以上方可稳定盈利，建议轻仓跟踪。")
 
     # ---------- 风险提示 ----------
@@ -3274,7 +3287,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
     zodiac_four_report = get_recent_four_zodiac_report(conn, lookback=20, history_window=16)
-    print("四生肖复盘（最近20期，任意中1只即算命中）:")
+    print("五生肖复盘（最近20期，任意中1只即算命中）:")
     print(
         f"  - 最近样本={int(zodiac_four_report['samples'])}期 "
         f"命中率={zodiac_four_report['hit_rate'] * 100:.1f}% "
