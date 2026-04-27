@@ -1232,26 +1232,24 @@ def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> L
     return candidates[:3] if len(candidates) >= 3 else pool20[:3]
 
 
-def _ensemble_strategy_v3_1(
-    draws: List[List[int]],
-    mined_config: Optional[Dict[str, float]],
-    strategy_weights: Dict[str, float],
-    conn: sqlite3.Connection,
-    issue_no: str
-) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    model = load_or_train_ensemble_model(conn, generate_strategy, load_recent_draws)
-    sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
-    sub_scores_dict: Dict[str, Dict[int, float]] = {}
-
-    for sub in sub_strategies:
-        _, _, _, score_map = generate_strategy(draws, sub, mined_config=mined_config, strategy_weights=strategy_weights, conn=conn, issue_no=issue_no)
-        sub_scores_dict[sub] = score_map
-
+def _ensemble_strategy_v3_1(draws, mined_config, strategy_weights, conn, issue_no):
+    model = load_or_train_ensemble_model(conn, generate_strategy)
+    sub_scores = {}
+    for sub in ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]:
+        _, _, _, score_map = generate_strategy(draws, sub, conn=conn, issue_no=issue_no)
+        sub_scores[sub] = score_map
     temperature = compute_market_temperature(draws)
-    score_map = ensemble_predict(sub_scores_dict, temperature, model)
+    recent_draws = draws[:10]
+    last_row = conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
+    last_special = int(last_row[0]) if last_row else None
+    all_nums = [n for d in recent_draws for n in d]
+    zod_cnt = Counter()
+    for n in all_nums:
+        zod_cnt[get_zodiac_by_number(n)] += 1
+    score_map = ensemble_predict(sub_scores, temperature, model, recent_draws, last_special, zod_cnt)
     main_picked = _pick_top_six(score_map, "XGB元集成")
-    main6 = [n for n, _, _, _ in main_picked]
-    special_number, confidence, _ = _generate_special_number_v4(conn, main6, issue_no)
+    main_set = {n for n, _, _, _ in main_picked}
+    special_number, confidence, _ = _generate_special_number_v4(conn, main_set, issue_no)
     return main_picked, special_number, confidence, score_map
 
 
@@ -2760,7 +2758,7 @@ def get_final_recommendation(conn: sqlite3.Connection):
     main6, pool10, pool14, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if not main6 or not pool10 or not pool14 or not pool20:
         return None
-    special, special_defenses, special_conflict = get_special_recommendation(conn, issue_no, main6)
+    special, special_defenses, special_conflict = get_special_recommendation(conn, issue_no, main6, zodiac_two)
     if special is None:
         return None
     strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = get_strong_special_from_strategies(
