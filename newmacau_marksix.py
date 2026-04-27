@@ -30,6 +30,7 @@ from urllib.request import Request, urlopen
 from tail_predictor import get_best_tail, backtest_tail
 from zodiac_strict import get_three_zodiac_picks
 from risk_manager import RiskManager
+from xgboost_predictor import XGBoostPredictor
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
@@ -1668,29 +1669,57 @@ def get_pending_runs(conn: sqlite3.Connection, limit: int = 12) -> List[sqlite3.
     ).fetchall()
 
 
-def get_review_stats(conn: sqlite3.Connection) -> List[sqlite3.Row]:
-    rows = conn.execute(
+def get_review_stats(conn: sqlite3.Connection, window: Optional[int] = None) -> List[sqlite3.Row]:
+    if window:
+        recent_issues = conn.execute(
+            "SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT ?", (window,)
+        ).fetchall()
+        issue_list = [r['issue_no'] for r in recent_issues]
+        if not issue_list:
+            return []
+        placeholders = ','.join('?' for _ in issue_list)
+        query = f"""
+            SELECT
+              strategy,
+              COUNT(*) AS c,
+              AVG(hit_count) AS avg_hit,
+              AVG(hit_rate) AS avg_rate,
+              AVG(hit_count_10) AS avg_hit_10,
+              AVG(hit_rate_10) AS avg_rate_10,
+              AVG(hit_count_14) AS avg_hit_14,
+              AVG(hit_rate_14) AS avg_rate_14,
+              AVG(hit_count_20) AS avg_hit_20,
+              AVG(hit_rate_20) AS avg_rate_20,
+              AVG(COALESCE(special_hit, 0)) AS special_rate,
+              AVG(CASE WHEN hit_count >= 1 THEN 1.0 ELSE 0.0 END) AS hit1_rate,
+              AVG(CASE WHEN hit_count >= 2 THEN 1.0 ELSE 0.0 END) AS hit2_rate
+            FROM prediction_runs
+            WHERE status='REVIEWED' AND issue_no IN ({placeholders})
+            GROUP BY strategy
+            ORDER BY avg_rate DESC
         """
-           SELECT
-             strategy,
-             COUNT(*) AS c,
-             AVG(hit_count) AS avg_hit,
-             AVG(hit_rate) AS avg_rate,
-             AVG(hit_count_10) AS avg_hit_10,
-             AVG(hit_rate_10) AS avg_rate_10,
-             AVG(hit_count_14) AS avg_hit_14,
-             AVG(hit_rate_14) AS avg_rate_14,
-             AVG(hit_count_20) AS avg_hit_20,
-             AVG(hit_rate_20) AS avg_rate_20,
-             AVG(COALESCE(special_hit, 0)) AS special_rate,
-             AVG(CASE WHEN hit_count >= 1 THEN 1.0 ELSE 0.0 END) AS hit1_rate,
-             AVG(CASE WHEN hit_count >= 2 THEN 1.0 ELSE 0.0 END) AS hit2_rate
-           FROM prediction_runs
-           WHERE status='REVIEWED'
-           GROUP BY strategy
-           ORDER BY avg_rate DESC
-           """
-    ).fetchall()
+        rows = conn.execute(query, issue_list).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT
+              strategy,
+              COUNT(*) AS c,
+              AVG(hit_count) AS avg_hit,
+              AVG(hit_rate) AS avg_rate,
+              AVG(hit_count_10) AS avg_hit_10,
+              AVG(hit_rate_10) AS avg_rate_10,
+              AVG(hit_count_14) AS avg_hit_14,
+              AVG(hit_rate_14) AS avg_rate_14,
+              AVG(hit_count_20) AS avg_hit_20,
+              AVG(hit_rate_20) AS avg_rate_20,
+              AVG(COALESCE(special_hit, 0)) AS special_rate,
+              AVG(CASE WHEN hit_count >= 1 THEN 1.0 ELSE 0.0 END) AS hit1_rate,
+              AVG(CASE WHEN hit_count >= 2 THEN 1.0 ELSE 0.0 END) AS hit2_rate
+            FROM prediction_runs
+            WHERE status='REVIEWED'
+            GROUP BY strategy
+            ORDER BY avg_rate DESC
+        """).fetchall()
     out = []
     for r in rows:
         strat = str(r["strategy"])
@@ -3119,7 +3148,7 @@ def get_final_recommendation(conn: sqlite3.Connection):
     )
 
 
-def print_final_recommendation(conn: sqlite3.Connection) -> None:
+def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = None) -> None:
     rec = get_final_recommendation(conn)
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
@@ -3129,6 +3158,15 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
      special_zodiacs, strategy_specials, strategy_special_zodiacs,
      strategy_strong_special, strategy_strong_zodiac) = rec
     special_text = _fmt_num(special)
+    xgb_tag = ""
+    if xgb_pool20 is not None and len(xgb_pool20) >= 6:
+        pool20 = xgb_pool20[:20]
+        pool14 = pool20[:14]
+        pool10 = pool20[:10]
+        main6 = pool20[:6]
+        xgb_tag = " (XGB)"
+        print("[XGB] 主号池已升级为 XGBoost 预测池")
+
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
     p14 = " ".join(_fmt_num(n) for n in pool14)
@@ -3161,14 +3199,14 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"一生肖推荐: {zodiac_single_text}")
     print(f"二生肖推荐: {zodiac_two_text}")
     print(f"三生肖推荐: {zodiac_three_text}")
-    print(f"特别生肖推荐: {special_zodiacs_text}")
+    print(f"特别生肖推荐: {special_zodiacs_text}{xgb_tag}")
 
     # ---------- 精选特别号 ----------
     precise_specials = get_precise_specials(conn, zodiac_two if zodiac_two else ["马", "蛇"], top_n=3)
     if precise_specials:
         ps_str = " ".join(_fmt_num(n) for n in precise_specials)
         ps_detail = ", ".join(f"{_fmt_num(n)}({get_zodiac_by_number(n)})" for n in precise_specials)
-        print(f"精选特别号 (3码): {ps_str}  ({ps_detail})")
+        print(f"精选特别号 (3码): {ps_str}  ({ps_detail}){xgb_tag}")
 
     # ---------- 五生肖仓位建议（规则：投入4元，中1肖得6元含本，净赚2元） ----------
     km = KellyManager(bankroll=1000.0)
@@ -3176,10 +3214,10 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     hit_rate_10 = report_10.get('hit_rate', 0.0)
     stake = km.kelly_stake(hit_rate_10, odds=1.5, fraction=0.5)
     if stake > 0:
-        print(f"五生肖特别号建议仓位: {stake:.2f} 元 (近10期命中率 {hit_rate_10*100:.1f}%, 赔率1:0.5)")
+        print(f"五生肖特别号建议仓位: {stake:.2f} 元 (近10期命中率 {hit_rate_10*100:.1f}%, 赔率1:0.5){xgb_tag}")
     else:
         trial = km.bankroll * 0.02
-        print(f"五生肖特别号建议仓位: <理论未达正期望>, 试探仓位 {trial:.2f} 元 (2%本金)")
+        print(f"五生肖特别号建议仓位: <理论未达正期望>, 试探仓位 {trial:.2f} 元 (2%本金){xgb_tag}")
         print("  说明: 当前命中率需进一步提高至67%以上方可稳定盈利，建议轻仓跟踪。")
 
     # ---------- 风险提示 ----------
@@ -3260,7 +3298,7 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
-def print_dashboard(conn: sqlite3.Connection) -> None:
+def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = None) -> None:
     latest = get_latest_draw(conn)
     if latest:
         nums = " ".join(_fmt_num(n) for n in json.loads(latest["numbers_json"]))
@@ -3270,8 +3308,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
     print_recommendation_sheet(conn, limit=8)
 
-    print("\n策略平均命中率:")
-    stats = get_review_stats(conn)
+    print("\n策略最近10期平均命中率:")
+    stats = get_review_stats(conn, window=10)
     if not stats:
         print("  (暂无复盘)")
     for s in stats:
@@ -3330,7 +3368,27 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
     )
 
-    print_final_recommendation(conn)
+    # 临时回测：五生肖前 N 名命中率
+    rows = _draws_ordered_asc(conn)
+    hit_counts = {1: 0, 2: 0, 3: 0, 5: 0}
+    total = 0
+    history_window = 16
+    for i in range(history_window, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        five = _get_five_zodiac_from_history_rows(history_rows, conn)
+        actual_zodiac = get_zodiac_by_number(int(rows[i]["special_number"]))
+        total += 1
+        for n in [1, 2, 3, 5]:
+            if actual_zodiac in five[:n]:
+                hit_counts[n] += 1
+    print("五生肖前N名临时回测（最近真实数据）:")
+    for n in [1, 2, 3, 5]:
+        rate = (hit_counts[n] / total * 100.0) if total else 0.0
+        print(f"  - 前{n}名命中率={rate:.1f}%")
+
+    print_final_recommendation(conn, xgb_pool20=xgb_pool20)
 
     print("\n" + review_latest_prediction(conn))
     # 精简最终展示：不再输出特别号规则贡献回测详情
@@ -3407,6 +3465,21 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_train_xgb(args: argparse.Namespace) -> None:
+    conn = connect_db(args.db)
+    try:
+        init_db(conn)
+        predictor = XGBoostPredictor()
+        predictor.train(conn)
+        model_path = SCRIPT_DIR / 'xgb_model.pkl'
+        import pickle
+        with open(model_path, 'wb') as f:
+            pickle.dump(predictor, f)
+        print(f"XGBoost 模型已训练并保存至 {model_path}")
+    finally:
+        conn.close()
+
+
 def cmd_sync(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
@@ -3479,7 +3552,23 @@ def cmd_show(args: argparse.Namespace) -> None:
     try:
         init_db(conn)
         backfill_missing_special_picks(conn)
-        print_dashboard(conn)
+
+        xgb_pool20 = None
+        model_path = SCRIPT_DIR / 'xgb_model.pkl'
+        if model_path.exists():
+            import pickle
+            with open(model_path, 'rb') as f:
+                predictor = pickle.load(f)
+            try:
+                xgb_pool20 = predictor.predict_pool(conn, top_k=20)
+                print(f"[XGB] 已加载模型，预测主号池 Top20: {xgb_pool20}")
+            except Exception as e:
+                print(f"[XGB] 预测失败（将使用原策略融合）: {e}")
+                xgb_pool20 = None
+        else:
+            print("[XGB] 模型未训练（运行 train-xgb 可训练），使用原策略融合主号池。")
+
+        print_dashboard(conn, xgb_pool20=xgb_pool20)
     finally:
         conn.close()
 
@@ -3558,6 +3647,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_mine = sub.add_parser("mine", help="Mine best pattern parameters from history")
     p_mine.set_defaults(func=cmd_mine)
+
+    p_train_xgb = sub.add_parser("train-xgb", help="Train XGBoost model for main numbers")
+    p_train_xgb.set_defaults(func=cmd_train_xgb)
 
     return p
 
