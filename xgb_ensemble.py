@@ -75,7 +75,7 @@ def compute_market_temperature(draws: Sequence[Sequence[int]]) -> Dict[str, floa
 
 def _score_vector_to_probabilities(score_map: Dict[int, float]) -> np.ndarray:
     values = np.asarray([float(score_map.get(n, 0.0)) for n in ALL_NUMBERS], dtype=np.float32)
-    values = values - float(values.max(initial=0.0))
+    values = values - float(values.max())
     exp = np.exp(values)
     denom = float(exp.sum()) or 1.0
     return exp / denom
@@ -88,11 +88,19 @@ def _build_feature_vector(
 ) -> np.ndarray:
     recent = list(draws[:FEATURE_WINDOW_DEFAULT])
     temp = compute_market_temperature(recent)
+    omission = _omission_map(recent)
     features: List[float] = [
         float(len(recent)),
         float(temperature.get("cold_ratio", temp["cold_ratio"])),
         float(temperature.get("zone_entropy", temp["zone_entropy"])),
     ]
+
+    # number-level features for all 49 numbers: omission, tail, zodiac, normalized id
+    for n in ALL_NUMBERS:
+        features.append(float(omission.get(n, 0.0)))
+        features.append(float(n % 10))
+        features.append(float((n - 1) // 12))
+        features.append(float(n) / 49.0)
 
     if generate_strategy_fn is None:
         for _ in STRATEGIES:
@@ -147,13 +155,18 @@ def train_ensemble_model(
         history = list(reversed(parsed_draws[max(0, i - FEATURE_WINDOW_DEFAULT):i]))
         temperature = compute_market_temperature(history)
 
-        # one feature row per target number label
         next_draw = {int(n) for n in parsed_draws[i] if 1 <= int(n) <= 49}
         score_features = _build_feature_vector(history, temperature, generate_strategy_fn)
         for n in ALL_NUMBERS:
             row_feat = score_features.copy()
-            # tiny label-specific perturbation to let the model distinguish numbers
-            row_feat = np.concatenate([row_feat, np.asarray([float(n) / 49.0], dtype=np.float32)])
+            row_feat = np.concatenate([
+                row_feat,
+                np.asarray([
+                    float(n) / 49.0,
+                    float(n % 10),
+                    float((n - 1) // 12),
+                ], dtype=np.float32),
+            ])
             X.append(row_feat)
             y.append(1 if n in next_draw else 0)
 
@@ -164,13 +177,14 @@ def train_ensemble_model(
     y_arr = np.asarray(y, dtype=np.int32)
 
     model = xgb.XGBClassifier(
-        n_estimators=260,
-        max_depth=5,
+        n_estimators=300,
+        max_depth=6,
         learning_rate=0.05,
         subsample=0.9,
         colsample_bytree=0.9,
         reg_alpha=0.1,
         reg_lambda=1.0,
+        scale_pos_weight=6,
         objective="binary:logistic",
         eval_metric="logloss",
         tree_method="hist",
