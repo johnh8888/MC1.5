@@ -27,9 +27,59 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
-from zodiac_strict import get_three_zodiac_picks
-from risk_manager import RiskManager
-from xgboost_predictor import XGBoostPredictor
+# 统一控制台输出编码，避免 Windows 终端乱码
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+try:
+    from tail_predictor import get_best_tail, backtest_tail
+except Exception:
+    def get_best_tail(*args, **kwargs):
+        return []
+
+    def backtest_tail(*args, **kwargs):
+        return 0.0, 0, 0
+
+try:
+    from zodiac_strict import get_three_zodiac_picks
+except Exception:
+    def get_three_zodiac_picks(*args, **kwargs):
+        return ["马", "蛇", "龙"]
+
+try:
+    from risk_manager import RiskManager
+except Exception:
+    class RiskManager:
+        def __init__(self, bankroll: float = 1000.0):
+            self.bankroll = bankroll
+
+        def get_bet_recommendation(self, *_args, **_kwargs):
+            return {"suspended": False, "recommended_stake": 0.0}
+
+try:
+    from xgboost_predictor import XGBoostPredictor
+except Exception:
+    class XGBoostPredictor:
+        def train(self, conn):
+            return None
+
+        def predict_pool(self, conn, top_k: int = 20):
+            return []
+
+try:
+    from lightgbm_predictor import LightGBMPredictor
+except Exception:
+    class LightGBMPredictor:
+        def train(self, conn):
+            return None
+
+        def predict_pool(self, conn, top_k: int = 20):
+            return []
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
@@ -59,6 +109,7 @@ STRATEGY_BASE_WINDOWS = {
 WEIGHT_WINDOW_DEFAULT = 30
 HEALTH_WINDOW_DEFAULT = 18
 BACKTEST_ISSUES_DEFAULT = 120
+ZERO_HIT_TRIGGER_THRESHOLD = float(os.environ.get("ZERO_HIT_TRIGGER_THRESHOLD", "0.5"))
 
 # Ensemble v3.1 配置
 ENSEMBLE_DIVERSITY_BONUS = 0.18
@@ -2669,7 +2720,7 @@ def get_dynamic_weights_v2(conn: sqlite3.Connection, window: int = 50) -> Dict[s
         score = (hit1 * 0.45) + (hit2 * 0.25) + (avg_hit * 0.20) - (miss * 0.10)
         scores[s] = max(score, 0.01)
 
-    temp = 0.2
+    temp = 0.15
     exp_vals = {s: math.exp(scores[s] / temp) for s in STRATEGY_IDS}
     total = sum(exp_vals.values()) or 1.0
     return {s: v / total for s, v in exp_vals.items()}
@@ -3254,6 +3305,67 @@ def get_special_rule_contribution_report_multi(conn: sqlite3.Connection) -> str:
     return "\n\n".join(parts)
 
 
+def _get_longest_omitted_numbers(conn: sqlite3.Connection, limit: int = 6) -> List[int]:
+    all_draws = conn.execute("SELECT numbers_json FROM draws ORDER BY draw_date DESC").fetchall()
+    omission = {n: 0 for n in ALL_NUMBERS}
+    for n in ALL_NUMBERS:
+        omit = 0
+        for row in all_draws:
+            if n in json.loads(row['numbers_json']):
+                break
+            omit += 1
+        omission[n] = omit
+
+    cold_zone = {n: omission[n] for n in omission if 15 <= omission[n] <= 25}
+    if len(cold_zone) >= limit:
+        return sorted(cold_zone, key=cold_zone.get, reverse=True)[:limit]
+    return sorted(omission, key=omission.get, reverse=True)[:limit]
+
+
+def _should_apply_zero_hit_patch(conn: sqlite3.Connection, threshold: float = ZERO_HIT_TRIGGER_THRESHOLD) -> bool:
+    last_issue = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
+    if not last_issue:
+        return False
+
+    avg_hit_last = conn.execute(
+        "SELECT AVG(COALESCE(hit_count,0)) FROM prediction_runs WHERE issue_no=? AND status='REVIEWED'",
+        (last_issue['issue_no'],)
+    ).fetchone()[0]
+
+    any_zero = conn.execute(
+        "SELECT 1 FROM prediction_runs WHERE issue_no=? AND status='REVIEWED' AND (hit_count IS NULL OR hit_count=0) LIMIT 1",
+        (last_issue['issue_no'],)
+    ).fetchone()
+
+    return (avg_hit_last is not None and avg_hit_last < float(threshold)) or bool(any_zero)
+
+
+def _apply_zero_hit_patch_to_pools(conn: sqlite3.Connection, pool20: List[int], pool14: List[int], pool10: List[int], main6: List[int]) -> Tuple[List[int], List[int], List[int], List[int]]:
+    if len(pool20) < 6:
+        return main6, pool10, pool14, pool20
+
+    most_omitted = _get_longest_omitted_numbers(conn, limit=6)
+    merged = list(pool20)
+    for n in most_omitted:
+        if n not in merged:
+            merged.append(n)
+
+    deduped: List[int] = []
+    for n in merged:
+        if n not in deduped:
+            deduped.append(n)
+
+    if len(deduped) < 20:
+        for n in _get_longest_omitted_numbers(conn, limit=49):
+            if n not in deduped:
+                deduped.append(n)
+            if len(deduped) == 20:
+                break
+
+    pool20 = deduped[:20]
+    return pool20[:6], pool20[:10], pool20[:14], pool20
+
+
 def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[List[int], List[int], List[int], List[int], Optional[int]]:
     strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
     number_scores: Dict[int, float] = {}
@@ -3293,25 +3405,8 @@ def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[
     pool10 = pool20[:10]
     main6 = pool20[:6]
 
-    recent_hits = conn.execute(
-        "SELECT hit_count FROM prediction_runs WHERE strategy = 'ensemble_v2' AND status = 'REVIEWED' ORDER BY reviewed_at DESC, created_at DESC, id DESC LIMIT 2"
-    ).fetchall()
-    if len(recent_hits) == 2 and all(int(r['hit_count'] or 0) == 0 for r in recent_hits):
-        all_draws = conn.execute("SELECT numbers_json FROM draws ORDER BY draw_date DESC").fetchall()
-        omission = {n: 0 for n in ALL_NUMBERS}
-        for n in ALL_NUMBERS:
-            omit = 0
-            for row in all_draws:
-                if n in json.loads(row['numbers_json']):
-                    break
-                omit += 1
-            omission[n] = omit
-        most_omitted = sorted(omission, key=lambda x: omission[x], reverse=True)[:4]
-        if len(pool20) >= 6:
-            pool20 = pool20[:-4] + most_omitted
-            pool14 = pool20[:14]
-            pool10 = pool20[:10]
-            main6 = pool20[:6]
+    if _should_apply_zero_hit_patch(conn):
+        main6, pool10, pool14, pool20 = _apply_zero_hit_patch_to_pools(conn, pool20, pool14, pool10, main6)
 
     special = None
     if special_scores:
@@ -3566,6 +3661,19 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
             f"最大连空={int(s.get('max_miss_streak', 0))}"
         )
 
+    confidence = 0.0
+    max_miss = 0
+    if stats_10:
+        confidence = max(float(s.get('hit1_rate', 0.0)) for s in stats_10) * 100.0
+        max_miss = max(int(s.get('max_miss_streak', 0)) for s in stats_10)
+    if confidence >= 80 and max_miss < 3:
+        advice = "🔥 高信心：可适当加大投入"
+    elif confidence >= 60:
+        advice = "👍 中等信心：正常投入"
+    else:
+        advice = "⚠️ 低信心：建议减少投入或观望"
+    print(f"\n信心指数: {confidence:.1f}/100 | 建议投入: {advice}")
+
     print(f"\n策略健康度（最近{HEALTH_WINDOW_DEFAULT}期）:")
     weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
     health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
@@ -3658,6 +3766,16 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
             top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
             top_special_str = " ".join(_fmt_num(n) for n in top_special_votes) if top_special_votes else "无"
 
+            stats_10 = get_review_stats(conn, window=10)
+            confidence = max((float(s.get("hit1_rate") or 0.0) for s in stats_10), default=0.0) * 100.0
+            max_miss = max((int(s.get("max_miss_streak", 0)) for s in stats_10), default=0)
+            if confidence >= 80 and max_miss < 3:
+                advice = "🔥 高信心：可适当加大投入"
+            elif confidence >= 60:
+                advice = "👍 中等信心：正常投入"
+            else:
+                advice = "⚠️ 低信心：建议减少投入或观望"
+
             zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
             zodiac_two_text = "、".join(zodiac_two) if zodiac_two else "数据不足"
             conflict_tip = "（已避开主号冲突）" if special_conflict else ""
@@ -3669,6 +3787,8 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
                 f"特别生肖推荐：{special_zodiacs_text}\n"
                 f"特别号主推：{special_text}{conflict_tip}\n"
                 f"特别号防守：{defense_text}\n"
+                f"信心指数：{confidence:.0f}/100\n"
+                f"建议投入：{advice}\n"
                 f"六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
                 f"六策略特别号组：{strategy_special_text}\n"
                 f"六策略生肖组：{strategy_zodiac_text}\n"
@@ -3706,6 +3826,21 @@ def cmd_train_xgb(args: argparse.Namespace) -> None:
         with open(model_path, 'wb') as f:
             pickle.dump(predictor, f)
         print(f"XGBoost 模型已训练并保存至 {model_path}")
+    finally:
+        conn.close()
+
+
+def cmd_train_lgb(args: argparse.Namespace) -> None:
+    conn = connect_db(args.db)
+    try:
+        init_db(conn)
+        predictor = LightGBMPredictor()
+        predictor.train(conn)
+        model_path = SCRIPT_DIR / 'lgb_model.pkl'
+        import pickle
+        with open(model_path, 'wb') as f:
+            pickle.dump(predictor, f)
+        print(f"LightGBM 模型已训练并保存至 {model_path}")
     finally:
         conn.close()
 
@@ -3796,13 +3931,15 @@ def cmd_show(args: argparse.Namespace) -> None:
             print("自动同步与回测完成。")
 
         xgb_pool20 = None
-        model_path = SCRIPT_DIR / 'xgb_model.pkl'
-        if model_path.exists():
+        lgb_pool20 = None
+
+        model_path_xgb = SCRIPT_DIR / 'xgb_model.pkl'
+        if model_path_xgb.exists():
             import pickle
-            with open(model_path, 'rb') as f:
-                predictor = pickle.load(f)
+            with open(model_path_xgb, 'rb') as f:
+                xgb_predictor = pickle.load(f)
             try:
-                xgb_pool20 = predictor.predict_pool(conn, top_k=20)
+                xgb_pool20 = xgb_predictor.predict_pool(conn, top_k=20)
                 print(f"[XGB] 已加载模型，预测主号池 Top20: {xgb_pool20}")
             except Exception as e:
                 print(f"[XGB] 预测失败（将使用原策略融合）: {e}")
@@ -3810,7 +3947,40 @@ def cmd_show(args: argparse.Namespace) -> None:
         else:
             print("[XGB] 模型未训练（运行 train-xgb 可训练），使用原策略融合主号池。")
 
-        print_dashboard(conn, xgb_pool20=xgb_pool20)
+        model_path_lgb = SCRIPT_DIR / 'lgb_model.pkl'
+        if model_path_lgb.exists():
+            import pickle
+            with open(model_path_lgb, 'rb') as f:
+                lgb_predictor = pickle.load(f)
+            try:
+                lgb_pool20 = lgb_predictor.predict_pool(conn, top_k=20)
+                print(f"[LGB] 已加载模型，预测主号池 Top20: {lgb_pool20}")
+            except Exception as e:
+                print(f"[LGB] 预测失败（将忽略该模型）: {e}")
+                lgb_pool20 = None
+        else:
+            print("[LGB] 模型未训练（运行 train-lgb 可训练），当前跳过。")
+
+        merged_pool20 = None
+        if xgb_pool20 and lgb_pool20:
+            union = []
+            seen = set()
+            max_len = max(len(xgb_pool20), len(lgb_pool20))
+            for i in range(max_len):
+                if i < len(xgb_pool20) and xgb_pool20[i] not in seen:
+                    union.append(xgb_pool20[i])
+                    seen.add(xgb_pool20[i])
+                if i < len(lgb_pool20) and lgb_pool20[i] not in seen:
+                    union.append(lgb_pool20[i])
+                    seen.add(lgb_pool20[i])
+            merged_pool20 = union[:20]
+            print(f"[融合] 合并双模型主号池 Top20: {merged_pool20}")
+        elif xgb_pool20:
+            merged_pool20 = xgb_pool20
+        elif lgb_pool20:
+            merged_pool20 = lgb_pool20
+
+        print_dashboard(conn, xgb_pool20=merged_pool20)
     finally:
         conn.close()
 
@@ -3902,6 +4072,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_train_xgb = sub.add_parser("train-xgb", help="Train XGBoost model for main numbers")
     p_train_xgb.set_defaults(func=cmd_train_xgb)
+
+    p_train_lgb = sub.add_parser("train-lgb", help="Train LightGBM model for main numbers")
+    p_train_lgb.set_defaults(func=cmd_train_lgb)
 
     p_backfill_special = sub.add_parser("backfill-special", help="回溯历史精选特别号记录")
     p_backfill_special.set_defaults(func=cmd_backfill_special)
