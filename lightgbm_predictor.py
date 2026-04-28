@@ -12,7 +12,7 @@ try:
 except Exception:
     lgb = None
 
-# 复制所有公用函数（与 xgboost_predictor.py 中相同的部分）
+# ======== 公用常量与函数 (与 XGBoost 版完全一致) ========
 ALL_NUMBERS = list(range(1, 50))
 ZODIAC_MAP = {
     "马": [1, 13, 25, 37, 49],
@@ -37,11 +37,13 @@ STRATEGY_WEIGHT_CONFIGS = {
     "pattern_mined_v1":{"window": 6,  "w_freq": 0.30, "w_omit": 0.45, "w_mom": 0.15, "w_zone": 0.10, "w_adj": 0.10},
 }
 
+
 def get_zodiac_by_number(n: int) -> str:
     for z, nums in ZODIAC_MAP.items():
         if n in nums:
             return z
     return "马"
+
 
 def _normalize_scores(score_map):
     values = list(score_map.values())
@@ -50,12 +52,14 @@ def _normalize_scores(score_map):
         return {k: 0.0 for k in score_map}
     return {k: (v - mn) / (mx - mn) for k, v in score_map.items()}
 
+
 def _freq_map(draws):
     freq = {n: 0.0 for n in ALL_NUMBERS}
     for draw in draws:
         for n in draw:
             freq[n] += 1.0
     return freq
+
 
 def _omission_map(draws):
     omission = {n: float(len(draws) + 1) for n in ALL_NUMBERS}
@@ -64,6 +68,7 @@ def _omission_map(draws):
             omission[n] = min(omission[n], float(i + 1))
     return omission
 
+
 def _momentum_map(draws):
     m = {n: 0.0 for n in ALL_NUMBERS}
     for i, draw in enumerate(draws):
@@ -71,6 +76,7 @@ def _momentum_map(draws):
         for n in draw:
             m[n] += w
     return m
+
 
 def _zone_heat_map(draws, window=3):
     zone_counts = [0.0] * 5
@@ -85,6 +91,7 @@ def _zone_heat_map(draws, window=3):
     zone_score = [expected - c for c in zone_counts]
     return {n: zone_score[min(4, (n - 1) // 10)] for n in ALL_NUMBERS}
 
+
 def _adjacency_compensation_map(draws, window=5):
     adjacency = {n: 0.0 for n in ALL_NUMBERS}
     w = draws[:window]
@@ -98,6 +105,7 @@ def _adjacency_compensation_map(draws, window=5):
                     if 1 <= candidate <= 49:
                         adjacency[candidate] += bonus * recency_w
     return adjacency
+
 
 def compute_strategy_scores(history_draws, strategy_name):
     cfg = STRATEGY_WEIGHT_CONFIGS.get(strategy_name)
@@ -126,6 +134,7 @@ def compute_strategy_scores(history_draws, strategy_name):
         )
     return scores
 
+
 def calc_span_and_sum(numbers):
     if not numbers or len(numbers) < 6:
         return 0, 0
@@ -133,6 +142,7 @@ def calc_span_and_sum(numbers):
     span = sorted_nums[-1] - sorted_nums[0]
     total_sum = sum(numbers)
     return span, total_sum
+
 
 def calc_span_sum_stats(draws, window=10):
     spans = []
@@ -210,6 +220,24 @@ class LightGBMPredictor:
             hist_span = history[-10:] if len(history) >= 10 else history
             mean_span, std_span, mean_sum, std_sum = calc_span_sum_stats(hist_span, window=10)
 
+            # 上一期大盘特征
+            if len(history) > 0:
+                last_row = history[-1]
+                last_nums = json.loads(last_row['numbers_json'])
+                last_sp = last_row['special_number']
+                last_span_val, last_sum_val = calc_span_and_sum(last_nums)
+                last_odd_ratio = sum(1 for n in last_nums if n % 2 == 1) / 6.0
+                last_big_ratio = sum(1 for n in last_nums if n > 25) / 6.0
+                freq_10 = Counter()
+                for h in history[-10:]:
+                    freq_10.update(json.loads(h['numbers_json']))
+                mean_10 = sum(freq_10.values()) / len(freq_10) if freq_10 else 1
+                last_hot_cnt = sum(1 for n in last_nums if freq_10.get(n, 0) > mean_10)
+                last_cold_cnt = 6 - last_hot_cnt
+            else:
+                last_span_val = last_sum_val = last_odd_ratio = last_big_ratio = last_hot_cnt = last_cold_cnt = 0
+                last_sp = 0
+
             for num in ALL_NUMBERS:
                 features = {
                     'num': num,
@@ -226,6 +254,13 @@ class LightGBMPredictor:
                     'std_span': std_span,
                     'mean_sum': mean_sum,
                     'std_sum': std_sum,
+                    'last_span': last_span_val,
+                    'last_sum': last_sum_val,
+                    'last_odd_ratio': last_odd_ratio,
+                    'last_big_ratio': last_big_ratio,
+                    'last_hot_cnt': last_hot_cnt,
+                    'last_cold_cnt': last_cold_cnt,
+                    'last_special': last_sp,
                 }
                 for sname in non_ensemble:
                     features[f'score_{sname}'] = strategy_scores[sname].get(num, 0.0)
@@ -312,6 +347,23 @@ class LightGBMPredictor:
         hist_span = draws[1:11] if len(draws) >= 11 else draws[1:]
         mean_span, std_span, mean_sum, std_sum = calc_span_sum_stats(hist_span, window=10)
 
+        if len(draws) >= 2:
+            prev_row = draws[1]
+            prev_nums = json.loads(prev_row['numbers_json'])
+            prev_special = prev_row['special_number']
+            last_span_val, last_sum_val = calc_span_and_sum(prev_nums)
+            last_odd_ratio = sum(1 for n in prev_nums if n % 2 == 1) / 6.0
+            last_big_ratio = sum(1 for n in prev_nums if n > 25) / 6.0
+            freq_10 = Counter()
+            for h in draws[1:11]:
+                freq_10.update(json.loads(h['numbers_json']))
+            mean_10 = sum(freq_10.values()) / len(freq_10) if freq_10 else 1
+            last_hot_cnt = sum(1 for n in prev_nums if freq_10.get(n, 0) > mean_10)
+            last_cold_cnt = 6 - last_hot_cnt
+        else:
+            last_span_val = last_sum_val = last_odd_ratio = last_big_ratio = last_hot_cnt = last_cold_cnt = 0
+            prev_special = 0
+
         rows = []
         for num in ALL_NUMBERS:
             feature = {
@@ -328,6 +380,13 @@ class LightGBMPredictor:
                 'std_span': std_span,
                 'mean_sum': mean_sum,
                 'std_sum': std_sum,
+                'last_span': last_span_val,
+                'last_sum': last_sum_val,
+                'last_odd_ratio': last_odd_ratio,
+                'last_big_ratio': last_big_ratio,
+                'last_hot_cnt': last_hot_cnt,
+                'last_cold_cnt': last_cold_cnt,
+                'last_special': prev_special,
             }
             for sname in non_ensemble:
                 feature[f'score_{sname}'] = strategy_scores[sname].get(num, 0.0)
