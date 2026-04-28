@@ -31,7 +31,7 @@ jobs:
           if_no_artifact_found: ignore
         continue-on-error: true
 
-      - name: 初始化数据库
+      - name: 初始化数据库（如果不存在，则拉取最近100期）
         run: |
           if [ ! -f "newmacau_marksix.db" ]; then
             echo "数据库不存在，拉取最近100期数据..."
@@ -43,6 +43,29 @@ jobs:
 
       - name: 回溯精选特别号历史日志
         run: python newmacau_marksix.py backfill-special
+
+      - name: 临时诊断：查看精选特别号命中详情
+        run: |
+          python -c "
+          import sqlite3, json
+          from newmacau_marksix import *
+
+          conn = connect_db('newmacau_marksix.db')
+          init_db(conn)
+
+          recent = [r['issue_no'] for r in conn.execute('SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 20').fetchall()]
+          print('期号 | 实际特号(生肖) | 精选号 | 命中')
+          print('-'*80)
+          for issue in recent:
+              row = conn.execute('SELECT special_number FROM draws WHERE issue_no=?', (issue,)).fetchone()
+              actual = row['special_number']
+              picks = conn.execute('SELECT picks_json FROM special_picks_log WHERE issue_no=?', (issue,)).fetchone()
+              picks_list = json.loads(picks['picks_json']) if picks else []
+              hit = 'Yes' if actual in picks_list else 'No'
+              zodiac = get_zodiac_by_number(actual)
+              print(f'{issue} | {actual}({zodiac}) | {picks_list} | {hit}')
+          conn.close()
+          "
 
       - name: 显示最终推荐并自动推送
         run: python newmacau_marksix.py show
