@@ -52,6 +52,11 @@ jobs:
           echo "训练 XGBoost 模型..."
           python newmacau_marksix.py train-xgb
 
+      - name: 回溯精选特别号历史日志
+        run: |
+          echo "回溯精选特别号历史数据..."
+          python newmacau_marksix.py backfill-special
+
       - name: 显示最终推荐并自动推送
         run: |
           python newmacau_marksix.py show
