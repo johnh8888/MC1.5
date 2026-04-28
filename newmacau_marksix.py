@@ -2956,9 +2956,16 @@ def backfill_special_picks_log(conn, max_issues=100):
 
         picks = get_precise_specials_from_history(history, zodiac_pool, top_n=3)
         if picks:
+            # ========== 关键：计算本期是否命中 ==========
+            actual_special_row = conn.execute(
+                "SELECT special_number FROM draws WHERE issue_no = ?", (target_issue,)
+            ).fetchone()
+            actual_special = actual_special_row['special_number'] if actual_special_row else None
+            special_hit = 1 if actual_special is not None and actual_special in picks else 0
+
             conn.execute(
-                "INSERT OR IGNORE INTO special_picks_log (issue_no, picks_json, created_at) VALUES (?, ?, ?)",
-                (target_issue, json.dumps(picks), utc_now())
+                "INSERT OR IGNORE INTO special_picks_log (issue_no, picks_json, special_hit, created_at) VALUES (?, ?, ?, ?)",
+                (target_issue, json.dumps(picks), special_hit, utc_now())
             )
             count += 1
         if count >= max_issues:
