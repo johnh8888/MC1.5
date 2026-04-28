@@ -3545,12 +3545,12 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     print(f"特别号精选回测（最近20期）: 命中率={special_picks_report['hit_rate']*100:.1f}% 最大连空={int(special_picks_report['max_miss_streak'])}")
 
     # ---------- 精选特别号 ----------
-    # 优先使用特别生肖池（4选，近10期命中率90%），否则回退到双生肖池
-precise_specials = get_precise_specials(
-    conn,
-    special_zodiacs if special_zodiacs else (zodiac_two if zodiac_two else ["马", "蛇"]),
-    top_n=3
-)
+        # 优先使用特别生肖池（4选，近10期命中率90%），否则回退到双生肖池
+        precise_specials = get_precise_specials(
+            conn,
+            special_zodiacs if special_zodiacs else (zodiac_two if zodiac_two else ["马", "蛇"]),
+            top_n=3
+        )
     conn,
     special_zodiacs if special_zodiacs else (zodiac_two if zodiac_two else ["马", "蛇"]),
     top_n=3
