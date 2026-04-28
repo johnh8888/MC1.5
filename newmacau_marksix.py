@@ -3544,17 +3544,18 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     special_picks_report = get_recent_special_picks_report(conn, lookback=20)
     print(f"特别号精选回测（最近20期）: 命中率={special_picks_report['hit_rate']*100:.1f}% 最大连空={int(special_picks_report['max_miss_streak'])}")
 
-        # 优先使用特别生肖池（4选，近10期命中率90%），否则回退到双生肖池
-        precise_specials = get_precise_specials(
-            conn,
-            special_zodiacs if special_zodiacs else (zodiac_two if zodiac_two else ["马", "蛇"]),
-            top_n=3
-        )
-        if precise_specials:
-            ps_str = " ".join(_fmt_num(n) for n in precise_specials)
-            ps_detail = ", ".join(f"{_fmt_num(n)}({get_zodiac_by_number(n)})" for n in precise_specials)
-            print(f"精选特别号 (3码): {ps_str}  ({ps_detail})")
-            log_special_picks(conn, issue_no, precise_specials, special)     
+    # ---------- 精选特别号 ----------
+    # 优先使用特别生肖池（4选，近10期命中率90%），否则回退到双生肖池
+    precise_specials = get_precise_specials(
+        conn,
+        special_zodiacs if special_zodiacs else (zodiac_two if zodiac_two else ["马", "蛇"]),
+        top_n=3
+    )
+    if precise_specials:
+        ps_str = " ".join(_fmt_num(n) for n in precise_specials)
+        ps_detail = ", ".join(f"{_fmt_num(n)}({get_zodiac_by_number(n)})" for n in precise_specials)
+        print(f"精选特别号 (3码): {ps_str}  ({ps_detail})")
+        log_special_picks(conn, issue_no, precise_specials, special)  
             
     # ---------- 特别生肖仓位建议 ----------
     km = KellyManager(bankroll=1000.0)
