@@ -1920,6 +1920,10 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         hit1_rate = float(h.get("hit1_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
 
+        if cold_streak >= 3:
+            weights[strategy] = 0.0
+            continue   # 不再参与后续归一化
+
         shrink = 1.0
         if recent_avg < 0.7:
             shrink *= 0.90 ** ((0.7 - recent_avg) * 8)
@@ -2326,6 +2330,26 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
     return picks if len(picks) == 3 else ["马", "蛇", "龙"]
 
 
+def _get_special_exact_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
+    if not rows:
+        return "马"
+    special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:8]]
+    counter = Counter(special_zodiacs)
+    omission: Dict[str, int] = {z: len(rows) + 1 for z in ZODIAC_MAP}
+    for idx, z in enumerate(special_zodiacs):
+        omission[z] = min(omission.get(z, len(rows) + 1), idx + 1)
+    scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
+    for z, cnt in counter.items():
+        scores[z] += cnt * 2.8
+    for z in scores:
+        if omission.get(z, 0) >= 4:
+            scores[z] += min(3.0, omission[z] / 2.5)
+        if z in counter:
+            scores[z] += 0.4
+    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+    return ranked[0][0] if ranked else "马"
+
+
 def _get_four_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Optional[sqlite3.Connection] = None) -> List[str]:
     """四生肖版 – 基于原 v5.4 增强，返回 4 个生肖"""
     if len(rows) < 3:
@@ -2514,7 +2538,7 @@ def get_recent_two_zodiac_report(
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
+        hit = 1 if all(z in winning_zodiacs for z in picks) else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -2629,6 +2653,42 @@ def get_recent_four_zodiac_report(
         picks = _get_four_zodiac_from_history_rows(history_rows, conn)
         actual_special = get_zodiac_by_number(int(rows[i]["special_number"]))
         hit = 1 if actual_special in picks else 0
+        hits += hit
+        samples += 1
+        if hit == 0:
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
+        else:
+            miss_streak = 0
+    if samples == 0:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    return {
+        "samples": float(samples),
+        "hit_rate": float(hits / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
+
+
+def get_recent_special_exact_report(
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 16,
+) -> Dict[str, float]:
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < history_window + 1:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    start = max(history_window, len(rows) - lookback)
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
+    for i in range(start, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        pick = _get_special_exact_zodiac_from_history_rows(history_rows)
+        actual_special = get_zodiac_by_number(int(rows[i]["special_number"]))
+        hit = 1 if pick == actual_special else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -3294,25 +3354,28 @@ def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[
     pool10 = pool20[:10]
     main6 = pool20[:6]
 
-    recent_hits = conn.execute(
-        "SELECT hit_count FROM prediction_runs WHERE strategy = 'ensemble_v2' AND status = 'REVIEWED' ORDER BY reviewed_at DESC, created_at DESC, id DESC LIMIT 2"
-    ).fetchall()
-    if len(recent_hits) == 2 and all(int(r['hit_count'] or 0) == 0 for r in recent_hits):
-        all_draws = conn.execute("SELECT numbers_json FROM draws ORDER BY draw_date DESC").fetchall()
-        omission = {n: 0 for n in ALL_NUMBERS}
-        for n in ALL_NUMBERS:
-            omit = 0
-            for row in all_draws:
-                if n in json.loads(row['numbers_json']):
-                    break
-                omit += 1
-            omission[n] = omit
-        most_omitted = sorted(omission, key=lambda x: omission[x], reverse=True)[:4]
-        if len(pool20) >= 6:
-            pool20 = pool20[:-4] + most_omitted
-            pool14 = pool20[:14]
-            pool10 = pool20[:10]
-            main6 = pool20[:6]
+    last_issue = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
+    if last_issue:
+        any_zero = conn.execute(
+            "SELECT 1 FROM prediction_runs WHERE issue_no=? AND status='REVIEWED' AND (hit_count IS NULL OR hit_count=0) LIMIT 1",
+            (last_issue['issue_no'],)
+        ).fetchone()
+        if any_zero:
+            all_draws = conn.execute("SELECT numbers_json FROM draws ORDER BY draw_date DESC").fetchall()
+            omission = {n: 0 for n in ALL_NUMBERS}
+            for n in ALL_NUMBERS:
+                omit = 0
+                for row in all_draws:
+                    if n in json.loads(row['numbers_json']):
+                        break
+                    omit += 1
+                omission[n] = omit
+            most_omitted = sorted(omission, key=lambda x: omission[x], reverse=True)[:5]
+            if len(pool20) >= 5:
+                pool20 = pool20[:-5] + most_omitted
+                pool14 = pool20[:14]
+                pool10 = pool20[:10]
+                main6 = pool20[:6]
 
     special = None
     if special_scores:
@@ -3592,14 +3655,14 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
         f"最大连空={int(zodiac_report['max_miss_streak'])}"
     )
     zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=20, history_window=16)
-    print("双生肖复盘（最近20期，任中1只即算命中）:")
+    print("双生肖复盘（最近20期，二中二）:")
     print(
         f"  - 最近样本={int(zodiac_two_report['samples'])}期 "
         f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
     zodiac_two_strict_report = get_recent_two_zodiac_report(conn, lookback=20, history_window=16)
-    print("双生肖复盘（最近20期，二中二）:")
+    print("双生肖准确玩法复盘（最近20期，二中二）:")
     print(
         f"  - 最近样本={int(zodiac_two_strict_report['samples'])}期 "
         f"命中率={zodiac_two_strict_report['hit_rate'] * 100:.1f}% "
@@ -3612,12 +3675,26 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
         f"命中率={zodiac_four_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_four_report['max_miss_streak'])}"
     )
+    special_exact_report = get_recent_special_exact_report(conn, lookback=20, history_window=16)
+    print("特别生肖准确玩法复盘（最近20期，定位胆=1只）:")
+    print(
+        f"  - 最近样本={int(special_exact_report['samples'])}期 "
+        f"命中率={special_exact_report['hit_rate'] * 100:.1f}% "
+        f"最大连空={int(special_exact_report['max_miss_streak'])}"
+    )
     zodiac_three_report = get_recent_three_zodiac_report(conn, lookback=20, history_window=16)
     print("三生肖复盘（最近20期，命中2只即算命中）:")
     print(
         f"  - 最近样本={int(zodiac_three_report['samples'])}期 "
         f"命中率={zodiac_three_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
+    )
+    special_exact_report = get_recent_special_exact_report(conn, lookback=20, history_window=16)
+    print("特别生肖准确玩法复盘（最近20期，定位胆=1只）:")
+    print(
+        f"  - 最近样本={int(special_exact_report['samples'])}期 "
+        f"命中率={special_exact_report['hit_rate'] * 100:.1f}% "
+        f"最大连空={int(special_exact_report['max_miss_streak'])}"
     )
 
     print_final_recommendation(conn, xgb_pool20=xgb_pool20)
