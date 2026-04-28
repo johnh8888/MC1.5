@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
-from tail_predictor import get_best_tail, backtest_tail
 from zodiac_strict import get_three_zodiac_picks
 from risk_manager import RiskManager
 from xgboost_predictor import XGBoostPredictor
