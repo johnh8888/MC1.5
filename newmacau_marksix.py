@@ -2751,6 +2751,69 @@ def get_precise_specials(
     return selected
 
 
+# ========== 历史回溯专用精选函数（避免数据穿越） ==========
+def get_precise_specials_from_history(history_rows, zodiac_pool, top_n=3):
+    """基于历史数据的精选特别号，纯历史窗口，不依赖数据库"""
+    if not zodiac_pool:
+        return []
+
+    latest_row = history_rows[0]
+    latest_special = int(latest_row['special_number'])
+    recent_specials = [int(r['special_number']) for r in history_rows[:12]]
+
+    omission = {}
+    for i, sp in enumerate(recent_specials):
+        if sp not in omission:
+            omission[sp] = i + 1
+
+    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
+    if not candidates:
+        return []
+
+    latest_main = json.loads(latest_row['numbers_json'])
+    main_zodiac_counter = Counter(get_zodiac_by_number(n) for n in latest_main)
+
+    # 综合评分
+    scores = {}
+    for num in candidates:
+        s = 1.0
+        # 邻号得分
+        for sp in recent_specials[:5]:
+            diff = abs(num - sp)
+            if diff == 1:
+                s += 3.0
+            elif diff == 2:
+                s += 1.5
+        # 遗漏得分
+        omit = omission.get(num, 20)
+        s += min(omit, 20) * 0.2
+        # 上期特号尾数
+        if num % 10 == latest_special % 10:
+            s += 2.0
+        # 主号尾数热度（简化：仅统计最近6个主号的尾数）
+        tail_counter = Counter(n % 10 for n in latest_main[:6])
+        hot_tails = {t for t, cnt in tail_counter.items() if cnt >= 2}
+        if num % 10 in hot_tails:
+            s += 1.5
+        # 上期特号距离
+        dist = abs(num - latest_special)
+        if dist <= 6:
+            s += (6 - dist) * 0.3
+        # 近期特号降权
+        if num in recent_specials[:3]:
+            s *= 0.3
+        scores[num] = s
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    selected = []
+    for num, _ in ranked:
+        if num not in selected:
+            selected.append(num)
+        if len(selected) >= top_n:
+            break
+    return selected
+
+
 def log_special_picks(conn: sqlite3.Connection, issue_no: str, picks: Sequence[int], special_number: Optional[int] = None) -> None:
     try:
         special_hit = 0
@@ -2785,6 +2848,74 @@ def get_recent_special_picks_report(conn: sqlite3.Connection, lookback: int = 20
             miss_streak = 0
     samples = len(rows)
     return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss)}
+
+
+# ========== 历史回溯命令 ==========
+def backfill_special_picks_log(conn, max_issues=100):
+    """回溯历史期数，生成精选特别号并写入 special_picks_log"""
+    draws = conn.execute(
+        "SELECT issue_no, draw_date, special_number FROM draws ORDER BY draw_date ASC"
+    ).fetchall()
+    if len(draws) < 16:
+        print("数据不足，无法回溯（至少需要16期）。")
+        return 0
+
+    count = 0
+    for i in range(12, len(draws)):
+        target_issue = draws[i]['issue_no']
+        target_date = draws[i]['draw_date']
+
+        # 跳过已有记录
+        existing = conn.execute(
+            "SELECT 1 FROM special_picks_log WHERE issue_no = ?", (target_issue,)
+        ).fetchone()
+        if existing:
+            continue
+
+        # 获取目标期之前的历史记录
+        history = conn.execute(
+            """SELECT numbers_json, special_number FROM draws 
+               WHERE draw_date < ? OR (draw_date = ? AND issue_no < ?)
+               ORDER BY draw_date DESC, issue_no DESC
+               LIMIT 16""",
+            (target_date, target_date, target_issue)
+        ).fetchall()
+        if len(history) < 12:
+            continue
+
+        # 动态生成生肖池（基于历史窗口）
+        base_four = _get_four_zodiac_from_history_rows(history, conn=None)
+        recent_zodiacs = [get_zodiac_by_number(int(r['special_number'])) for r in history[:8]]
+        zodiac_freq = Counter(recent_zodiacs)
+        specials_hist = [int(r['special_number']) for r in history[:30]]
+        omission_zodiac = {z: 0 for z in ZODIAC_MAP}
+        for idx, sp in enumerate(specials_hist):
+            z = get_zodiac_by_number(sp)
+            if omission_zodiac[z] == 0:
+                omission_zodiac[z] = idx + 1
+        sorted_omit = sorted(omission_zodiac.items(), key=lambda x: -x[1])
+        extra_freq = [z for z, _ in zodiac_freq.most_common(3) if z not in base_four][:2]
+        extra_cold = [z for z, _ in sorted_omit if z not in base_four and z not in extra_freq][:2]
+        zodiac_pool = base_four + extra_freq + extra_cold
+        while len(zodiac_pool) < 8:
+            for z in ZODIAC_MAP:
+                if z not in zodiac_pool:
+                    zodiac_pool.append(z)
+                if len(zodiac_pool) == 8:
+                    break
+
+        picks = get_precise_specials_from_history(history, zodiac_pool, top_n=3)
+        if picks:
+            conn.execute(
+                "INSERT OR IGNORE INTO special_picks_log (issue_no, picks_json, created_at) VALUES (?, ?, ?)",
+                (target_issue, json.dumps(picks), utc_now())
+            )
+            count += 1
+        if count >= max_issues:
+            break
+
+    conn.commit()
+    return count
 
 
 class KellyManager:
@@ -3290,23 +3421,12 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     strong_special_text = _fmt_num(strategy_strong_special) if strategy_strong_special is not None else "无"
     strong_zodiac_text = strategy_strong_zodiac if strategy_strong_zodiac else "无"
 
-    zodiac_three = get_three_zodiac_picks(conn)
-    STRICT_TWO_HIT = 0.30
-    SPECIAL_HIT = 0.03
-    rm = RiskManager(bankroll=1000.0)
-    zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", STRICT_TWO_HIT, 5.0, rm.bankroll)
-    special_rec = rm.get_bet_recommendation("special", SPECIAL_HIT, 45.0, rm.bankroll)
-
     # ---------- 生肖推荐（恢复显示） ----------
-    zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
-    zodiac_two_text = "、".join(zodiac_two) if zodiac_two else "数据不足"
-    zodiac_three = get_three_zodiac_picks(conn)
-    zodiac_three_text = "、".join(zodiac_three)
-    special_zodiacs_text = "、".join(special_zodiacs) if special_zodiacs else "无"
-
     print("")
     print(f"一生肖推荐: {zodiac_single_text}")
     print(f"二生肖推荐: {zodiac_two_text}")
+    zodiac_three = get_three_zodiac_picks(conn)
+    zodiac_three_text = "、".join(zodiac_three)
     print(f"三生肖推荐: {zodiac_three_text}")
     print(f"特别生肖推荐: {special_zodiacs_text}")
 
@@ -3331,7 +3451,7 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
         print(f"精选特别号 (3码): {ps_str}  ({ps_detail})")
         log_special_picks(conn, issue_no, precise_specials, special)
 
-    # ---------- 特别生肖仓位建议（规则：投入4元，中1肖得6元含本，净赚2元） ----------
+    # ---------- 特别生肖仓位建议 ----------
     km = KellyManager(bankroll=1000.0)
     report_10 = get_recent_four_zodiac_report(conn, lookback=10)
     hit_rate_10 = report_10.get('hit_rate', 0.0)
@@ -3346,6 +3466,9 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     # ---------- 风险提示 ----------
     if km.loss_streak >= 2:
         print("⚠️ 提醒: 模拟账户连续亏损，当前仓位已自动减半。")
+    rm = RiskManager(bankroll=1000.0)
+    zodiac_rec = rm.get_bet_recommendation("zodiac_strict_two", 0.30, 5.0, rm.bankroll)
+    special_rec = rm.get_bet_recommendation("special", 0.03, 45.0, rm.bankroll)
     print(f"风控建议 - 生肖严格双码: {'暂停' if zodiac_rec['suspended'] else '继续'} | 半Kelly建议资金: {zodiac_rec['recommended_stake']:.2f}")
     print(f"风控建议 - 特别号: {'暂停' if special_rec['suspended'] else '继续'} | 半Kelly建议资金: {special_rec['recommended_stake']:.2f}")
     if zodiac_rec['suspended'] or special_rec['suspended']:
@@ -3500,7 +3623,6 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
     print_final_recommendation(conn, xgb_pool20=xgb_pool20)
 
     print("\n" + review_latest_prediction(conn))
-    # 精简最终展示：不再输出特别号规则贡献回测详情
 
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
@@ -3662,6 +3784,18 @@ def cmd_show(args: argparse.Namespace) -> None:
         init_db(conn)
         backfill_missing_special_picks(conn)
 
+        # 自动检测并补齐复盘数据
+        reviewed_count = conn.execute(
+            "SELECT COUNT(*) FROM prediction_runs WHERE status='REVIEWED'"
+        ).fetchone()[0]
+        if reviewed_count < 10:
+            print("检测到复盘数据不足，自动执行 sync --with-backtest ...")
+            records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries)
+            sync_from_records(conn, records, source="macau_api")
+            run_historical_backtest(conn, rebuild=False, max_issues=20)
+            generate_predictions(conn)
+            print("自动同步与回测完成。")
+
         xgb_pool20 = None
         model_path = SCRIPT_DIR / 'xgb_model.pkl'
         if model_path.exists():
@@ -3706,6 +3840,16 @@ def cmd_mine(args: argparse.Namespace) -> None:
         init_db(conn)
         cfg = ensure_mined_pattern_config(conn, force=True)
         print(f"Mine done. config={json.dumps(cfg, ensure_ascii=False)}")
+    finally:
+        conn.close()
+
+
+def cmd_backfill_special(args: argparse.Namespace) -> None:
+    conn = connect_db(args.db)
+    try:
+        init_db(conn)
+        count = backfill_special_picks_log(conn, max_issues=100)
+        print(f"已回溯并写入 {count} 期精选特别号记录。")
     finally:
         conn.close()
 
@@ -3759,6 +3903,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_train_xgb = sub.add_parser("train-xgb", help="Train XGBoost model for main numbers")
     p_train_xgb.set_defaults(func=cmd_train_xgb)
+
+    p_backfill_special = sub.add_parser("backfill-special", help="回溯历史精选特别号记录")
+    p_backfill_special.set_defaults(func=cmd_backfill_special)
 
     return p
 
