@@ -2736,12 +2736,11 @@ def get_precise_specials(
     top_n: int = 3
 ) -> List[int]:
     """
-    精选特别号 v7：强制邻号优先 + 冷号补位 + 惯性惩罚
+    精选特别号 v8：强制邻号 + 尾数关联 + 冷号托底
     """
     if not zodiac_pool:
         return []
 
-    # 获取近期特别号序列
     recent_rows = conn.execute(
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 12"
     ).fetchall()
@@ -2749,9 +2748,9 @@ def get_precise_specials(
     if not recent_specials:
         return list(ZODIAC_MAP.get(zodiac_pool[0], []))[:top_n]
 
-    latest_special = recent_specials[0]  # 上期特别号
+    latest_special = recent_specials[0]
 
-    # 遗漏计算
+    # 遗漏
     omission = {}
     for i, sp in enumerate(recent_specials):
         if sp not in omission:
@@ -2765,41 +2764,59 @@ def get_precise_specials(
     if not candidates:
         return []
 
-    # 惯性惩罚名单：最近 5 期特别号本身
-    penalty_nums = set(recent_specials[:5])
+    # 尾数热度计算（最近8期主号+特别号尾数）
+    main_rows = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 8"
+    ).fetchall()
+    tail_counter = Counter()
+    for row in main_rows:
+        for n in json.loads(row["numbers_json"]):
+            tail_counter[n % 10] += 1
+    # 最近特别号尾数加权
+    for sp in recent_specials[:8]:
+        tail_counter[sp % 10] += 2
+    hot_tails = {t for t, cnt in tail_counter.most_common(5)}
+
+    # 上期特别号尾数及相邻尾数
+    last_tail = latest_special % 10
+    neighbor_tails = {last_tail, (last_tail + 1) % 10, (last_tail - 1) % 10}
 
     selected = []
+    penalty_nums = set(recent_specials[:3])  # 最近3期特别号不优先
 
-    # 1) 强制邻号：上期特号 ±1，选遗漏最大的
+    # 1) 强制 ±1 邻号（遗漏最大的）
     neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in penalty_nums]
-    if not neighbors:  # 如果都被惩罚了，放开惩罚
+    if not neighbors:
         neighbors = [n for n in candidates if abs(n - latest_special) == 1]
     if neighbors:
-        best = max(neighbors, key=lambda n: omission.get(n, 20))
-        selected.append(best)
+        selected.append(max(neighbors, key=lambda n: omission.get(n, 20)))
 
-    # 2) 若还不足，尝试 ±2
+    # 2) 如果还缺，选一个尾数关联最强的号码（优先相同尾数，然后相邻尾数，且避免近期特号）
+    if len(selected) < top_n:
+        tail_candidates = [n for n in candidates if n not in selected and n % 10 in neighbor_tails and n not in penalty_nums]
+        if not tail_candidates:
+            tail_candidates = [n for n in candidates if n not in selected and n % 10 in hot_tails and n not in penalty_nums]
+        if tail_candidates:
+            selected.append(max(tail_candidates, key=lambda n: omission.get(n, 20)))
+
+    # 3) 如果还不够，尝试 ±2 邻号
     if len(selected) < top_n:
         neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in selected and n not in penalty_nums]
-        if not neighbors2:
-            neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in selected]
         if neighbors2:
-            best2 = max(neighbors2, key=lambda n: omission.get(n, 20))
-            selected.append(best2)
+            selected.append(max(neighbors2, key=lambda n: omission.get(n, 20)))
 
-    # 3) 冷号：遗漏最大的候选号码（且不在已选，不是上期特号本身）
-    cold_candidates = [n for n in candidates if n not in selected and n != latest_special]
-    if cold_candidates:
-        coldest = max(cold_candidates, key=lambda n: omission.get(n, 20))
-        selected.append(coldest)
+    # 4) 冷号托底（遗漏最大的，但不与已选重复，且避免上期特号自身）
+    if len(selected) < top_n:
+        cold_pool = [n for n in candidates if n not in selected and n != latest_special]
+        if cold_pool:
+            selected.append(max(cold_pool, key=lambda n: omission.get(n, 20)))
 
-    # 4) 补齐
+    # 5) 如果还没满，按遗漏从大到小补齐
     if len(selected) < top_n:
         remaining = [n for n in candidates if n not in selected]
         remaining.sort(key=lambda n: omission.get(n, 20), reverse=True)
         for n in remaining:
-            if n not in selected:
-                selected.append(n)
+            selected.append(n)
             if len(selected) >= top_n:
                 break
 
@@ -2824,28 +2841,49 @@ def get_precise_specials_from_history(history_rows, zodiac_pool, top_n=3):
     if not candidates:
         return []
 
-    # 惯性惩罚（与在线函数一致）
-    penalty_nums = set(recent_specials[:5])
+    # 尾数统计（基于历史窗口中的主号+特别号）
+    tail_counter = Counter()
+    for row in history_rows[:8]:
+        for n in json.loads(row['numbers_json']):
+            tail_counter[n % 10] += 1
+    for sp in recent_specials[:8]:
+        tail_counter[sp % 10] += 2
+    hot_tails = {t for t, cnt in tail_counter.most_common(5)}
+
+    last_tail = latest_special % 10
+    neighbor_tails = {last_tail, (last_tail + 1) % 10, (last_tail - 1) % 10}
 
     selected = []
+    penalty_nums = set(recent_specials[:3])
+
     # 1) ±1 邻号
     neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in penalty_nums]
     if not neighbors:
         neighbors = [n for n in candidates if abs(n - latest_special) == 1]
     if neighbors:
         selected.append(max(neighbors, key=lambda n: omission.get(n, 20)))
-    # 2) ±2 邻号
+
+    # 2) 尾数关联
+    if len(selected) < top_n:
+        tail_candidates = [n for n in candidates if n not in selected and n % 10 in neighbor_tails and n not in penalty_nums]
+        if not tail_candidates:
+            tail_candidates = [n for n in candidates if n not in selected and n % 10 in hot_tails and n not in penalty_nums]
+        if tail_candidates:
+            selected.append(max(tail_candidates, key=lambda n: omission.get(n, 20)))
+
+    # 3) ±2 邻号
     if len(selected) < top_n:
         neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in selected and n not in penalty_nums]
-        if not neighbors2:
-            neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in selected]
         if neighbors2:
             selected.append(max(neighbors2, key=lambda n: omission.get(n, 20)))
-    # 3) 冷号
-    cold_candidates = [n for n in candidates if n not in selected and n != latest_special]
-    if cold_candidates:
-        selected.append(max(cold_candidates, key=lambda n: omission.get(n, 20)))
-    # 补齐
+
+    # 4) 冷号托底
+    if len(selected) < top_n:
+        cold_pool = [n for n in candidates if n not in selected and n != latest_special]
+        if cold_pool:
+            selected.append(max(cold_pool, key=lambda n: omission.get(n, 20)))
+
+    # 5) 补齐
     if len(selected) < top_n:
         remaining = [n for n in candidates if n not in selected]
         remaining.sort(key=lambda n: omission.get(n, 20), reverse=True)
