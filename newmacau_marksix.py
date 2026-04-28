@@ -3948,15 +3948,16 @@ def cmd_show(args: argparse.Namespace) -> None:
             print("[XGB] 模型未训练（运行 train-xgb 可训练），使用原策略融合主号池。")
 
         model_path_lgb = SCRIPT_DIR / 'lgb_model.pkl'
+        lgb_pool20 = None
         if model_path_lgb.exists():
             import pickle
-            with open(model_path_lgb, 'rb') as f:
-                lgb_predictor = pickle.load(f)
             try:
+                with open(model_path_lgb, 'rb') as f:
+                    lgb_predictor = pickle.load(f)
                 lgb_pool20 = lgb_predictor.predict_pool(conn, top_k=20)
                 print(f"[LGB] 已加载模型，预测主号池 Top20: {lgb_pool20}")
             except Exception as e:
-                print(f"[LGB] 预测失败（将忽略该模型）: {e}")
+                print(f"[LGB] 加载或预测失败（将仅使用XGB）: {e}")
                 lgb_pool20 = None
         else:
             print("[LGB] 模型未训练（运行 train-lgb 可训练），当前跳过。")
