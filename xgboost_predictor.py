@@ -4,15 +4,15 @@ from typing import Optional
 
 try:
     import pandas as pd
-except Exception:  # pragma: no cover - optional dependency on some runners
+except Exception:
     pd = None
 
 try:
     import xgboost as xgb
-except Exception:  # pragma: no cover - optional dependency on some runners
+except Exception:
     xgb = None
 
-# ======== 策略得分计算所需公用函数（从主脚本提取） ========
+# ======== 公用常量与函数 ========
 ALL_NUMBERS = list(range(1, 50))
 ZODIAC_MAP = {
     "马": [1, 13, 25, 37, 49],
@@ -34,7 +34,7 @@ STRATEGY_WEIGHT_CONFIGS = {
     "cold_rebound_v1": {"window": 13, "w_freq": 0.06, "w_omit": 0.62, "w_mom": 0.22, "w_zone": 0.05, "w_adj": 0.12},
     "momentum_v1":     {"window": 7,  "w_freq": 0.10, "w_omit": 0.05, "w_mom": 0.75, "w_zone": 0.05, "w_adj": 0.05},
     "balanced_v1":     {"window": 10, "w_freq": 0.36, "w_omit": 0.26, "w_mom": 0.18, "w_zone": 0.06, "w_adj": 0.14},
-    "pattern_mined_v1": {"window": 6,  "w_freq": 0.30, "w_omit": 0.45, "w_mom": 0.15, "w_zone": 0.10, "w_adj": 0.10},
+    "pattern_mined_v1":{"window": 6,  "w_freq": 0.30, "w_omit": 0.45, "w_mom": 0.15, "w_zone": 0.10, "w_adj": 0.10},
 }
 
 
@@ -138,6 +138,36 @@ def compute_strategy_scores(history_draws, strategy_name):
     return scores
 
 
+# ======== 新增：跨度与和值特征 ========
+def calc_span_and_sum(numbers):
+    """计算一组号码的跨度与总和"""
+    if not numbers or len(numbers) < 6:
+        return 0, 0
+    sorted_nums = sorted(numbers)
+    span = sorted_nums[-1] - sorted_nums[0]
+    total_sum = sum(numbers)
+    return span, total_sum
+
+
+def calc_span_sum_stats(draws, window=10):
+    """计算最近 window 期的跨度与和值的均值、标准差"""
+    spans = []
+    sums = []
+    for draw in draws[-window:]:
+        nums = json.loads(draw['numbers_json'])
+        s, su = calc_span_and_sum(nums)
+        spans.append(s)
+        sums.append(su)
+    if not spans:
+        return 0, 0, 0, 0
+    mean_span = sum(spans) / len(spans)
+    std_span = (sum((s - mean_span)**2 for s in spans) / len(spans)) ** 0.5
+    mean_sum = sum(sums) / len(sums)
+    std_sum = (sum((s - mean_sum)**2 for s in sums) / len(sums)) ** 0.5
+    return mean_span, std_span, mean_sum, std_sum
+
+
+# ======== XGBoost 预测器 ========
 class XGBoostPredictor:
     def __init__(self):
         self.model = None
@@ -155,7 +185,7 @@ class XGBoostPredictor:
             history = draws[idx - 12:idx]
             winning_nums = set(json.loads(current['numbers_json']))
 
-            # 原有的频率/遗漏/邻号计算保持
+            # 频率
             freq_6 = Counter()
             freq_12 = Counter()
             for h in history[-6:]:
@@ -165,6 +195,7 @@ class XGBoostPredictor:
                 for n in json.loads(h['numbers_json']):
                     freq_12[n] += 1
 
+            # 遗漏
             omission = {}
             for n in ALL_NUMBERS:
                 omit = 0
@@ -175,6 +206,7 @@ class XGBoostPredictor:
                     omit += 1
                 omission[n] = omit
 
+            # 邻号
             last_nums = json.loads(draws[idx - 1]['numbers_json'])
             last_special = draws[idx - 1]['special_number']
             last_set = set(last_nums + [last_special])
@@ -189,13 +221,16 @@ class XGBoostPredictor:
                         else:
                             neighbor_2.add(nb)
 
-            # ----- 新增：计算五个策略的得分 -----
+            # 策略得分
             history_draws = [json.loads(h['numbers_json']) for h in history]
             strategy_scores = {}
             non_ensemble = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
             for sname in non_ensemble:
-                ss = compute_strategy_scores(history_draws, sname)
-                strategy_scores[sname] = ss
+                strategy_scores[sname] = compute_strategy_scores(history_draws, sname)
+
+            # 跨度与和值特征：基于最近10期历史
+            hist_span = history[-10:] if len(history) >= 10 else history
+            mean_span, std_span, mean_sum, std_sum = calc_span_sum_stats(hist_span, window=10)
 
             for num in ALL_NUMBERS:
                 features = {
@@ -209,6 +244,11 @@ class XGBoostPredictor:
                     'tail': num % 10,
                     'parity': num % 2,
                     'zone': (num - 1) // 10,
+                    # 跨度与和值
+                    'mean_span': mean_span,
+                    'std_span': std_span,
+                    'mean_sum': mean_sum,
+                    'std_sum': std_sum,
                 }
                 for sname in non_ensemble:
                     features[f'score_{sname}'] = strategy_scores[sname].get(num, 0.0)
@@ -242,22 +282,18 @@ class XGBoostPredictor:
         if not self.model:
             raise RuntimeError("Model not trained yet. Run train() first.")
 
-        # 获取最近13期记录（前12期作为历史）
         draws = conn.execute(
             "SELECT issue_no, numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 13"
         ).fetchall()
         if len(draws) < 13:
             raise RuntimeError("Need at least 13 draws for features.")
 
-        # 历史 = 最近12期（不包含最新一期）
         history_draws_data = [json.loads(d['numbers_json']) for d in draws[1:13]]
 
-        # 最新一期开奖的号码，用于 neighbor 计算
         latest_nums = json.loads(draws[0]['numbers_json'])
         latest_special = draws[0]['special_number']
         latest_set = set(latest_nums + [latest_special])
 
-        # 计算频率、遗漏等特征（用所有历史数据）
         all_prev = conn.execute(
             "SELECT numbers_json FROM draws ORDER BY draw_date DESC"
         ).fetchall()
@@ -290,13 +326,15 @@ class XGBoostPredictor:
                     else:
                         neighbor_2.add(nb)
 
-        # 计算策略得分（基于最近12期历史）
         non_ensemble = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
         strategy_scores = {}
         for sname in non_ensemble:
             strategy_scores[sname] = compute_strategy_scores(history_draws_data, sname)
 
-        # 构建特征向量
+        # 跨度与和值特征：基于最近10期历史（draws[1:11]）
+        hist_span = draws[1:11] if len(draws) >= 11 else draws[1:]
+        mean_span, std_span, mean_sum, std_sum = calc_span_sum_stats(hist_span, window=10)
+
         rows = []
         for num in ALL_NUMBERS:
             feature = {
@@ -309,6 +347,10 @@ class XGBoostPredictor:
                 'tail': num % 10,
                 'parity': num % 2,
                 'zone': (num - 1) // 10,
+                'mean_span': mean_span,
+                'std_span': std_span,
+                'mean_sum': mean_sum,
+                'std_sum': std_sum,
             }
             for sname in non_ensemble:
                 feature[f'score_{sname}'] = strategy_scores[sname].get(num, 0.0)
