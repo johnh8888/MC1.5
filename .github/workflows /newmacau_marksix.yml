@@ -2,7 +2,6 @@ name: 新澳门彩每日自动更新与推送
 
 on:
   schedule:
-    # 每天 14:00 UTC（北京时间 22:00），可根据实际开奖时间调整
     - cron: '0 14 * * *'
   workflow_dispatch:
 
@@ -18,29 +17,36 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 安装依赖（含 xgboost）
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install xgboost
+          pip install xgboost scikit-learn pandas
 
-      - name: 配置 PushPlus Token
-        run: echo "PUSHPLUS_TOKEN=${{ secrets.PUSHPLUS_TOKEN }}" >> $GITHUB_ENV
+      - name: 下载上次运行的数据库（如果存在）
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: push.yml
+          name: newmacau-db
+          path: .
+          if_no_artifact_found: ignore
+        continue-on-error: true
 
-      - name: 初始化数据库（如果不存在）
+      - name: 确保数据库存在（如果下载失败就用源数据库兜底）
         run: |
-          if [ ! -f "newmacau_marksix.db" ]; then
-            python newmacau_marksix.py bootstrap
+          if [ -f "newmacau_marksix.db" ]; then
+            echo "数据库已就绪"
+          else
+            echo "数据库缺失，尝试使用仓库中的备份数据库"
+            cp newmacau_marksix_backup.db newmacau_marksix.db || true
           fi
 
       - name: 同步最新开奖并生成预测
-        run: |
-          python newmacau_marksix.py sync --with-backtest
+        run: python newmacau_marksix.py sync --with-backtest
 
-      - name: 显示结果并推送微信
-        run: |
-          python newmacau_marksix.py show
+      - name: 显示结果并推送
+        run: python newmacau_marksix.py show
 
-      - name: 上传数据库（可选，用于备份）
+      - name: 上传数据库（供下次使用）
         uses: actions/upload-artifact@v4
         with:
           name: newmacau-db
