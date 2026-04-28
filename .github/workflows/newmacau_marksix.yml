@@ -31,7 +31,7 @@ jobs:
           if_no_artifact_found: ignore
         continue-on-error: true
 
-      - name: 初始化数据库（如果不存在，则拉取最近100期）
+      - name: 初始化数据库
         run: |
           if [ ! -f "newmacau_marksix.db" ]; then
             echo "数据库不存在，拉取最近100期数据..."
