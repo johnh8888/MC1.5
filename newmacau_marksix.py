@@ -2736,11 +2736,12 @@ def get_precise_specials(
     top_n: int = 3
 ) -> List[int]:
     """
-    精选特别号：邻号强度 + 遗漏值 + 尾数关联 + 主号尾数外溢(2.0) + 上期特别号距离
+    精选特别号 v6：强制邻号+冷号补位+扩大候选池
     """
     if not zodiac_pool:
         return []
 
+    # 获取最近一期特别号及近期特别号序列
     recent_rows = conn.execute(
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 12"
     ).fetchall()
@@ -2748,62 +2749,69 @@ def get_precise_specials(
     if not recent_specials:
         return list(ZODIAC_MAP.get(zodiac_pool[0], []))[:top_n]
 
+    latest_special = recent_specials[0]  # 上期特号
+
+    # 计算遗漏值
     omission = {}
     for i, sp in enumerate(recent_specials):
         if sp not in omission:
             omission[sp] = i + 1
 
+    # 生成候选号码：从 zodiac_pool 中取所有号码
     candidates = []
     for z in zodiac_pool:
         candidates.extend(ZODIAC_MAP.get(z, []))
     candidates = list(set(candidates))
+    if not candidates:
+        return []
 
-    main_rows = conn.execute(
-        "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 8"
-    ).fetchall()
-    tail_counter = Counter()
-    for row in main_rows:
-        for n in json.loads(row["numbers_json"]):
-            tail_counter[n % 10] += 1
-    avg_tail_count = sum(tail_counter.values()) / len(tail_counter) if tail_counter else 1
-    hot_tails = {tail for tail, cnt in tail_counter.items() if cnt >= avg_tail_count * 1.2}
+    # 获取上期主号生肖热度
+    latest_main = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 1"
+    ).fetchone()
+    main_zodiacs = []
+    if latest_main:
+        main_nums = json.loads(latest_main['numbers_json'])
+        main_zodiac_counter = Counter(get_zodiac_by_number(n) for n in main_nums)
+        if main_zodiac_counter:
+            main_zodiacs = [z for z, _ in main_zodiac_counter.most_common(2)]
 
-    last_sp = recent_specials[0]
-
-    scores = {}
-    for num in candidates:
-        s = 0.0
-        for sp in recent_specials[:5]:
-            diff = abs(num - sp)
-            if diff == 1:
-                s += 3.0
-            elif diff == 2:
-                s += 1.5
-        s += min(omission.get(num, 20), 20) * 0.2
-        if num % 10 == last_sp % 10:
-            s += 2.0
-        if num % 10 in hot_tails:
-            s += 2.0
-        distance = abs(num - last_sp)
-        if distance <= 6:
-            s += (6 - distance) * 0.3
-        if num in recent_specials[:3]:
-            s *= 0.6
-        scores[num] = s
-
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     selected = []
-    for num, _ in ranked:
-        if num not in selected:
-            selected.append(num)
-        if len(selected) >= top_n:
-            break
-    return selected
+
+    # 1) 强制邻号：上期特别号的 ±1，选遗漏最大的一个
+    neighbors = [n for n in candidates if abs(n - latest_special) == 1]
+    if neighbors:
+        best_neighbor = max(neighbors, key=lambda n: omission.get(n, 20))
+        selected.append(best_neighbor)
+
+    # 2) 如果还没满，尝试 ±2
+    if len(selected) < 2:
+        neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in selected]
+        if neighbors2:
+            best2 = max(neighbors2, key=lambda n: omission.get(n, 20))
+            selected.append(best2)
+
+    # 3) 强制冷号：遗漏最大的候选号码（排除上期特号自身）
+    cold_candidates = [n for n in candidates if n not in selected and n != latest_special]
+    if cold_candidates:
+        coldest = max(cold_candidates, key=lambda n: omission.get(n, 20))
+        selected.append(coldest)
+
+    # 4) 若仍不足 top_n，按遗漏从大到小补齐
+    if len(selected) < top_n:
+        remaining = [n for n in candidates if n not in selected]
+        remaining.sort(key=lambda n: omission.get(n, 20), reverse=True)
+        for n in remaining:
+            selected.append(n)
+            if len(selected) >= top_n:
+                break
+
+    return selected[:top_n]
 
 
 # ========== 历史回溯专用精选函数（避免数据穿越） ==========
 def get_precise_specials_from_history(history_rows, zodiac_pool, top_n=3):
-    """基于历史数据的精选特别号，纯历史窗口，不依赖数据库"""
+    """回溯版：使用相同的强制邻号+冷号逻辑，但仅基于历史窗口"""
     if not zodiac_pool:
         return []
 
@@ -2820,48 +2828,32 @@ def get_precise_specials_from_history(history_rows, zodiac_pool, top_n=3):
     if not candidates:
         return []
 
-    latest_main = json.loads(latest_row['numbers_json'])
-    main_zodiac_counter = Counter(get_zodiac_by_number(n) for n in latest_main)
+    # 上期主号（用于后续可能的扩展，但不强制）
+    # 此处略
 
-    # 综合评分
-    scores = {}
-    for num in candidates:
-        s = 1.0
-        # 邻号得分
-        for sp in recent_specials[:5]:
-            diff = abs(num - sp)
-            if diff == 1:
-                s += 3.0
-            elif diff == 2:
-                s += 1.5
-        # 遗漏得分
-        omit = omission.get(num, 20)
-        s += min(omit, 20) * 0.2
-        # 上期特号尾数
-        if num % 10 == latest_special % 10:
-            s += 2.0
-        # 主号尾数热度（简化：仅统计最近6个主号的尾数）
-        tail_counter = Counter(n % 10 for n in latest_main[:6])
-        hot_tails = {t for t, cnt in tail_counter.items() if cnt >= 2}
-        if num % 10 in hot_tails:
-            s += 1.5
-        # 上期特号距离
-        dist = abs(num - latest_special)
-        if dist <= 6:
-            s += (6 - dist) * 0.3
-        # 近期特号降权
-        if num in recent_specials[:3]:
-            s *= 0.3
-        scores[num] = s
-
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     selected = []
-    for num, _ in ranked:
-        if num not in selected:
-            selected.append(num)
-        if len(selected) >= top_n:
-            break
-    return selected
+    # 1) 邻号 ±1
+    neighbors = [n for n in candidates if abs(n - latest_special) == 1]
+    if neighbors:
+        selected.append(max(neighbors, key=lambda n: omission.get(n, 20)))
+    # 2) ±2
+    if len(selected) < 2:
+        neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in selected]
+        if neighbors2:
+            selected.append(max(neighbors2, key=lambda n: omission.get(n, 20)))
+    # 3) 冷号
+    cold_candidates = [n for n in candidates if n not in selected and n != latest_special]
+    if cold_candidates:
+        selected.append(max(cold_candidates, key=lambda n: omission.get(n, 20)))
+    # 补齐
+    if len(selected) < top_n:
+        remaining = [n for n in candidates if n not in selected]
+        remaining.sort(key=lambda n: omission.get(n, 20), reverse=True)
+        for n in remaining:
+            selected.append(n)
+            if len(selected) >= top_n:
+                break
+    return selected[:top_n]
 
 
 def log_special_picks(conn: sqlite3.Connection, issue_no: str, picks: Sequence[int], special_number: Optional[int] = None) -> None:
@@ -2933,7 +2925,7 @@ def backfill_special_picks_log(conn, max_issues=100):
         if len(history) < 12:
             continue
 
-        # 动态生成生肖池（基于历史窗口）
+        # 增强生肖池：基础四生肖 + 最近8期热生肖 + 最近30期冷生肖 + 上期主号热生肖 + 最近3期特号生肖
         base_four = _get_four_zodiac_from_history_rows(history, conn=None)
         recent_zodiacs = [get_zodiac_by_number(int(r['special_number'])) for r in history[:8]]
         zodiac_freq = Counter(recent_zodiacs)
@@ -2941,18 +2933,29 @@ def backfill_special_picks_log(conn, max_issues=100):
         omission_zodiac = {z: 0 for z in ZODIAC_MAP}
         for idx, sp in enumerate(specials_hist):
             z = get_zodiac_by_number(sp)
-            if omission_zodiac[z] == 0:
-                omission_zodiac[z] = idx + 1
+            if omission_zodiac[z] == 0: omission_zodiac[z] = idx + 1
         sorted_omit = sorted(omission_zodiac.items(), key=lambda x: -x[1])
         extra_freq = [z for z, _ in zodiac_freq.most_common(3) if z not in base_four][:2]
         extra_cold = [z for z, _ in sorted_omit if z not in base_four and z not in extra_freq][:2]
-        zodiac_pool = base_four + extra_freq + extra_cold
-        while len(zodiac_pool) < 8:
+        # 最近3期特号生肖
+        last3_zodiacs = [get_zodiac_by_number(int(r['special_number'])) for r in history[:3]]
+        # 上期主号热生肖
+        latest_main = json.loads(history[0]['numbers_json'])
+        main_counter = Counter(get_zodiac_by_number(n) for n in latest_main)
+        top_main = main_counter.most_common(1)[0][0] if main_counter else None
+        zodiac_pool = base_four + extra_freq + extra_cold + last3_zodiacs + ([top_main] if top_main else [])
+        seen = set()
+        final_pool = []
+        for z in zodiac_pool:
+            if z not in seen:
+                seen.add(z)
+                final_pool.append(z)
+        while len(final_pool) < 8:
             for z in ZODIAC_MAP:
-                if z not in zodiac_pool:
-                    zodiac_pool.append(z)
-                if len(zodiac_pool) == 8:
-                    break
+                if z not in final_pool:
+                    final_pool.append(z)
+                if len(final_pool) == 8: break
+        zodiac_pool = final_pool[:8]
 
         picks = get_precise_specials_from_history(history, zodiac_pool, top_n=3)
         if picks:
@@ -3545,12 +3548,35 @@ def print_final_recommendation(conn: sqlite3.Connection, xgb_pool20: Optional[Li
     print(f"特别号精选回测（最近20期）: 命中率={special_picks_report['hit_rate']*100:.1f}% 最大连空={int(special_picks_report['max_miss_streak'])}")
 
     # ---------- 精选特别号 ----------
-    # 优先使用特别生肖池（4选，近10期命中率90%），否则回退到双生肖池
-    precise_specials = get_precise_specials(
-        conn,
-        special_zodiacs if special_zodiacs else (zodiac_two if zodiac_two else ["马", "蛇"]),
-        top_n=3
-    )
+    # 构建增强生肖池：特别生肖 + 最近3期特号生肖 + 上期主号最热生肖
+    enhanced_zodiacs = list(special_zodiacs) if special_zodiacs else (zodiac_two if zodiac_two else ["马","蛇"])
+    # 加入最近3期特号生肖
+    last3_specials = [int(r['special_number']) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3"
+    ).fetchall()]
+    for sp in last3_specials:
+        z = get_zodiac_by_number(sp)
+        if z not in enhanced_zodiacs:
+            enhanced_zodiacs.append(z)
+    # 加入上期主号最热生肖
+    latest_main = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 1"
+    ).fetchone()
+    if latest_main:
+        main_nums = json.loads(latest_main['numbers_json'])
+        main_counter = Counter(get_zodiac_by_number(n) for n in main_nums)
+        if main_counter:
+            top_main_zodiac = main_counter.most_common(1)[0][0]
+            if top_main_zodiac not in enhanced_zodiacs:
+                enhanced_zodiacs.append(top_main_zodiac)
+    # 确保至少有4个生肖
+    while len(enhanced_zodiacs) < 4:
+        for z in ZODIAC_MAP:
+            if z not in enhanced_zodiacs:
+                enhanced_zodiacs.append(z)
+            if len(enhanced_zodiacs) >= 4:
+                break
+    precise_specials = get_precise_specials(conn, enhanced_zodiacs, top_n=3)
     if precise_specials:
         ps_str = " ".join(_fmt_num(n) for n in precise_specials)
         ps_detail = ", ".join(f"{_fmt_num(n)}({get_zodiac_by_number(n)})" for n in precise_specials)
