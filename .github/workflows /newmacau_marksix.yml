@@ -2,8 +2,9 @@ name: 新澳门彩每日自动更新与推送
 
 on:
   schedule:
+    # 每天 UTC 14:00（北京时间 22:00），可根据实际开奖时间调整
     - cron: '0 14 * * *'
-  workflow_dispatch:
+  workflow_dispatch:   # 支持手动触发
 
 jobs:
   update-predict:
@@ -17,34 +18,43 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 安装依赖
+      - name: 安装依赖（含 xgboost、pandas 等）
         run: |
           python -m pip install --upgrade pip
-          pip install xgboost scikit-learn pandas
+          pip install xgboost scikit-learn numpy pandas
 
       - name: 下载上次运行的数据库（如果存在）
         uses: dawidd6/action-download-artifact@v2
         with:
-          workflow: push.yml
-          name: newmacau-db
-          path: .
+          workflow: push.yml          # 当前工作流文件名
+          name: newmacau-db           # 与上传时的 artifact 名称一致
+          path: .                     # 保存到当前目录
           if_no_artifact_found: ignore
         continue-on-error: true
 
-      - name: 确保数据库存在（如果下载失败就用源数据库兜底）
+      - name: 初始化数据库（如果不存在，则拉取最近100期）
         run: |
-          if [ -f "newmacau_marksix.db" ]; then
-            echo "数据库已就绪"
-          else
-            echo "数据库缺失，尝试使用仓库中的备份数据库"
-            cp newmacau_marksix_backup.db newmacau_marksix.db || true
+          if [ ! -f "newmacau_marksix.db" ]; then
+            echo "数据库不存在，拉取最近100期数据..."
+            python newmacau_marksix.py recent --limit 100
           fi
 
-      - name: 同步最新开奖并生成预测
-        run: python newmacau_marksix.py sync --with-backtest
+      - name: 配置 PushPlus Token
+        run: echo "PUSHPLUS_TOKEN=${{ secrets.PUSHPLUS_TOKEN }}" >> $GITHUB_ENV
 
-      - name: 显示结果并推送
-        run: python newmacau_marksix.py show
+      - name: 同步最新开奖并生成预测
+        run: |
+          echo "同步最新数据..."
+          python newmacau_marksix.py sync --with-backtest
+
+      - name: 训练 XGBoost 模型
+        run: |
+          echo "训练 XGBoost 模型..."
+          python newmacau_marksix.py train-xgb
+
+      - name: 显示最终推荐并自动推送
+        run: |
+          python newmacau_marksix.py show
 
       - name: 上传数据库（供下次使用）
         uses: actions/upload-artifact@v4
