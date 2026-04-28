@@ -232,6 +232,25 @@ class XGBoostPredictor:
             hist_span = history[-10:] if len(history) >= 10 else history
             mean_span, std_span, mean_sum, std_sum = calc_span_sum_stats(hist_span, window=10)
 
+            # ======== 上一期大盘特征 ========
+            if len(history) > 0:
+                last_row = history[-1]
+                last_nums = json.loads(last_row['numbers_json'])
+                last_sp = last_row['special_number']
+                last_span_val, last_sum_val = calc_span_and_sum(last_nums)
+                last_odd_ratio = sum(1 for n in last_nums if n % 2 == 1) / 6.0
+                last_big_ratio = sum(1 for n in last_nums if n > 25) / 6.0
+                # 粗略冷热号统计：基于前10期频率
+                freq_10 = Counter()
+                for h in history[-10:]:
+                    freq_10.update(json.loads(h['numbers_json']))
+                mean_10 = sum(freq_10.values()) / len(freq_10) if freq_10 else 1
+                last_hot_cnt = sum(1 for n in last_nums if freq_10.get(n, 0) > mean_10)
+                last_cold_cnt = 6 - last_hot_cnt
+            else:
+                last_span_val = last_sum_val = last_odd_ratio = last_big_ratio = last_hot_cnt = last_cold_cnt = 0
+                last_sp = 0
+
             for num in ALL_NUMBERS:
                 features = {
                     'num': num,
@@ -249,6 +268,14 @@ class XGBoostPredictor:
                     'std_span': std_span,
                     'mean_sum': mean_sum,
                     'std_sum': std_sum,
+                    # 上一期大盘特征
+                    'last_span': last_span_val,
+                    'last_sum': last_sum_val,
+                    'last_odd_ratio': last_odd_ratio,
+                    'last_big_ratio': last_big_ratio,
+                    'last_hot_cnt': last_hot_cnt,
+                    'last_cold_cnt': last_cold_cnt,
+                    'last_special': last_sp,
                 }
                 for sname in non_ensemble:
                     features[f'score_{sname}'] = strategy_scores[sname].get(num, 0.0)
@@ -335,6 +362,25 @@ class XGBoostPredictor:
         hist_span = draws[1:11] if len(draws) >= 11 else draws[1:]
         mean_span, std_span, mean_sum, std_sum = calc_span_sum_stats(hist_span, window=10)
 
+        # ======== 上一期大盘特征（draws[1]是上一期） ========
+        if len(draws) >= 2:
+            prev_row = draws[1]
+            prev_nums = json.loads(prev_row['numbers_json'])
+            prev_special = prev_row['special_number']
+            last_span_val, last_sum_val = calc_span_and_sum(prev_nums)
+            last_odd_ratio = sum(1 for n in prev_nums if n % 2 == 1) / 6.0
+            last_big_ratio = sum(1 for n in prev_nums if n > 25) / 6.0
+            # 冷热号统计基于前10期（draws[2:12] 或 draws[1:11]）
+            freq_10 = Counter()
+            for h in draws[1:11]:
+                freq_10.update(json.loads(h['numbers_json']))
+            mean_10 = sum(freq_10.values()) / len(freq_10) if freq_10 else 1
+            last_hot_cnt = sum(1 for n in prev_nums if freq_10.get(n, 0) > mean_10)
+            last_cold_cnt = 6 - last_hot_cnt
+        else:
+            last_span_val = last_sum_val = last_odd_ratio = last_big_ratio = last_hot_cnt = last_cold_cnt = 0
+            prev_special = 0
+
         rows = []
         for num in ALL_NUMBERS:
             feature = {
@@ -351,6 +397,13 @@ class XGBoostPredictor:
                 'std_span': std_span,
                 'mean_sum': mean_sum,
                 'std_sum': std_sum,
+                'last_span': last_span_val,
+                'last_sum': last_sum_val,
+                'last_odd_ratio': last_odd_ratio,
+                'last_big_ratio': last_big_ratio,
+                'last_hot_cnt': last_hot_cnt,
+                'last_cold_cnt': last_cold_cnt,
+                'last_special': prev_special,
             }
             for sname in non_ensemble:
                 feature[f'score_{sname}'] = strategy_scores[sname].get(num, 0.0)
