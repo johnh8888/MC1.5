@@ -3,3 +3,4 @@ xgboost
 lightgbm
 numpy
 pandas
+optuna
