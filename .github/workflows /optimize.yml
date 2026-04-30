@@ -1,4 +1,4 @@
-name: Auto Hyperparameter Optimization
+name: 自动参数调整
 
 on:
   workflow_dispatch:          # 手动触发
