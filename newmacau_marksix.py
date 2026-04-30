@@ -2219,16 +2219,16 @@ def get_single_zodiac_pick(conn, issue_no, window=14):
         return "马"
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
     for idx, r in enumerate(rows):
-        w = 1.0 / (1.0 + idx * 0.24)
+        w = 1.0 / (1.0 + idx * 0.16)
         for n in json.loads(r["numbers_json"]):
-            scores[get_zodiac_by_number(int(n))] += 1.18 * w
-        scores[get_zodiac_by_number(int(r["special_number"]))] += 1.95 * w
+            scores[get_zodiac_by_number(int(n))] += 1.26 * w
+        scores[get_zodiac_by_number(int(r["special_number"]))] += 2.35 * w
     recent_hit_rate = get_recent_single_zodiac_report(conn, lookback=5, history_window=16)['hit_rate']
-    if recent_hit_rate < 0.65:
+    if recent_hit_rate < 0.70:
         omission = _zodiac_omission_map(rows)
         for z, omit in omission.items():
-            if omit >= 8:
-                scores[z] += 1.0
+            if omit >= 6:
+                scores[z] += 1.5
     return max(scores.items(), key=lambda x: (x[1], x[0]))[0]
 
 
@@ -2317,80 +2317,34 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
 
 
 def _get_four_zodiac_from_history_rows(rows, conn=None):
-    """四生肖版 – 冷热混合，保留邻态但降低过度邻号依赖"""
     if len(rows) < 3:
         return ["马", "蛇", "龙", "兔"]
 
     specials = [int(row["special_number"]) for row in rows]
     zodiac_series = [get_zodiac_by_number(sp) for sp in specials]
-    recent_3 = zodiac_series[:3]
-    repeated = len(set(recent_3)) < 3
-
-    LOOKBACK = 4
-    neighbor_scores = {z: 0.0 for z in ZODIAC_MAP}
-    for i in range(min(LOOKBACK, len(specials))):
-        sp = specials[i]
-        weight = 1.0 / (1.0 + i)
-        for delta in (-2, -1, 1, 2):
-            n = sp + delta
-            if 1 <= n <= 49:
-                z = get_zodiac_by_number(n)
-                bonus = 2.0 if (i == 0 and abs(delta) == 1 and repeated) else 1.0
-                neighbor_scores[z] += weight * bonus
-    mx = max(neighbor_scores.values()) or 1.0
-    neighbor_norm = {z: neighbor_scores[z] / mx for z in ZODIAC_MAP}
-
     omission = {z: len(specials) + 1 for z in ZODIAC_MAP}
     for idx, z in enumerate(zodiac_series):
         omission[z] = min(omission[z], idx + 1)
-    max_omit = max(omission.values())
-    omit_norm = {z: (omission[z] / max_omit) ** 2 for z in ZODIAC_MAP}
 
-    penalty = {z: 0.0 for z in ZODIAC_MAP}
-    if len(zodiac_series) >= 2 and zodiac_series[0] == zodiac_series[1]:
-        penalty[zodiac_series[0]] = -8.0
+    # 三冷
+    cold_sorted = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
+    picks = [z for z, _ in cold_sorted[:3]]
 
-    extra_scores = {z: 0.0 for z in ZODIAC_MAP}
-    if len(zodiac_series) >= 3:
-        x, y, z = zodiac_series[2], zodiac_series[1], zodiac_series[0]
-        if x == z and x != y:
-            extra_scores[y] += 0.10
-            neighbors = set()
-            for num in ZODIAC_MAP.get(y, []):
-                for d in (-2, -1, 1, 2):
-                    n2 = num + d
-                    if 1 <= n2 <= 49:
-                        neighbors.add(get_zodiac_by_number(n2))
-            for nb in neighbors:
-                extra_scores[nb] += 0.05
+    # 一跟随：最近一期特号生肖优先跟随；若已在三冷中，则补下一个冷号
+    latest_z = zodiac_series[0] if zodiac_series else None
+    if latest_z and latest_z not in picks:
+        picks.append(latest_z)
+    else:
+        for z, _ in cold_sorted[3:]:
+            if z not in picks:
+                picks.append(z)
+                break
 
-    w_omit = 0.50 if repeated else 0.44
-    final_scores = {}
-    for z in ZODIAC_MAP:
-        score = 0.62 * neighbor_norm[z] + w_omit * omit_norm[z] + penalty[z] + 0.10 * extra_scores[z]
-        final_scores[z] = score
-
-    ranked = sorted(final_scores.items(), key=lambda x: (-x[1], x[0]))
-    picks = [z for z, _ in ranked[:4]]
-
-    if repeated and len(zodiac_series) >= 4:
-        recent_4_zodiacs = set(zodiac_series[:4])
-        overlap = [z for z in picks if z in recent_4_zodiacs]
-        if len(overlap) >= 3:
-            omit_ranked = sorted(omission.items(), key=lambda x: -x[1])
-            new_additions = []
-            for z, _ in omit_ranked:
-                if z not in picks[:3] and z not in new_additions:
-                    new_additions.append(z)
-                if len(new_additions) >= 1:
-                    break
-            picks = picks[:3] + new_additions[:1]
-            while len(picks) < 4:
-                for z, _ in omit_ranked:
-                    if z not in picks:
-                        picks.append(z)
-                        break
-
+    while len(picks) < 4:
+        for z, _ in cold_sorted:
+            if z not in picks:
+                picks.append(z)
+                break
     return picks[:4]
 
 
@@ -2399,40 +2353,33 @@ _get_five_zodiac_from_history_rows = _get_four_zodiac_from_history_rows
 
 
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
-    two_zodiac = _get_two_zodiac_from_history_rows(rows)
     if not rows:
-        return two_zodiac[0] if two_zodiac else "马"
+        return "马"
 
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.12)
+    # 最近 5 期：主号 + 特别号，强趋势跟随
+    recent_rows = rows[:5]
+    scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
+    for idx, r in enumerate(recent_rows):
+        w = 1.0 / (1.0 + idx * 0.18)
+        for n in json.loads(r["numbers_json"]):
+            scores[get_zodiac_by_number(int(n))] += 1.35 * w
+        scores[get_zodiac_by_number(int(r["special_number"]))] += 2.25 * w
 
-    # 单生肖：跟随双生肖里更热的那个方向，减少分散
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
-    zodiac_counter = Counter(recent_special_zodiacs)
-    if zodiac_counter:
-        hottest = max(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
-        zodiac_scores[hottest] += 12.0
-        for z, cnt in zodiac_counter.items():
-            zodiac_scores[z] += cnt * 0.7
+    # 保险：如果近期命中偏低，才补高遗漏生肖
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in recent_rows[:3]]
+    if len(recent_special_zodiacs) >= 3 and len(set(recent_special_zodiacs)) <= 2:
+        for z in recent_special_zodiacs:
+            scores[z] += 0.35
 
-    # 连空触发保护：近段空窗太长时再轻微补主热生肖
-    main_zodiacs = []
-    for r in rows[:3]:
-        main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
-    main_counter = Counter(main_zodiacs)
-    if main_counter:
-        main_hot = max(main_counter.keys(), key=lambda z: main_counter[z])
-        zodiac_scores[main_hot] += 0.15
+    omission = _zodiac_omission_map(rows)
+    for z, omit in omission.items():
+        if omit >= 8:
+            scores[z] += 1.4
+        elif omit >= 5:
+            scores[z] += 0.45
 
-    for z in two_zodiac:
-        zodiac_scores[z] += 0.02
-
-    # 单生肖跟随双生肖的主热方向，但若最近特别号已重复，则更偏向补位生肖
-    if len(recent_special_zodiacs) >= 3 and len(set(recent_special_zodiacs[:3])) <= 2:
-        for z in two_zodiac:
-            zodiac_scores[z] += 0.25
-
-    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    return ranked[0][0]
+    top = max(scores.items(), key=lambda x: (x[1], x[0]))[0]
+    return top
 
 
 def get_recent_single_zodiac_report(
@@ -3863,7 +3810,6 @@ def cmd_show(args: argparse.Namespace) -> None:
         print_dashboard(conn, xgb_pool20=merged_pool20)
     finally:
         conn.close()
-
 
 def cmd_backtest(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
