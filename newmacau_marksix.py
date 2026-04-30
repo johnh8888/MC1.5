@@ -2907,6 +2907,12 @@ def print_final_recommendation(conn, xgb_pool20=None):
         ps_detail = ", ".join(f"{n:02d}({get_zodiac_by_number(n)})" for n in precise)
         print(f"精选特别号 (3码): {ps_str}  ({ps_detail})")
         log_special_picks(conn, issue_no, precise, special)
+    if four_rep['hit_rate'] < 0.65:
+        latest_sp = conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()["special_number"]
+        trend_z = get_zodiac_by_number(int(latest_sp))
+        if trend_z not in special_zodiacs:
+            special_zodiacs[-1] = trend_z
+            print(f"[修正] 特别生肖即时跟随: {trend_z}")
     km = KellyManager()
     km_stake = km.kelly_stake(four_rep['hit_rate'], 1.5)
     if km_stake > 0:
