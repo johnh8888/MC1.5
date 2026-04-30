@@ -2331,15 +2331,12 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
         if omission[z] > i + 1:
             omission[z] = i + 1
     sorted_zodiacs = sorted(omission.items(), key=lambda x: x[1], reverse=True)
-    picks = [z for z, _ in sorted_zodiacs[:2]]
+    picks = [z for z, _ in sorted_zodiacs[:3]]
     latest_z = get_zodiac_by_number(specials[0])
     if latest_z not in picks:
         picks.append(latest_z)
-    for z, _ in sorted_zodiacs:
-        if len(picks) >= 4:
-            break
-        if z not in picks:
-            picks.append(z)
+    else:
+        picks.append(sorted_zodiacs[3][0])
     return picks[:4]
 
 
