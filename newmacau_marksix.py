@@ -16,6 +16,15 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
+BEST_PARAMS_PATH = Path(__file__).resolve().parent / "best_params.json"
+
+
+def load_best_params():
+    if BEST_PARAMS_PATH.exists():
+        with open(BEST_PARAMS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
 # 控制台编码统一
 for _stream_name in ("stdout", "stderr"):
     _stream = getattr(sys, _stream_name, None)
