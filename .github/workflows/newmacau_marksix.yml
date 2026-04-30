@@ -2,12 +2,16 @@ name: 新澳门彩每日自动更新与推送
 
 on:
   schedule:
-    - cron: '0 14 * * *'
+    - cron: '0 14 * * *'      # 北京时间 22:00
   workflow_dispatch:
 
 jobs:
   update-predict:
     runs-on: ubuntu-latest
+    env:
+      PREDICT_LAG: 1           # 全局预测前移一期
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -20,18 +24,18 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install xgboost scikit-learn numpy pandas lightgbm
+          pip install -r requirements.txt
 
       - name: 下载上次运行的数据库
         uses: dawidd6/action-download-artifact@v2
         with:
-          workflow: push.yml
+          workflow: push.yml        # 需与上传的工作流名称一致
           name: newmacau-db
           path: .
           if_no_artifact_found: ignore
         continue-on-error: true
 
-      - name: 初始化数据库（如果不存在，则拉取最近100期）
+      - name: 初始化数据库（如不存在，拉取最近100期）
         run: |
           if [ ! -f "newmacau_marksix.db" ]; then
             echo "数据库不存在，拉取最近100期数据..."
