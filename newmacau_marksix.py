@@ -2221,10 +2221,23 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
         return "马"
     original_pick = _get_single_zodiac_from_history_rows(rows)
     recent_hit_rate = get_recent_single_zodiac_report(conn, lookback=5, history_window=16)['hit_rate']
-    if recent_hit_rate < 0.55:
+
+    if recent_hit_rate < 0.65:
+        latest_sp = conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()["special_number"]
+        trend_zodiac = get_zodiac_by_number(int(latest_sp))
+        return trend_zodiac
+
+    if recent_hit_rate < 0.7:
         omission_map = _zodiac_omission_map(rows)
         fallback = max(omission_map, key=omission_map.get)
         return fallback
+
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if pool20:
+        main_zodiacs = [get_zodiac_by_number(n) for n in pool20[:10]]
+        most_common = Counter(main_zodiacs).most_common(1)[0][0]
+        return most_common
+
     return original_pick
 
 
@@ -2375,7 +2388,7 @@ def _get_four_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Option
             for nb in neighbors:
                 extra_scores[nb] += 0.06
 
-    w_omit = 0.38 if repeated else 0.42
+    w_omit = 0.65
     final_scores = {}
     for z in ZODIAC_MAP:
         score = (
@@ -2388,6 +2401,12 @@ def _get_four_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn: Option
 
     ranked = sorted(final_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = [z for z, _ in ranked[:4]]
+    if not any(omission.get(z, 0) >= 8 for z in picks) and len(omission) >= 4:
+        cold_sorted = sorted(omission.items(), key=lambda x: x[1], reverse=True)
+        for z, _ in cold_sorted[:2]:
+            if z not in picks:
+                picks[-1] = z
+                break
 
     replace_count = 2 if repeated else 0
     if replace_count > 0 and len(zodiac_series) >= 4:
@@ -2700,6 +2719,13 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
 
     long_omitted = sorted([n for n in candidates if omission.get(n, 20) >= 10], key=lambda x: omission.get(x, 20), reverse=True)[:2]
     selected = list(dict.fromkeys(long_omitted))
+    if len(selected) < 2:
+        extras = sorted([n for n in candidates if n not in selected], key=lambda x: omission.get(x, 20), reverse=True)
+        for n in extras:
+            if n not in selected:
+                selected.append(n)
+            if len(selected) >= 2:
+                break
     rest = [n for n in candidates if n not in selected]
     if rest: selected.append(max(rest, key=lambda n: omission.get(n, 20)))
     return selected[:top_n]
@@ -3140,7 +3166,7 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
             if n % 10 == recent_special_tail: score += 0.45
             if (n - 1) // 10 == recent_special_zone: score += 0.25
         if n in recent_3_specials:
-            score *= 0.55
+            score *= 0.72
         combined.append((n, score))
 
     if not combined:
@@ -3207,19 +3233,19 @@ def get_strong_special_from_strategies(
 
     model_score: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
     for z, cnt in zodiac_counter.items():
-        model_score[z] += cnt * 3.2
+        model_score[z] += cnt * 2.8
     for z, cnt in recent_zodiac_counter.items():
-        model_score[z] += cnt * 0.3
-    hot_special = [z for z, _ in Counter(recent_special_zodiacs).most_common(2)]
+        model_score[z] += cnt * 0.25
+    hot_special = [z for z, _ in Counter(recent_special_zodiacs).most_common(1)]
     for z in hot_special:
-        model_score[z] += 3.2
+        model_score[z] += 2.0
     omission_zodiac: Dict[str, int] = {z: 0 for z in ZODIAC_MAP.keys()}
     for idx, sp in enumerate(recent_specials):
         oz = get_zodiac_by_number(sp)
         omission_zodiac[oz] = max(omission_zodiac.get(oz, 0), 30 - idx)
-    cold_zodiacs = [z for z, _ in sorted(omission_zodiac.items(), key=lambda x: (-x[1], x[0]))[:1]]
+    cold_zodiacs = [z for z, _ in sorted(omission_zodiac.items(), key=lambda x: (-x[1], x[0]))[:2]]
     for z in cold_zodiacs:
-        model_score[z] += 3.0
+        model_score[z] += 4.2
     for z in ZODIAC_MAP.keys():
         if omission_zodiac.get(z, 0) >= 5:
             model_score[z] += 2.2
