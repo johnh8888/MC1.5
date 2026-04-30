@@ -1892,11 +1892,10 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 # ========== 动态权重相关函数 ==========
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
     rows = conn.execute("""
-        SELECT strategy,
-               AVG(main_hit_count) as avg_hit,
-               AVG(COALESCE(main_hit_count, 0) / 6.0) as avg_rate,
-               AVG(CASE WHEN main_hit_count >= 1 THEN 1.0 ELSE 0.0 END) AS hit1_rate,
-               AVG(CASE WHEN main_hit_count >= 2 THEN 1.0 ELSE 0.0 END) AS hit2_rate
+        SELECT strategy, AVG(main_hit_count) as avg_hit, 
+               AVG(hit_rate) as avg_rate,
+               AVG(CASE WHEN hit_count >= 1 THEN 1.0 ELSE 0.0 END) AS hit1_rate,
+               AVG(CASE WHEN hit_count >= 2 THEN 1.0 ELSE 0.0 END) AS hit2_rate
         FROM strategy_performance
         WHERE issue_no IN (
             SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT ?
