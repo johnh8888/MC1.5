@@ -1,0 +1,47 @@
+name: Auto Hyperparameter Optimization
+
+on:
+  workflow_dispatch:          # 允许手动触发
+  schedule:
+    - cron: '0 2 * * 1'      # 每周一凌晨2点（UTC）
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install optuna numpy
+          pip install -r requirements.txt || true
+
+      - name: Cache database
+        uses: actions/cache@v4
+        with:
+          path: newmacau_marksix.db
+          key: marksix-db-${{ github.run_id }}
+          restore-keys: |
+            marksix-db-
+
+      - name: Sync latest data from API
+        run: python newmacau_marksix.py sync
+
+      - name: Run optimization
+        run: python hyper_optimize.py --db newmacau_marksix.db --trials 200
+
+      - name: Commit best_params.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add best_params.json
+          git commit -m "Update best hyperparameters [skip ci]" || echo "No changes to commit"
+          git push
