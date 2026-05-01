@@ -2472,7 +2472,7 @@ def get_recent_two_zodiac_report(
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
+        hit = 1 if all(z in winning_zodiacs for z in picks) else 0
         hits += hit
         samples += 1
         if hit == 0:
