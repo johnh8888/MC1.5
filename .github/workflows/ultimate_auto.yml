@@ -1,0 +1,52 @@
+name: Ultimate Auto Optimize 90%
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'   # 每天UTC 4:00
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: |
+          pip install optuna numpy
+          pip install -r requirements.txt || true
+
+      - name: Cache DB
+        uses: actions/cache@v4
+        with:
+          path: newmacau_marksix.db
+          key: marksix-db-${{ github.run_id }}
+          restore-keys: marksix-db-
+
+      - name: Sync data
+        run: python newmacau_marksix.py sync
+
+      - name: Run v5 optimizer
+        run: python hyper_optimize_v5.py --trials 500
+
+      - name: Rebuild backtest
+        run: |
+          python newmacau_marksix.py backfill-special
+          python newmacau_marksix.py backtest --rebuild
+
+      - name: Show results
+        run: python newmacau_marksix.py show | tee report.txt
+
+      - name: Commit everything
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add best_params_zodiac.json newmacau_marksix.db report.txt || true
+          git commit -m "Auto optimize zodiac 90% [skip ci]" || echo "No changes"
+          git push
