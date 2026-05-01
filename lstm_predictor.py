@@ -1,15 +1,36 @@
 #!/usr/bin/env python3
-""" LSTM 模型：支持可变序列长度 """
+""" LSTM 序列模型：预测下一期各生肖的出现概率 """
 import sqlite3, json, argparse
 import numpy as np
 from pathlib import Path
 
-ZODIAC_MAP = { ... }  # 与主脚本一致，此处省略重复
+# 正确的生肖映射字典
+ZODIAC_MAP = {
+    "马": [1, 13, 25, 37, 49],
+    "蛇": [2, 14, 26, 38],
+    "龙": [3, 15, 27, 39],
+    "兔": [4, 16, 28, 40],
+    "虎": [5, 17, 29, 41],
+    "牛": [6, 18, 30, 42],
+    "鼠": [7, 19, 31, 43],
+    "猪": [8, 20, 32, 44],
+    "狗": [9, 21, 33, 45],
+    "鸡": [10, 22, 34, 46],
+    "猴": [11, 23, 35, 47],
+    "羊": [12, 24, 36, 48],
+}
 ZODIAC_LIST = list(ZODIAC_MAP.keys())
 
-def get_zodiac_by_number(n): ...
+def get_zodiac_by_number(n):
+    for z, nums in ZODIAC_MAP.items():
+        if n in nums:
+            return z
+    return "马"
 
-def connect_db(path): ...
+def connect_db(path):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def build_sequence_data(conn, seq_len=30):
     rows = conn.execute(
@@ -33,14 +54,14 @@ def build_sequence_data(conn, seq_len=30):
         y.append(all_features[i])
     return np.array(X), np.array(y)
 
-def train_lstm(conn, model_path='lstm_zodiac.h5', seq_len=30, epochs=50):
+def train_lstm(conn, model_path='lstm_zodiac.h5', seq_len=30, epochs=30):
     try:
         from tensorflow.keras.models import Sequential
         from tensorflow.keras.layers import LSTM, Dense, Dropout
         from tensorflow.keras.optimizers import Adam
         from tensorflow.keras.callbacks import EarlyStopping
     except ImportError:
-        print("[LSTM] 未安装 TensorFlow，跳过训练。")
+        print("[LSTM] 未安装 TensorFlow，跳过训练")
         return
 
     X, y = build_sequence_data(conn, seq_len)
@@ -60,9 +81,14 @@ def train_lstm(conn, model_path='lstm_zodiac.h5', seq_len=30, epochs=50):
         Dense(12, activation='sigmoid')
     ])
     model.compile(optimizer=Adam(1e-3), loss='binary_crossentropy')
-    model.fit(X_train, y_train, validation_data=(X_val, y_val),
-              epochs=epochs, batch_size=32, callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
-              verbose=1)
+    model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=32,
+        callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+        verbose=1
+    )
     model.save(model_path)
     print(f"[LSTM] 模型已保存至 {model_path}")
 
@@ -99,7 +125,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--db', default='newmacau_marksix.db')
     parser.add_argument('--seq_len', type=int, default=30)
-    parser.add_argument('--epochs', type=int, default=30)  # 减少点时间
+    parser.add_argument('--epochs', type=int, default=30)
     args = parser.parse_args()
     conn = connect_db(args.db)
     train_lstm(conn, seq_len=args.seq_len, epochs=args.epochs)
