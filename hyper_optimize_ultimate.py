@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""终极自我进化优化器 —— 不达标不停止（连续多轮版）"""
+"""终极自我进化优化器 —— 软化评分 + 连续多轮搜索"""
 import sqlite3, json, sys, argparse
 from collections import Counter
 import optuna
 
-# 完整生肖映射
 ZODIAC_MAP = {
     "马": [1, 13, 25, 37, 49],
     "蛇": [2, 14, 26, 38],
@@ -143,12 +142,20 @@ def evaluate(issues, params):
     r4 = four_h / total
     max_streak = max(max_single_streak, max_two_streak, max_four_streak)
 
-    # 硬指标：一生肖≥90%，二生肖≥92%，特别生肖≥90%，最大连空≤1
-    if r1 < 0.90 or r2 < 0.92 or r4 < 0.90 or max_streak > 1:
-        return 0.0, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
+    # 软化评分：基础分 = 三个命中率的加权平均
+    score = r1 * 0.4 + r2 * 0.35 + r4 * 0.25
 
-    avg_hit = (r1 + r2 + r4) / 3
-    return avg_hit + 1.0 / (1.0 + max_streak), r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
+    # 对不达标的指标施加温和惩罚（乘系数，不归零）
+    if r1 < 0.90:
+        score *= 0.7
+    if r2 < 0.92:
+        score *= 0.7
+    if r4 < 0.90:
+        score *= 0.8
+    if max_streak > 1:
+        score *= 0.9
+
+    return score, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
 
 def objective(trial, issues):
     p = {
@@ -188,7 +195,8 @@ def main():
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
 
-    if score > 0:
+    # 判定是否严格达标
+    if r1 >= 0.90 and r2 >= 0.92 and r4 >= 0.90 and max(ms1, ms2, ms4) <= 1:
         print("🎉 已达标！")
         sys.exit(0)
     else:
