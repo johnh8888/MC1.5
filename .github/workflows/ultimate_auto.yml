@@ -3,12 +3,12 @@ name: 增量进化生肖命中率
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'   # 每6小时运行一次，在私有仓库完全免费
+    - cron: '0 */6 * * *'   # 每6小时运行一次
 
 jobs:
   evolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 240      # 单次作业最多4小时，充裕
+    timeout-minutes: 240
     permissions:
       contents: write
     steps:
@@ -39,6 +39,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add best_params_zodiac.json optuna_study.db report.txt newmacau_marksix.db || true
+          git add best_params_zodiac.json optuna_study.db report.txt || true
           git commit -m "优化进度更新 [skip ci]" || echo "No changes"
           git push
