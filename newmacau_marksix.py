@@ -16,13 +16,15 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
+BEST_PARAMS_ZODIAC_PATH = Path(__file__).resolve().parent / "best_params_zodiac.json"
 BEST_PARAMS_PATH = Path(__file__).resolve().parent / "best_params.json"
 
 
 def load_best_params():
-    if BEST_PARAMS_PATH.exists():
-        with open(BEST_PARAMS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+    for path in (BEST_PARAMS_ZODIAC_PATH, BEST_PARAMS_PATH):
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
     return None
 
 # 控制台编码统一
@@ -2329,13 +2331,17 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
     if len(rows) < 3:
         return ["马", "蛇", "龙", "兔"]
 
+    params = load_best_params()
+    four_boost = float(params.get("four_boost", 1.4221091374805384)) if params else 1.4221091374805384
+
     specials = [int(row["special_number"]) for row in rows]
     zodiac_series = [get_zodiac_by_number(sp) for sp in specials]
     omission = {z: len(specials) + 1 for z in ZODIAC_MAP}
     for idx, z in enumerate(zodiac_series):
         omission[z] = min(omission[z], idx + 1)
 
-    sorted_cold = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
+    weighted_omission = {z: omission[z] * (four_boost if z in zodiac_series[:3] else 1.0) for z in omission}
+    sorted_cold = sorted(weighted_omission.items(), key=lambda x: (-x[1], x[0]))
     picks = [z for z, _ in sorted_cold[:3]]
 
     latest_z = zodiac_series[-1] if zodiac_series else None
@@ -2354,19 +2360,19 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
 _get_five_zodiac_from_history_rows = _get_four_zodiac_from_history_rows
 
 
-def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], window: int = 6, recency_w: float = 0.6248, safe_threshold: float = 1.0) -> str:
+def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], window_size: int = 6, recency_weight: float = 0.7339244843958144, safe_threshold: float = 1.4589204262361037) -> str:
     if not rows:
         return "马"
 
     params = load_best_params()
-    window = int(params.get("single_window", window)) if params else window
-    recency_w = float(params.get("single_recency_w", recency_w)) if params else recency_w
+    window_size = int(params.get("single_window", window_size)) if params else window_size
+    recency_weight = float(params.get("single_recency_w", recency_weight)) if params else recency_weight
     safe_threshold = float(params.get("single_safe_threshold", safe_threshold)) if params else safe_threshold
 
-    recent_rows = rows[:window]
+    recent_rows = rows[:window_size]
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
     for idx, r in enumerate(recent_rows):
-        w = recency_w / (1.0 + idx * 0.15)
+        w = recency_weight / (1.0 + idx * 0.15)
         for n in json.loads(r["numbers_json"]):
             scores[get_zodiac_by_number(int(n))] += 1.35 * w
         scores[get_zodiac_by_number(int(r["special_number"]))] += 2.25 * w
@@ -2383,11 +2389,8 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], window: in
         elif omit >= 7:
             scores[z] += 0.45
 
-    top_zodiac, top_score = max(scores.items(), key=lambda x: (x[1], x[0]))
-    max_score = top_score
-    if max_score < 1.5:
-        return max(omission.items(), key=lambda x: (x[1], x[0]))[0]
-    if top_score < safe_threshold:
+    top_zodiac, max_score = max(scores.items(), key=lambda x: (x[1], x[0]))
+    if max_score < safe_threshold:
         return max(omission.items(), key=lambda x: (x[1], x[0]))[0]
     return top_zodiac
 
