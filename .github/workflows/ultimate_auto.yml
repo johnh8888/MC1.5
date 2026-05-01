@@ -1,14 +1,14 @@
-name: 全自动进化至90%（连续多轮，修正版）
+name: 自我进化 v3.0（长时运行）
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */4 * * *'   # 每4小时自动触发一次
 
 jobs:
   evolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 720
+    timeout-minutes: 4320   # 72小时，充分利用私有仓库超时
     permissions:
       contents: write
     steps:
@@ -32,27 +32,30 @@ jobs:
       - name: 同步最新开奖数据
         run: python newmacau_marksix.py sync
 
-      - name: 多轮连续优化直至达标
+      - name: 长时连续优化（最多500轮）
         shell: bash
         run: |
-          set +e   # 允许单条命令失败不终止循环
-          for i in {1..50}; do
+          set +e
+          for i in {1..500}; do
             echo "====== 第 $i 轮优化 ======"
             python hyper_optimize_ultimate.py --trials 200
             STATUS=$?
+            echo "退出码: $STATUS"
+            
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add best_params_zodiac.json optuna_study.db || true
-            git commit -m "自动优化第${i}轮进度 [skip ci]" || true
-            git push || true
+            git add best_params_zodiac.json optuna_study.db 2>/dev/null
+            git commit -m "自动优化第${i}轮 [skip ci]" 2>/dev/null
+            git push 2>/dev/null
+            
             if [ $STATUS -eq 0 ]; then
               echo "🎉 已达目标，停止优化！"
               break
             fi
-            sleep 5
+            sleep 3
           done
 
-      - name: 使用最佳参数重建回测与报告
+      - name: 重建回测与报告
         if: always()
         run: |
           python newmacau_marksix.py backfill-special
@@ -62,8 +65,6 @@ jobs:
       - name: 提交最终结果
         if: always()
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add best_params_zodiac.json optuna_study.db report.txt newmacau_marksix.db || true
-          git commit -m "最终优化结果 [skip ci]" || true
-          git push
+          git add best_params_zodiac.json optuna_study.db report.txt newmacau_marksix.db 2>/dev/null
+          git commit -m "长时进化结果 [skip ci]" 2>/dev/null
+          git push 2>/dev/null
