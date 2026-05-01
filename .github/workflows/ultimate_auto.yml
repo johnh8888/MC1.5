@@ -1,9 +1,9 @@
-name: 全自动进化至90%（连续多轮）
+name: 全自动进化至90%（连续多轮，修正版）
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'   # 每6小时自动运行一次
+    - cron: '0 */6 * * *'
 
 jobs:
   evolve:
@@ -12,11 +12,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 设置 Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -36,10 +33,12 @@ jobs:
         run: python newmacau_marksix.py sync
 
       - name: 多轮连续优化直至达标
+        shell: bash
         run: |
+          set +e   # 允许单条命令失败不终止循环
           for i in {1..50}; do
             echo "====== 第 $i 轮优化 ======"
-            python hyper_optimize_ultimate.py --trials 200 || true
+            python hyper_optimize_ultimate.py --trials 200
             STATUS=$?
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
