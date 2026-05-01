@@ -1,4 +1,4 @@
-name: 自我进化 v3.0（长时运行）
+name: 自我进化 v3.0（长时运行 + LSTM）
 
 on:
   workflow_dispatch:
@@ -18,19 +18,33 @@ jobs:
           python-version: '3.10'
 
       - name: 安装依赖
-        run: pip install optuna numpy
+        run: |
+          pip install optuna numpy tensorflow
+          pip install -r requirements.txt || true
 
-      - name: 缓存数据库
+      - name: 缓存数据库与模型
         uses: actions/cache@v4
         with:
           path: |
             newmacau_marksix.db
             optuna_study.db
+            lstm_zodiac.h5
           key: marksix-cache-${{ hashFiles('newmacau_marksix.db') }}
           restore-keys: marksix-cache-
 
       - name: 同步最新开奖数据
         run: python newmacau_marksix.py sync
+
+      - name: 训练 LSTM 模型（若文件不存在或超过1天）
+        run: |
+          if [ ! -f lstm_zodiac.h5 ] || [ $(find lstm_zodiac.h5 -mmin +1440) ]; then
+            python lstm_predictor.py --db newmacau_marksix.db
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add lstm_zodiac.h5 || true
+            git commit -m "自动更新 LSTM 模型 [skip ci]" || true
+            git push || true
+          fi
 
       - name: 长时连续优化（最多500轮）
         shell: bash
@@ -65,6 +79,8 @@ jobs:
       - name: 提交最终结果
         if: always()
         run: |
-          git add best_params_zodiac.json optuna_study.db report.txt newmacau_marksix.db 2>/dev/null
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add best_params_zodiac.json optuna_study.db report.txt newmacau_marksix.db lstm_zodiac.h5 2>/dev/null
           git commit -m "长时进化结果 [skip ci]" 2>/dev/null
           git push 2>/dev/null
