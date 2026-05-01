@@ -64,6 +64,11 @@ except ImportError:
     predict_lstm_proba = None
 
 try:
+    from hmm_features import get_hmm_state_proba
+except ImportError:
+    get_hmm_state_proba = None
+
+try:
     from risk_manager import RiskManager
 except Exception:
     class RiskManager:
@@ -817,6 +822,31 @@ def _momentum_map(draws: List[List[int]]) -> Dict[int, float]:
         for n in draw:
             m[n] += w
     return m
+
+
+def get_zodiac_momentum(recent_zodiacs: Sequence[str], window: int = 10) -> Dict[str, float]:
+    scores = {z: 0.0 for z in ZODIAC_MAP}
+    if not recent_zodiacs:
+        return scores
+    tail = list(recent_zodiacs)[-window:]
+    for i, z in enumerate(reversed(tail)):
+        if z in scores:
+            scores[z] += 1.0 / (1.0 + i)
+    return scores
+
+
+def get_zodiac_cycle_position(recent_zodiacs: Sequence[str], zodiac: str) -> float:
+    if not recent_zodiacs:
+        return 999.0
+    last_idx = None
+    for i, z in enumerate(reversed(recent_zodiacs)):
+        if z == zodiac:
+            last_idx = i
+            break
+    if last_idx is None:
+        return float(len(recent_zodiacs) + 1)
+    avg_cycle = max(1.0, len(recent_zodiacs) / max(1, len(ZODIAC_MAP)))
+    return float(last_idx + 1) / avg_cycle
 
 
 def _pair_affinity_map(draws: List[List[int]], window: int = 3) -> Dict[int, float]:
@@ -2287,7 +2317,7 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int 
     return hot, cold
 
 
-def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
+def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) -> List[str]:
     if not rows:
         return ["马", "蛇"]
 
@@ -2295,6 +2325,8 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     wsize = int(params.get("wsize", 6))
     rec_w = float(params.get("rec_w", 0.7339))
     safe_th = float(params.get("safe_th", 1.4589))
+    two_lstm_w = float(params.get("two_lstm_weight", 0.3))
+    two_hmm_w = float(params.get("two_hmm_weight", 0.2))
 
     recent = rows[-wsize:] if len(rows) >= wsize else rows
     zodiac_scores = _build_zodiac_scores_from_rows(recent, decay=0.10)
@@ -2325,17 +2357,37 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     recent_noise = {get_zodiac_by_number(int(r["special_number"])) for r in recent[:2]}
     for z in recent_noise:
         zodiac_scores[z] -= 0.02 * rec_w
+
+    if conn and predict_lstm_proba and two_lstm_w > 0.01:
+        lstm_probs = predict_lstm_proba(conn)
+        if lstm_probs:
+            for z in zodiac_scores:
+                zodiac_scores[z] = (1 - two_lstm_w) * zodiac_scores[z] + two_lstm_w * lstm_probs.get(z, 0.0)
+
+    if conn and get_hmm_state_proba and two_hmm_w > 0.01:
+        hmm_probs = get_hmm_state_proba(conn)
+        if hmm_probs:
+            for z in zodiac_scores:
+                zodiac_scores[z] = (1 - two_hmm_w) * zodiac_scores[z] + two_hmm_w * hmm_probs.get(z, 0.0)
+
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     if ranked and ranked[0][1] < safe_th:
         return [max(omission_zodiac.items(), key=lambda x: x[1])[0], ranked[0][0] if ranked else "马"]
     if len(ranked) >= 2:
-        return [ranked[0][0], ranked[1][0]]
+        hot = ranked[0][0]
+        cold = max((z for z in ZODIAC_MAP if z != hot), key=lambda z: omission_zodiac.get(z, 0))
+        return [hot, cold]
     return ["马", "蛇"]
 
 
-def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
+def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) -> List[str]:
     if not rows:
         return ["马", "蛇", "龙"]
+
+    params = load_best_zodiac_params()
+    three_lstm_w = float(params.get("three_lstm_weight", 0.3))
+    three_hmm_w = float(params.get("three_hmm_weight", 0.2))
+
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
     for z, cnt in Counter(recent_special_zodiacs).items():
@@ -2345,11 +2397,24 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
         recent_main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
     for z, cnt in Counter(recent_main_zodiacs).items():
         zodiac_scores[z] += cnt * 0.5
+
+    if conn and predict_lstm_proba and three_lstm_w > 0.01:
+        lstm_probs = predict_lstm_proba(conn)
+        if lstm_probs:
+            for z in zodiac_scores:
+                zodiac_scores[z] = (1 - three_lstm_w) * zodiac_scores[z] + three_lstm_w * lstm_probs.get(z, 0.0)
+
+    if conn and get_hmm_state_proba and three_hmm_w > 0.01:
+        hmm_probs = get_hmm_state_proba(conn)
+        if hmm_probs:
+            for z in zodiac_scores:
+                zodiac_scores[z] = (1 - three_hmm_w) * zodiac_scores[z] + three_hmm_w * hmm_probs.get(z, 0.0)
+
     omission_zodiac = _zodiac_omission_map(rows)
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
     for z, omit in sorted(omission_zodiac.items(), key=lambda x: -x[1]):
-        if omit >= 5 and z not in picks:
+        if z not in picks:
             picks.append(z)
             break
     return picks[:3]
@@ -2361,6 +2426,7 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
     params = load_best_zodiac_params()
     four_boost = params.get("four_boost", 1.4221)
     lstm_weight = params.get("lstm_weight", 0.3) if params else 0.3
+    lstm_seq_len = int(params.get("lstm_seq_len", 30)) if params else 30
 
     # 计算遗漏（原有逻辑）
     omission = {z: 0 for z in ZODIAC_MAP}
@@ -2372,7 +2438,7 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
 
     # LSTM 概率融合
     if conn is not None and predict_lstm_proba:
-        lstm_probs = predict_lstm_proba(conn, seq_len=30)
+        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
         if lstm_probs:
             for z in omission:
                 omission[z] = (1 - lstm_weight) * omission[z] + lstm_weight * lstm_probs.get(z, 0)
@@ -2417,8 +2483,26 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None)
             scores[get_zodiac_by_number(int(n))] += w
         scores[get_zodiac_by_number(int(r["special_number"]))] += w * 2.0
 
+    recent_zodiacs = []
+    for r in rows[-20:]:
+        for n in json.loads(r["numbers_json"]):
+            recent_zodiacs.append(get_zodiac_by_number(int(n)))
+        recent_zodiacs.append(get_zodiac_by_number(int(r["special_number"])))
+
+    momentum = get_zodiac_momentum(recent_zodiacs, 10)
+    for z in scores:
+        if z in momentum:
+            scores[z] += momentum[z] * 0.6
+
+    for z in scores:
+        cycle = get_zodiac_cycle_position(recent_zodiacs, z)
+        if cycle > 1.5:
+            scores[z] += 3.0
+        elif cycle < 0.5:
+            scores[z] -= 1.0
+
     if conn is not None and predict_lstm_proba:
-        lstm_probs = predict_lstm_proba(conn, seq_len=30)
+        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
         if lstm_probs:
             for z in scores:
                 scores[z] = (1 - lstm_weight) * scores[z] + lstm_weight * lstm_probs.get(z, 0)
@@ -2487,7 +2571,7 @@ def get_recent_two_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        picks = _get_two_zodiac_from_history_rows(history_rows)
+        picks = _get_two_zodiac_from_history_rows(history_rows, conn)
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
