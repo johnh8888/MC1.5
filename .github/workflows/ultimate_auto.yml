@@ -1,58 +1,44 @@
-name: 全自动进化至90%命中率（最大连空≤1）
+name: 增量进化生肖命中率
 
 on:
-  workflow_dispatch:          # 手动触发
+  workflow_dispatch:
   schedule:
-    - cron: '0 6 * * *'       # 北京时间每天14:00自动运行（UTC 06:00）
+    - cron: '0 */6 * * *'   # 每6小时运行一次，在私有仓库完全免费
 
 jobs:
-  evolve:                     # ✅ 使用英文 Job ID
-    name: 自动进化            # ✅ 中文显示名称
+  evolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 600
+    timeout-minutes: 240      # 单次作业最多4小时，充裕
     permissions:
       contents: write
-
     steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 设置Python环境
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: 安装所有依赖
-        run: |
-          pip install --upgrade pip
-          pip install optuna numpy xgboost lightgbm
-          pip install -r requirements.txt || true
-
-      - name: 缓存数据库（加速后续运行）
+      - name: 安装依赖
+        run: pip install optuna numpy
+      - name: 缓存数据
         uses: actions/cache@v4
         with:
-          path: newmacau_marksix.db
-          key: marksix-db-${{ github.run_id }}
-          restore-keys: marksix-db-
-
-      - name: 同步最新开奖数据
+          path: |
+            newmacau_marksix.db
+            optuna_study.db
+          key: marksix-cache-${{ hashFiles('newmacau_marksix.db') }}
+          restore-keys: marksix-cache-
+      - name: 同步最新开奖
         run: python newmacau_marksix.py sync
-
-      - name: 启动自我进化优化器（不达目标不停止）
-        run: python hyper_optimize_ultimate.py --max_trials_per_round 300
-
-      - name: 使用最佳参数重建历史回测与特别号记录
+      - name: 运行优化器 (续传)
+        run: python hyper_optimize_ultimate.py --trials 200
+      - name: 重建回测与报告
         run: |
           python newmacau_marksix.py backfill-special
           python newmacau_marksix.py backtest --rebuild
-
-      - name: 生成最终推荐报告
-        run: python newmacau_marksix.py show | tee report.txt
-
-      - name: 提交优化结果及报告
+          python newmacau_marksix.py show | tee report.txt
+      - name: 提交进度
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add best_params_zodiac.json newmacau_marksix.db report.txt || true
-          git commit -m "自动进化至90%命中率 [skip ci]" || echo "没有新更改，跳过提交"
+          git add best_params_zodiac.json optuna_study.db report.txt newmacau_marksix.db || true
+          git commit -m "优化进度更新 [skip ci]" || echo "No changes"
           git push
