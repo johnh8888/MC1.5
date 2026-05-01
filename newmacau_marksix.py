@@ -2309,7 +2309,7 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
     for z, cnt in Counter(recent_special_zodiacs).items():
-        zodiac_scores[z] += cnt * 2.0
+        zodiac_scores[z] += cnt * 1.357
     recent_main_zodiacs = []
     for r in rows[:5]:
         recent_main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
@@ -2318,8 +2318,8 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
     omission_zodiac = _zodiac_omission_map(rows)
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
-    for z, _ in sorted(omission_zodiac.items(), key=lambda x: -x[1]):
-        if z not in picks:
+    for z, omit in sorted(omission_zodiac.items(), key=lambda x: -x[1]):
+        if omit >= 5 and z not in picks:
             picks.append(z)
             break
     return picks[:3]
@@ -2335,25 +2335,18 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
     for idx, z in enumerate(zodiac_series):
         omission[z] = min(omission[z], idx + 1)
 
-    # 三冷
-    cold_sorted = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
-    picks = [z for z, _ in cold_sorted[:3]]
+    sorted_cold = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
+    picks = [z for z, _ in sorted_cold[:3]]
 
-    # 一跟随：最近一期特号生肖优先跟随；若已在三冷中，则补下一个冷号
-    latest_z = zodiac_series[0] if zodiac_series else None
+    latest_z = zodiac_series[-1] if zodiac_series else None
     if latest_z and latest_z not in picks:
         picks.append(latest_z)
     else:
-        for z, _ in cold_sorted[3:]:
+        for z, _ in sorted_cold[3:]:
             if z not in picks:
                 picks.append(z)
                 break
 
-    while len(picks) < 4:
-        for z, _ in cold_sorted:
-            if z not in picks:
-                picks.append(z)
-                break
     return picks[:4]
 
 
@@ -2361,20 +2354,23 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
 _get_five_zodiac_from_history_rows = _get_four_zodiac_from_history_rows
 
 
-def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
+def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], window: int = 6, recency_w: float = 0.6248, safe_threshold: float = 1.0) -> str:
     if not rows:
         return "马"
 
-    # 最近 5 期：主号 + 特别号，强趋势跟随
-    recent_rows = rows[:5]
+    params = load_best_params()
+    window = int(params.get("single_window", window)) if params else window
+    recency_w = float(params.get("single_recency_w", recency_w)) if params else recency_w
+    safe_threshold = float(params.get("single_safe_threshold", safe_threshold)) if params else safe_threshold
+
+    recent_rows = rows[:window]
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
     for idx, r in enumerate(recent_rows):
-        w = 1.0 / (1.0 + idx * 0.18)
+        w = recency_w / (1.0 + idx * 0.15)
         for n in json.loads(r["numbers_json"]):
             scores[get_zodiac_by_number(int(n))] += 1.35 * w
         scores[get_zodiac_by_number(int(r["special_number"]))] += 2.25 * w
 
-    # 保险：如果近期命中偏低，才补高遗漏生肖
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in recent_rows[:3]]
     if len(recent_special_zodiacs) >= 3 and len(set(recent_special_zodiacs)) <= 2:
         for z in recent_special_zodiacs:
@@ -2387,8 +2383,13 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
         elif omit >= 7:
             scores[z] += 0.45
 
-    top = max(scores.items(), key=lambda x: (x[1], x[0]))[0]
-    return top
+    top_zodiac, top_score = max(scores.items(), key=lambda x: (x[1], x[0]))
+    max_score = top_score
+    if max_score < 1.5:
+        return max(omission.items(), key=lambda x: (x[1], x[0]))[0]
+    if top_score < safe_threshold:
+        return max(omission.items(), key=lambda x: (x[1], x[0]))[0]
+    return top_zodiac
 
 
 def get_recent_single_zodiac_report(
@@ -2623,10 +2624,12 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
         return []
 
     params = load_best_params()
-    cold_threshold = params.get("cold_threshold", 8) if params else 8
-    neighbor_1_bonus = params.get("neighbor_1_bonus", 4.7701) if params else 4.7701
-    neighbor_2_bonus = params.get("neighbor_2_bonus", 1.1365) if params else 1.1365
-    penalty_coeff = params.get("penalty_coeff", 0.8949) if params else 0.8949
+    cold_threshold = params.get("cold_threshold", 11) if params else 11
+    neighbor_1_bonus = params.get("neighbor_1_bonus", 6.918) if params else 6.918
+    neighbor_2_bonus = params.get("neighbor_2_bonus", 0.514) if params else 0.514
+    penalty_coeff = params.get("penalty_coeff", 0.76) if params else 0.76
+    lgb_weight = params.get("lgb_weight", 0.6146) if params else 0.6146
+    omit_boost = params.get("four_omit_boost", 2.578) if params else 2.578
 
     # 拉取最近特别号，应用 PREDICT_LAG 跳过最新一期
     recent_rows = conn.execute(
@@ -2637,8 +2640,7 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
     if not recent_specials:
         return list(ZODIAC_MAP.get(zodiac_pool[0], []))[:top_n]
 
-    latest_special = recent_specials[0]          # 已前移后的最近一期
-    # 遗漏计算同样基于前移后的数据
+    latest_special = recent_specials[0]
     omission = {}
     for i, sp in enumerate(recent_specials):
         if sp not in omission:
@@ -2648,7 +2650,6 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
     if not candidates:
         return []
 
-    # ---- 强制冷号策略 ----
     cold_picks = sorted(
         [n for n in candidates if omission.get(n, 20) >= cold_threshold],
         key=lambda n: omission.get(n, 20), reverse=True
@@ -2662,13 +2663,11 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
             cold_picks.append(extra.pop(0))
     picks = cold_picks[:2]
 
-    # 第三个名额：优先选 latest_special 的 ±1 邻号（不与冷号重复）
     if len(picks) < top_n:
         neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in picks]
         if neighbors:
             picks.append(max(neighbors, key=lambda n: omission.get(n, 20) + neighbor_1_bonus))
         else:
-            # 没有邻号则继续补冷号
             rest = [n for n in candidates if n not in picks]
             rest.sort(key=lambda n: omission.get(n, 20), reverse=True)
             while len(picks) < top_n and rest:
@@ -2682,9 +2681,10 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
     if recent_specials:
         scored = []
         for n in picks:
-            score = float(omission.get(n, 20))
+            score = float(omission.get(n, 20)) * lgb_weight
             if n in recent_specials[:3]:
                 score *= penalty_coeff
+            score += omit_boost if omission.get(n, 20) >= cold_threshold else 0.0
             scored.append((n, score))
         picks = [n for n, _ in sorted(scored, key=lambda x: (-x[1], x[0]))]
 
