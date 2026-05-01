@@ -1,14 +1,14 @@
-name: 全模块进化（LSTM+HMM+特别号）
+name: 澳门彩全自动进化
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 */4 * * *'   # 每4小时
 
 jobs:
   evolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 333
+    timeout-minutes: 330      # 5.5小时
     permissions:
       contents: write
     steps:
@@ -22,7 +22,7 @@ jobs:
           pip install optuna numpy tensorflow hmmlearn
           pip install -r requirements.txt || true
 
-      - name: 缓存数据与模型
+      - name: 缓存
         uses: actions/cache@v4
         with:
           path: |
@@ -31,8 +31,8 @@ jobs:
             lstm_zodiac.h5
             lstm_seq_len.txt
             hmm_zodiac.pkl
-          key: marksix-cache-${{ hashFiles('newmacau_marksix.db') }}
-          restore-keys: marksix-cache-
+          key: macau-cache-${{ hashFiles('newmacau_marksix.db') }}
+          restore-keys: macau-cache-
 
       - name: 同步最新开奖
         run: python newmacau_marksix.py sync
@@ -64,7 +64,7 @@ jobs:
             git push || true
           fi
 
-      - name: 长时多轮优化
+      - name: 长时优化
         shell: bash
         run: |
           set +e
@@ -91,11 +91,11 @@ jobs:
           python newmacau_marksix.py backtest --rebuild
           python newmacau_marksix.py show | tee report.txt
 
-      - name: 提交最终结果
+      - name: 提交结果
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add best_params_zodiac.json optuna_study.db report.txt newmacau_marksix.db lstm_zodiac.h5 lstm_seq_len.txt hmm_zodiac.pkl 2>/dev/null
-          git commit -m "全模块进化结果 [skip ci]" 2>/dev/null
+          git commit -m "澳门彩进化结果 [skip ci]" 2>/dev/null
           git push 2>/dev/null
