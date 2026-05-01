@@ -2233,24 +2233,28 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
 
 
 def get_single_zodiac_pick(conn, issue_no, window=6):
+    params = load_best_zodiac_params()
+    wsize = int(params.get("wsize", window))
+    rec_w = float(params.get("rec_w", 0.7339))
+    safe_th = float(params.get("safe_th", 1.4589))
+
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 5"
     ).fetchall()
     if not rows:
         return "马"
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
-    for idx, r in enumerate(rows):
-        recency_w = 1.6228032754817128 / (1.0 + idx * 0.16)
+    recent = rows[-wsize:] if len(rows) >= wsize else rows
+    for idx, r in enumerate(recent[::-1]):
+        w = rec_w / (1.0 + idx * 0.15)
         for n in json.loads(r["numbers_json"]):
-            scores[get_zodiac_by_number(int(n))] += 1.26 * recency_w
-        scores[get_zodiac_by_number(int(r["special_number"]))] += 2.35 * recency_w
-    recent_hit_rate = get_recent_single_zodiac_report(conn, lookback=5, history_window=16)['hit_rate']
-    if recent_hit_rate < 0.70:
+            scores[get_zodiac_by_number(int(n))] += w
+        scores[get_zodiac_by_number(int(r["special_number"]))] += w * 2.0
+
+    if max(scores.values()) < safe_th:
         omission = _zodiac_omission_map(rows)
-        for z, omit in omission.items():
-            if omit >= 7:
-                scores[z] += 1.5
-    return max(scores.items(), key=lambda x: (x[1], x[0]))[0]
+        return max(omission.items(), key=lambda x: x[1])[0]
+    return max(scores.items(), key=lambda x: x[1])[0]
 
 
 def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int = 3) -> Tuple[List[str], List[str]]:
@@ -2281,35 +2285,44 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int 
 def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:4]]
+
+    params = load_best_zodiac_params()
+    wsize = int(params.get("wsize", 6))
+    rec_w = float(params.get("rec_w", 0.7339))
+    safe_th = float(params.get("safe_th", 1.4589))
+
+    recent = rows[-wsize:] if len(rows) >= wsize else rows
+    zodiac_scores = _build_zodiac_scores_from_rows(recent, decay=0.10)
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in recent[::-1][:4]]
     zodiac_counter = Counter(recent_special_zodiacs)
     if zodiac_counter:
         special_hot = max(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
-        zodiac_scores[special_hot] += 8.5
+        zodiac_scores[special_hot] += 8.5 * rec_w
         for z, cnt in zodiac_counter.items():
-            zodiac_scores[z] += cnt * 0.9
-    omission_zodiac: Dict[str, int] = _zodiac_omission_map(rows)
+            zodiac_scores[z] += cnt * 0.9 * rec_w
+    omission_zodiac: Dict[str, int] = _zodiac_omission_map(recent)
     for z, omit in omission_zodiac.items():
         if omit >= 6:
-            zodiac_scores[z] += 1.8
+            zodiac_scores[z] += 1.8 * rec_w
         elif omit >= 3:
-            zodiac_scores[z] += 0.4
+            zodiac_scores[z] += 0.4 * rec_w
     main_zodiacs = []
-    for r in rows[:4]:
+    for r in recent[:4]:
         main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
     main_counter = Counter(main_zodiacs)
     if main_counter:
         main_hot = max(main_counter.keys(), key=lambda z: main_counter[z])
-        zodiac_scores[main_hot] += 0.10
+        zodiac_scores[main_hot] += 0.10 * rec_w
     recent_all = recent_special_zodiacs + main_zodiacs
     for z, cnt in Counter(recent_all).items():
         if cnt >= 2:
-            zodiac_scores[z] += 0.12
-    recent_noise = {get_zodiac_by_number(int(r["special_number"])) for r in rows[:2]}
+            zodiac_scores[z] += 0.12 * rec_w
+    recent_noise = {get_zodiac_by_number(int(r["special_number"])) for r in recent[:2]}
     for z in recent_noise:
-        zodiac_scores[z] -= 0.02
+        zodiac_scores[z] -= 0.02 * rec_w
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    if ranked and ranked[0][1] < safe_th:
+        return [max(omission_zodiac.items(), key=lambda x: x[1])[0], ranked[0][0] if ranked else "马"]
     if len(ranked) >= 2:
         return [ranked[0][0], ranked[1][0]]
     return ["马", "蛇"]
@@ -2372,39 +2385,30 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
 _get_five_zodiac_from_history_rows = _get_four_zodiac_from_history_rows
 
 
-def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], window_size: int = 6, recency_weight: float = 0.7339244843958144, safe_threshold: float = 1.4589204262361037) -> str:
+def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     if not rows:
         return "马"
 
-    params = load_best_params()
-    window_size = int(params.get("single_window", window_size)) if params else window_size
-    recency_weight = float(params.get("single_recency_w", recency_weight)) if params else recency_weight
-    safe_threshold = float(params.get("single_safe_threshold", safe_threshold)) if params else safe_threshold
+    # 从优化结果加载参数，若无文件则使用稳健默认值
+    params = load_best_zodiac_params()
+    wsize = int(params.get("wsize", 6))
+    rec_w = float(params.get("rec_w", 0.7339))
+    safe_th = float(params.get("safe_th", 1.4589))
 
-    recent_rows = rows[:window_size]
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
-    for idx, r in enumerate(recent_rows):
-        w = recency_weight / (1.0 + idx * 0.15)
+    recent = rows[-wsize:] if len(rows) >= wsize else rows
+    for idx, r in enumerate(recent[::-1]):
+        w = rec_w / (1.0 + idx * 0.15)
         for n in json.loads(r["numbers_json"]):
-            scores[get_zodiac_by_number(int(n))] += 1.35 * w
-        scores[get_zodiac_by_number(int(r["special_number"]))] += 2.25 * w
+            scores[get_zodiac_by_number(int(n))] += w
+        scores[get_zodiac_by_number(int(r["special_number"]))] += w * 2.0
 
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in recent_rows[:3]]
-    if len(recent_special_zodiacs) >= 3 and len(set(recent_special_zodiacs)) <= 2:
-        for z in recent_special_zodiacs:
-            scores[z] += 0.35
+    max_score = max(scores.values())
+    if max_score < safe_th:
+        omission = _zodiac_omission_map(rows)
+        return max(omission.items(), key=lambda x: x[1])[0]
 
-    omission = _zodiac_omission_map(rows)
-    for z, omit in omission.items():
-        if omit >= 8:
-            scores[z] += 1.4
-        elif omit >= 7:
-            scores[z] += 0.45
-
-    top_zodiac, max_score = max(scores.items(), key=lambda x: (x[1], x[0]))
-    if max_score < safe_threshold:
-        return max(omission.items(), key=lambda x: (x[1], x[0]))[0]
-    return top_zodiac
+    return max(scores.items(), key=lambda x: x[1])[0]
 
 
 def get_recent_single_zodiac_report(
