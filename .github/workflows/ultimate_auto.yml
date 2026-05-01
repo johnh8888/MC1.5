@@ -6,11 +6,12 @@ on:
     - cron: '0 6 * * *'       # 北京时间每天14:00自动运行（UTC 06:00）
 
 jobs:
-  自动进化:
+  evolve:                     # ✅ 使用英文 Job ID
+    name: 自动进化            # ✅ 中文显示名称
     runs-on: ubuntu-latest
-    timeout-minutes: 600      # 最多运行10小时，确保足够搜索
+    timeout-minutes: 600
     permissions:
-      contents: write          # 允许推送代码
+      contents: write
 
     steps:
       - name: 检出仓库代码
