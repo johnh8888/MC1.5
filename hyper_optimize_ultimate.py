@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
-"""终极自我进化优化器 —— 软化评分 + 连续多轮搜索"""
-import sqlite3, json, sys, argparse
+"""自我进化优化器 v3.0 —— 多样性惩罚 + 跳出局部最优 + 二中二严格评估"""
+import sqlite3, json, sys, argparse, random
 from collections import Counter
 import optuna
 
 ZODIAC_MAP = {
-    "马": [1, 13, 25, 37, 49],
-    "蛇": [2, 14, 26, 38],
-    "龙": [3, 15, 27, 39],
-    "兔": [4, 16, 28, 40],
-    "虎": [5, 17, 29, 41],
-    "牛": [6, 18, 30, 42],
-    "鼠": [7, 19, 31, 43],
-    "猪": [8, 20, 32, 44],
-    "狗": [9, 21, 33, 45],
-    "鸡": [10, 22, 34, 46],
-    "猴": [11, 23, 35, 47],
-    "羊": [12, 24, 36, 48],
+    "马": [1, 13, 25, 37, 49], "蛇": [2, 14, 26, 38], "龙": [3, 15, 27, 39],
+    "兔": [4, 16, 28, 40], "虎": [5, 17, 29, 41], "牛": [6, 18, 30, 42],
+    "鼠": [7, 19, 31, 43], "猪": [8, 20, 32, 44], "狗": [9, 21, 33, 45],
+    "鸡": [10, 22, 34, 46], "猴": [11, 23, 35, 47], "羊": [12, 24, 36, 48],
 }
 ALL_NUMS = list(range(1, 50))
 
@@ -35,12 +27,9 @@ def load_issues(conn, recent=300):
     rows = conn.execute(
         "SELECT issue_no, draw_date, numbers_json, special_number FROM draws ORDER BY draw_date ASC"
     ).fetchall()
-    return [
-        (r["issue_no"], json.loads(r["numbers_json"]), int(r["special_number"]))
-        for r in rows[-recent:]
-    ]
+    return [(r["issue_no"], json.loads(r["numbers_json"]), int(r["special_number"])) for r in rows[-recent:]]
 
-# ---------- 预测函数 ----------
+# ========== 预测函数 ==========
 def pred_single(hist, wsize, rec_w, safe_th):
     scores = {z: 0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist) >= wsize else hist
@@ -98,11 +87,18 @@ def pred_four(hist, four_boost):
                 break
     return picks[:4]
 
+# ========== 核心评估函数（添加多样性惩罚） ==========
 def evaluate(issues, params):
     single_h = two_h = four_h = 0
     single_streak = two_streak = four_streak = 0
     max_single_streak = max_two_streak = max_four_streak = 0
     total = 0
+
+    # 用于记录所有预测结果，计算多样性
+    single_list = []
+    two_list = []
+    four_list = []
+
     for i in range(60, len(issues)):
         past = issues[:i]
         cur_nums, cur_sp = issues[i][1], issues[i][2]
@@ -110,6 +106,7 @@ def evaluate(issues, params):
         cur_zod.add(get_zodiac(cur_sp))
 
         s = pred_single(past, params['wsize'], params['rec_w'], params['safe_th'])
+        single_list.append(s)
         if s in cur_zod:
             single_h += 1
             single_streak = 0
@@ -118,7 +115,8 @@ def evaluate(issues, params):
             max_single_streak = max(max_single_streak, single_streak)
 
         two = pred_two(past)
-        if any(z in cur_zod for z in two):
+        two_list.append(tuple(two))
+        if all(z in cur_zod for z in two):   # 严格二中二
             two_h += 1
             two_streak = 0
         else:
@@ -126,6 +124,7 @@ def evaluate(issues, params):
             max_two_streak = max(max_two_streak, two_streak)
 
         four = pred_four(past, params['four_boost'])
+        four_list.append(tuple(four))
         if any(z in cur_zod for z in four):
             four_h += 1
             four_streak = 0
@@ -137,23 +136,27 @@ def evaluate(issues, params):
 
     if total == 0:
         return 0.0, 0, 0, 0, 0, 0, 0
+
     r1 = single_h / total
     r2 = two_h / total
     r4 = four_h / total
     max_streak = max(max_single_streak, max_two_streak, max_four_streak)
 
-    # 软化评分：基础分 = 三个命中率的加权平均
+    # 基础分：加权平均
     score = r1 * 0.4 + r2 * 0.35 + r4 * 0.25
 
-    # 对不达标的指标施加温和惩罚（乘系数，不归零）
-    if r1 < 0.90:
-        score *= 0.7
-    if r2 < 0.92:
-        score *= 0.7
-    if r4 < 0.90:
-        score *= 0.8
-    if max_streak > 1:
-        score *= 0.9
+    # 多样性惩罚：如果预测结果过于单一，则大幅降分
+    single_unique = len(set(single_list))
+    two_unique = len(set(two_list))
+    four_unique = len(set(four_list))
+    min_diversity = min(single_unique, two_unique, four_unique) / total
+    score *= min(1.0, min_diversity * 5)   # 多样性不足时，分数被压低
+
+    # 温和惩罚不达标项
+    if r1 < 0.90: score *= 0.7
+    if r2 < 0.92: score *= 0.7
+    if r4 < 0.90: score *= 0.8
+    if max_streak > 1: score *= 0.9
 
     return score, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
 
@@ -182,7 +185,7 @@ def main():
 
     study = optuna.create_study(
         direction='maximize',
-        study_name='ultimate_optimizer',
+        study_name='ultimate_optimizer_v3',
         storage='sqlite:///optuna_study.db',
         load_if_exists=True,
     )
@@ -191,11 +194,12 @@ def main():
     best_p = study.best_params
     score, r1, r2, r4, ms1, ms2, ms4 = evaluate(issues, best_p)
     print(f"当前最佳: 一生肖={r1:.3f}(连空{ms1}) 二肖={r2:.3f}(连空{ms2}) 四肖={r4:.3f}(连空{ms4})")
+    print(f"多样性指标: 一生肖种类数={len(set(single_list))}, 二生肖种类数={len(set(two_list))}, 四生肖种类数={len(set(four_list))}")
 
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
 
-    # 判定是否严格达标
+    # 严格达标判定
     if r1 >= 0.90 and r2 >= 0.92 and r4 >= 0.90 and max(ms1, ms2, ms4) <= 1:
         print("🎉 已达标！")
         sys.exit(0)
