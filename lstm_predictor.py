@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 """ LSTM 序列模型：预测下一期各生肖的出现概率 """
-import sqlite3, json
+import sqlite3, json, argparse
 import numpy as np
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
 from pathlib import Path
 
-ZODIAC_MAP = { ... }  # 与主脚本一致，省略
-ZODIAC_LIST = list(ZODIAC_MAP.keys())  # 12生肖顺序固定
+# ---------- 请确保下面的生肖映射与主脚本一致 ----------
+ZODIAC_MAP = {
+    "马": [1, 13, 25, 37, 49],
+    "蛇": [2, 14, 26, 38],
+    "龙": [3, 15, 27, 39],
+    "兔": [4, 16, 28, 40],
+    "虎": [5, 17, 29, 41],
+    "牛": [6, 18, 30, 42],
+    "鼠": [7, 19, 31, 43],
+    "猪": [8, 20, 32, 44],
+    "狗": [9, 21, 33, 45],
+    "鸡": [10, 22, 34, 46],
+    "猴": [11, 23, 35, 47],
+    "羊": [12, 24, 36, 48],
+}
+ZODIAC_LIST = list(ZODIAC_MAP.keys())  # 固定顺序
+
+def get_zodiac_by_number(n):
+    for z, nums in ZODIAC_MAP.items():
+        if n in nums:
+            return z
+    return "马"
 
 def connect_db(path):
     conn = sqlite3.connect(path)
@@ -19,13 +35,11 @@ def connect_db(path):
 def build_sequence_data(conn, seq_len=30):
     """
     构建训练/预测所需的时序特征
-    返回: X (样本数, seq_len, 特征维度), y (样本数, 12) 
-          对于每一期，X是前seq_len期的特征，y是当期各生肖是否出现（主号+特别号）
+    返回: X (样本数, seq_len, 12), y (样本数, 12)
     """
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date ASC"
     ).fetchall()
-    # 每期提取12维向量：每个生肖是否出现（1/0）
     all_features = []
     for row in rows:
         nums = json.loads(row["numbers_json"])
@@ -45,12 +59,20 @@ def build_sequence_data(conn, seq_len=30):
     return np.array(X), np.array(y)
 
 def train_lstm(conn, model_path='lstm_zodiac.h5', seq_len=30, epochs=50):
-    X, y = build_sequence_data(conn, seq_len)
-    if len(X) < 100:
-        print("[LSTM] 数据不足，跳过训练")
+    try:
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import LSTM, Dense, Dropout
+        from tensorflow.keras.optimizers import Adam
+        from tensorflow.keras.callbacks import EarlyStopping
+    except ImportError:
+        print("[LSTM] 未安装 TensorFlow，跳过训练。请执行：pip install tensorflow")
         return
 
-    # 划分训练/验证集（时序，不可随机打乱）
+    X, y = build_sequence_data(conn, seq_len)
+    if len(X) < 100:
+        print(f"[LSTM] 数据不足（{len(X)} 条），至少需要100个样本，跳过训练")
+        return
+
     split = int(len(X) * 0.85)
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
@@ -63,15 +85,24 @@ def train_lstm(conn, model_path='lstm_zodiac.h5', seq_len=30, epochs=50):
         Dense(12, activation='sigmoid')
     ])
     model.compile(optimizer=Adam(1e-3), loss='binary_crossentropy')
-    model.fit(X_train, y_train, validation_data=(X_val, y_val),
-              epochs=epochs, batch_size=32, callbacks=[EarlyStopping(patience=10)],
-              verbose=1)
+    model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=32,
+        callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+        verbose=1
+    )
     model.save(model_path)
     print(f"[LSTM] 模型已保存至 {model_path}")
 
 def predict_lstm_proba(conn, model_path='lstm_zodiac.h5', seq_len=30):
-    """ 返回对下一期12生肖的概率向量 """
+    """ 返回对下一期12生肖的概率向量（dict） """
     if not Path(model_path).exists():
+        return None
+    try:
+        from tensorflow.keras.models import load_model
+    except ImportError:
         return None
     model = load_model(model_path)
     rows = conn.execute(
@@ -80,7 +111,6 @@ def predict_lstm_proba(conn, model_path='lstm_zodiac.h5', seq_len=30):
     ).fetchall()
     if len(rows) < seq_len:
         return None
-    # 构建最近seq_len期的特征
     features = []
     for row in rows[::-1]:  # 从旧到新
         nums = json.loads(row["numbers_json"])
@@ -95,3 +125,14 @@ def predict_lstm_proba(conn, model_path='lstm_zodiac.h5', seq_len=30):
     X_input = np.array(features[-seq_len:]).reshape(1, seq_len, 12)
     proba = model.predict(X_input, verbose=0)[0]
     return dict(zip(ZODIAC_LIST, proba))
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--db', default='newmacau_marksix.db')
+    parser.add_argument('--seq_len', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=50)
+    args = parser.parse_args()
+
+    conn = connect_db(args.db)
+    train_lstm(conn, seq_len=args.seq_len, epochs=args.epochs)
+    conn.close()
