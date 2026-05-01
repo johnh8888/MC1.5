@@ -8,7 +8,7 @@ on:
 jobs:
   evolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 4320
+    timeout-minutes: 333
     permissions:
       contents: write
     steps:
