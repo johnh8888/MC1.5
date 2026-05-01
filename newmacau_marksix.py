@@ -59,6 +59,11 @@ except Exception:
     def get_three_zodiac_picks(*args, **kwargs): return ["马", "蛇", "龙"]
 
 try:
+    from lstm_predictor import predict_lstm_proba
+except ImportError:
+    predict_lstm_proba = None
+
+try:
     from risk_manager import RiskManager
 except Exception:
     class RiskManager:
@@ -2355,6 +2360,7 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
         return ["马", "蛇", "龙", "兔"]
     params = load_best_zodiac_params()
     four_boost = params.get("four_boost", 1.4221)
+    lstm_weight = params.get("lstm_weight", 0.3) if params else 0.3
 
     # 计算遗漏（原有逻辑）
     omission = {z: 0 for z in ZODIAC_MAP}
@@ -2363,6 +2369,13 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
     for idx, z in enumerate(zodiac_series):
         if omission[z] == 0:
             omission[z] = idx + 1
+
+    # LSTM 概率融合
+    if conn is not None and predict_lstm_proba:
+        lstm_probs = predict_lstm_proba(conn, seq_len=30)
+        if lstm_probs:
+            for z in omission:
+                omission[z] = (1 - lstm_weight) * omission[z] + lstm_weight * lstm_probs.get(z, 0)
 
     # 遗漏分母缩小（体现 four_boost）
     for z in omission:
@@ -2385,7 +2398,7 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
 _get_five_zodiac_from_history_rows = _get_four_zodiac_from_history_rows
 
 
-def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
+def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) -> str:
     if not rows:
         return "马"
 
@@ -2394,6 +2407,7 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     wsize = int(params.get("wsize", 6))
     rec_w = float(params.get("rec_w", 0.7339))
     safe_th = float(params.get("safe_th", 1.4589))
+    lstm_weight = params.get("lstm_weight", 0.3) if params else 0.3
 
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
     recent = rows[-wsize:] if len(rows) >= wsize else rows
@@ -2402,6 +2416,12 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
         for n in json.loads(r["numbers_json"]):
             scores[get_zodiac_by_number(int(n))] += w
         scores[get_zodiac_by_number(int(r["special_number"]))] += w * 2.0
+
+    if conn is not None and predict_lstm_proba:
+        lstm_probs = predict_lstm_proba(conn, seq_len=30)
+        if lstm_probs:
+            for z in scores:
+                scores[z] = (1 - lstm_weight) * scores[z] + lstm_weight * lstm_probs.get(z, 0)
 
     max_score = max(scores.values())
     if max_score < safe_th:
@@ -2428,7 +2448,7 @@ def get_recent_single_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        pick = _get_single_zodiac_from_history_rows(history_rows)
+        pick = _get_single_zodiac_from_history_rows(history_rows, conn)
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
@@ -3016,7 +3036,7 @@ def backfill_special_picks_log(conn, max_issues=100):
         if len(history) < 12:
             continue
 
-        base_four = _get_four_zodiac_from_history_rows(history, conn=None)
+        base_four = _get_four_zodiac_from_history_rows(history, conn)
         recent_zodiacs = [get_zodiac_by_number(int(r['special_number'])) for r in history[:8]]
         zodiac_freq = Counter(recent_zodiacs)
         specials_hist = [int(r['special_number']) for r in history[:30]]
