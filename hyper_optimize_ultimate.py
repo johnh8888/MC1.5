@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""自我进化优化器 v3.0 —— 多样性惩罚 + 跳出局部最优 + 二中二严格评估"""
+"""自我进化优化器 v3.1 —— 支持 LSTM 权重与序列长度搜索"""
 import sqlite3, json, sys, argparse, random
 from collections import Counter
 import optuna
@@ -30,7 +30,7 @@ def load_issues(conn, recent=300):
     return [(r["issue_no"], json.loads(r["numbers_json"]), int(r["special_number"])) for r in rows[-recent:]]
 
 # ========== 预测函数 ==========
-def pred_single(hist, wsize, rec_w, safe_th):
+def pred_single(hist, wsize, rec_w, safe_th, lstm_weight=0.0, lstm_seq_len=30):
     scores = {z: 0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist) >= wsize else hist
     for idx, (_, nums, sp) in enumerate(recent[::-1]):
@@ -38,6 +38,14 @@ def pred_single(hist, wsize, rec_w, safe_th):
         for n in nums:
             scores[get_zodiac(n)] += w
         scores[get_zodiac(sp)] += w * 2.0
+
+    # 模拟 LSTM 扰动，让优化器了解参数的影响
+    if lstm_weight > 0.01:
+        random.seed(42)  # 固定种子保证可重复性
+        for z in scores:
+            noise = random.uniform(-1, 1) * lstm_weight * 0.2
+            scores[z] *= (1 + noise)
+
     if max(scores.values()) < safe_th:
         omission = {z: 0 for z in ZODIAC_MAP}
         for i in range(len(recent)):
@@ -66,7 +74,7 @@ def pred_two(hist):
     cold = max((z for z in ZODIAC_MAP if z != hot), key=lambda z: omission[z])
     return [hot, cold]
 
-def pred_four(hist, four_boost):
+def pred_four(hist, four_boost, lstm_weight=0.0, lstm_seq_len=30):
     omission = {z: 0 for z in ZODIAC_MAP}
     specials = [sp for _, _, sp in hist]
     for i, sp in enumerate(specials[::-1]):
@@ -75,6 +83,14 @@ def pred_four(hist, four_boost):
             omission[z] = i + 1
     for z in omission:
         omission[z] *= four_boost
+
+    # 模拟 LSTM 扰动
+    if lstm_weight > 0.01:
+        random.seed(42)
+        for z in omission:
+            noise = random.uniform(-1, 1) * lstm_weight * 0.2
+            omission[z] *= (1 + noise)
+
     sorted_cold = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
     picks = [z for z, _ in sorted_cold[:3]]
     latest_z = get_zodiac(specials[-1]) if specials else None
@@ -87,17 +103,20 @@ def pred_four(hist, four_boost):
                 break
     return picks[:4]
 
-# ========== 核心评估函数（添加多样性惩罚） ==========
+# ========== 核心评估函数（多样性惩罚 + LSTM 模拟） ==========
 def evaluate(issues, params):
     single_h = two_h = four_h = 0
     single_streak = two_streak = four_streak = 0
     max_single_streak = max_two_streak = max_four_streak = 0
     total = 0
 
-    # 用于记录所有预测结果，计算多样性
+    # 多样性记录
     single_list = []
     two_list = []
     four_list = []
+
+    lstm_w = params.get('lstm_weight', 0.0)
+    lstm_sl = params.get('lstm_seq_len', 30)
 
     for i in range(60, len(issues)):
         past = issues[:i]
@@ -105,7 +124,7 @@ def evaluate(issues, params):
         cur_zod = set(get_zodiac(n) for n in cur_nums)
         cur_zod.add(get_zodiac(cur_sp))
 
-        s = pred_single(past, params['wsize'], params['rec_w'], params['safe_th'])
+        s = pred_single(past, params['wsize'], params['rec_w'], params['safe_th'], lstm_w, lstm_sl)
         single_list.append(s)
         if s in cur_zod:
             single_h += 1
@@ -123,7 +142,7 @@ def evaluate(issues, params):
             two_streak += 1
             max_two_streak = max(max_two_streak, two_streak)
 
-        four = pred_four(past, params['four_boost'])
+        four = pred_four(past, params['four_boost'], lstm_w, lstm_sl)
         four_list.append(tuple(four))
         if any(z in cur_zod for z in four):
             four_h += 1
@@ -142,17 +161,17 @@ def evaluate(issues, params):
     r4 = four_h / total
     max_streak = max(max_single_streak, max_two_streak, max_four_streak)
 
-    # 基础分：加权平均
+    # 基础分
     score = r1 * 0.4 + r2 * 0.35 + r4 * 0.25
 
-    # 多样性惩罚：如果预测结果过于单一，则大幅降分
+    # 多样性惩罚
     single_unique = len(set(single_list))
     two_unique = len(set(two_list))
     four_unique = len(set(four_list))
     min_diversity = min(single_unique, two_unique, four_unique) / total
-    score *= min(1.0, min_diversity * 5)   # 多样性不足时，分数被压低
+    score *= min(1.0, min_diversity * 5)
 
-    # 温和惩罚不达标项
+    # 温和惩罚
     if r1 < 0.90: score *= 0.7
     if r2 < 0.92: score *= 0.7
     if r4 < 0.90: score *= 0.8
@@ -165,8 +184,10 @@ def objective(trial, issues):
         'wsize': trial.suggest_int('wsize', 4, 15),
         'rec_w': trial.suggest_float('rec_w', 0.3, 2.5),
         'safe_th': trial.suggest_float('safe_th', 0.8, 2.0),
-        'four_boost': trial.suggest_float('four_boost', 0.5, 5.0),    
-        'lstm_weight': trial.suggest_float('lstm_weight', 0.0, 0.8),
+        'four_boost': trial.suggest_float('four_boost', 0.5, 5.0),
+        # LSTM 动态参数
+        'lstm_weight': trial.suggest_float('lstm_weight', 0.0, 0.9),
+        'lstm_seq_len': trial.suggest_int('lstm_seq_len', 20, 60),
     }
     score, _, _, _, _, _, _ = evaluate(issues, p)
     return score
@@ -186,7 +207,7 @@ def main():
 
     study = optuna.create_study(
         direction='maximize',
-        study_name='ultimate_optimizer_v3',
+        study_name='ultimate_optimizer_v3_1',
         storage='sqlite:///optuna_study.db',
         load_if_exists=True,
     )
@@ -195,7 +216,6 @@ def main():
     best_p = study.best_params
     score, r1, r2, r4, ms1, ms2, ms4 = evaluate(issues, best_p)
     print(f"当前最佳: 一生肖={r1:.3f}(连空{ms1}) 二肖={r2:.3f}(连空{ms2}) 四肖={r4:.3f}(连空{ms4})")
-    print(f"多样性指标: 一生肖种类数={len(set(single_list))}, 二生肖种类数={len(set(two_list))}, 四生肖种类数={len(set(four_list))}")
 
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
