@@ -1,6 +1,17 @@
 {
   "wsize": 6,
-  "rec_w": 0.7611057359641722,
-  "safe_th": 1.750089347002433,
-  "four_boost": 4.997002677465694
+  "rec_w": 2.458954672595265,
+  "safe_th": 1.0144890829117426,
+  "four_boost": 3.848362628785226,
+  "lstm_weight": 0.16391197770841728,
+  "lstm_seq_len": 58,
+  "sp_cold_threshold": 17,
+  "sp_neighbor_bonus1": 2.14885227941801,
+  "sp_neighbor_bonus2": 0.6794649970964057,
+  "sp_recent_penalty": 0.4308697661244764,
+  "sp_lstm_weight": 0.5533120143982502,
+  "two_lstm_weight": 0.7707168830349388,
+  "two_hmm_weight": 0.038827621459101846,
+  "three_lstm_weight": 0.36806589695110337,
+  "three_hmm_weight": 0.24198259299750124
 }
