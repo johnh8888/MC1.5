@@ -2220,7 +2220,7 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     return picks[:2]
 
 
-def get_single_zodiac_pick(conn, issue_no, window=14):
+def get_single_zodiac_pick(conn, issue_no, window=6):
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 5"
     ).fetchall()
@@ -2228,15 +2228,15 @@ def get_single_zodiac_pick(conn, issue_no, window=14):
         return "马"
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
     for idx, r in enumerate(rows):
-        w = 1.0 / (1.0 + idx * 0.16)
+        recency_w = 1.6228032754817128 / (1.0 + idx * 0.16)
         for n in json.loads(r["numbers_json"]):
-            scores[get_zodiac_by_number(int(n))] += 1.26 * w
-        scores[get_zodiac_by_number(int(r["special_number"]))] += 2.35 * w
+            scores[get_zodiac_by_number(int(n))] += 1.26 * recency_w
+        scores[get_zodiac_by_number(int(r["special_number"]))] += 2.35 * recency_w
     recent_hit_rate = get_recent_single_zodiac_report(conn, lookback=5, history_window=16)['hit_rate']
     if recent_hit_rate < 0.70:
         omission = _zodiac_omission_map(rows)
         for z, omit in omission.items():
-            if omit >= 6:
+            if omit >= 7:
                 scores[z] += 1.5
     return max(scores.items(), key=lambda x: (x[1], x[0]))[0]
 
@@ -2384,7 +2384,7 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     for z, omit in omission.items():
         if omit >= 8:
             scores[z] += 1.4
-        elif omit >= 5:
+        elif omit >= 7:
             scores[z] += 0.45
 
     top = max(scores.items(), key=lambda x: (x[1], x[0]))[0]
@@ -2622,6 +2622,12 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
     if not zodiac_pool:
         return []
 
+    params = load_best_params()
+    cold_threshold = params.get("cold_threshold", 8) if params else 8
+    neighbor_1_bonus = params.get("neighbor_1_bonus", 4.7701) if params else 4.7701
+    neighbor_2_bonus = params.get("neighbor_2_bonus", 1.1365) if params else 1.1365
+    penalty_coeff = params.get("penalty_coeff", 0.8949) if params else 0.8949
+
     # 拉取最近特别号，应用 PREDICT_LAG 跳过最新一期
     recent_rows = conn.execute(
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT ?",
@@ -2643,9 +2649,8 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
         return []
 
     # ---- 强制冷号策略 ----
-    # 选两个最冷的号码（遗漏≥15期），不足则降级到遗漏≥10期
     cold_picks = sorted(
-        [n for n in candidates if omission.get(n, 20) >= 15],
+        [n for n in candidates if omission.get(n, 20) >= cold_threshold],
         key=lambda n: omission.get(n, 20), reverse=True
     )[:2]
     if len(cold_picks) < 2:
@@ -2661,13 +2666,28 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
     if len(picks) < top_n:
         neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in picks]
         if neighbors:
-            picks.append(max(neighbors, key=lambda n: omission.get(n, 20)))
+            picks.append(max(neighbors, key=lambda n: omission.get(n, 20) + neighbor_1_bonus))
         else:
             # 没有邻号则继续补冷号
             rest = [n for n in candidates if n not in picks]
             rest.sort(key=lambda n: omission.get(n, 20), reverse=True)
             while len(picks) < top_n and rest:
                 picks.append(rest.pop(0))
+
+    if len(picks) < top_n:
+        neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in picks]
+        if neighbors2:
+            picks.append(max(neighbors2, key=lambda n: omission.get(n, 20) + neighbor_2_bonus))
+
+    if recent_specials:
+        scored = []
+        for n in picks:
+            score = float(omission.get(n, 20))
+            if n in recent_specials[:3]:
+                score *= penalty_coeff
+            scored.append((n, score))
+        picks = [n for n, _ in sorted(scored, key=lambda x: (-x[1], x[0]))]
+
     return picks[:top_n]
 def _get_longest_omitted_numbers(conn, limit=6):
     all_draws = conn.execute("SELECT numbers_json FROM draws ORDER BY draw_date DESC").fetchall()
@@ -3152,14 +3172,14 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
         if n in mains:
             continue
         score = vote_scores.get(n, 0) * 4.0
-        score += _special_distance_bias(n) * 0.85
+        score += _special_distance_bias(n) * 0.8949
         if recent_12_specials:
             recent_special_tail = recent_12_specials[0] % 10
             recent_special_zone = (recent_12_specials[0] - 1) // 10
             if n % 10 == recent_special_tail: score += 0.45
             if (n - 1) // 10 == recent_special_zone: score += 0.25
         if n in recent_3_specials:
-            score *= 0.72
+            score *= 0.8949
         combined.append((n, score))
 
     if not combined:
