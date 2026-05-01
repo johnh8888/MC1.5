@@ -165,7 +165,8 @@ def objective(trial, issues):
         'wsize': trial.suggest_int('wsize', 4, 15),
         'rec_w': trial.suggest_float('rec_w', 0.3, 2.5),
         'safe_th': trial.suggest_float('safe_th', 0.8, 2.0),
-        'four_boost': trial.suggest_float('four_boost', 0.5, 5.0),
+        'four_boost': trial.suggest_float('four_boost', 0.5, 5.0),    
+        'lstm_weight': trial.suggest_float('lstm_weight', 0.0, 0.8),
     }
     score, _, _, _, _, _, _ = evaluate(issues, p)
     return score
