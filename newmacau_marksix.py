@@ -16,6 +16,16 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
+_BEST_PARAMS_PATH = Path(__file__).resolve().parent / "best_params_zodiac.json"
+
+
+def load_best_zodiac_params():
+    if _BEST_PARAMS_PATH.exists():
+        with open(_BEST_PARAMS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
 BEST_PARAMS_ZODIAC_PATH = Path(__file__).resolve().parent / "best_params_zodiac.json"
 BEST_PARAMS_PATH = Path(__file__).resolve().parent / "best_params.json"
 
@@ -2330,21 +2340,24 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str
 def _get_four_zodiac_from_history_rows(rows, conn=None):
     if len(rows) < 3:
         return ["马", "蛇", "龙", "兔"]
+    params = load_best_zodiac_params()
+    four_boost = params.get("four_boost", 1.4221)
 
-    params = load_best_params()
-    four_boost = float(params.get("four_boost", 1.4221091374805384)) if params else 1.4221091374805384
-
+    # 计算遗漏（原有逻辑）
+    omission = {z: 0 for z in ZODIAC_MAP}
     specials = [int(row["special_number"]) for row in rows]
     zodiac_series = [get_zodiac_by_number(sp) for sp in specials]
-    omission = {z: len(specials) + 1 for z in ZODIAC_MAP}
     for idx, z in enumerate(zodiac_series):
-        omission[z] = min(omission[z], idx + 1)
+        if omission[z] == 0:
+            omission[z] = idx + 1
 
-    weighted_omission = {z: omission[z] * (four_boost if z in zodiac_series[:3] else 1.0) for z in omission}
-    sorted_cold = sorted(weighted_omission.items(), key=lambda x: (-x[1], x[0]))
+    # 遗漏分母缩小（体现 four_boost）
+    for z in omission:
+        omission[z] = omission[z] * four_boost
+
+    sorted_cold = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
     picks = [z for z, _ in sorted_cold[:3]]
-
-    latest_z = zodiac_series[-1] if zodiac_series else None
+    latest_z = get_zodiac_by_number(specials[0]) if specials else None
     if latest_z and latest_z not in picks:
         picks.append(latest_z)
     else:
@@ -2352,7 +2365,6 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
             if z not in picks:
                 picks.append(z)
                 break
-
     return picks[:4]
 
 
