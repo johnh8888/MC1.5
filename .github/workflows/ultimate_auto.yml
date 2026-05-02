@@ -3,7 +3,7 @@ name: 澳门彩全自动进化
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'   # 每4小时
+    - cron: '0 */4 * * *'
 
 jobs:
   evolve:
@@ -27,7 +27,7 @@ jobs:
         with:
           path: |
             newmacau_marksix.db
-            optuna_macau_r2_90.db
+            optuna_macau_stable.db
             lstm_zodiac.h5
             lstm_seq_len.txt
             hmm_zodiac.pkl
@@ -64,7 +64,7 @@ jobs:
             git push || true
           fi
 
-      - name: 长时优化（专攻二肖90%）
+      - name: 长时优化（稳定版，目标 一生肖90% 二肖80% 四肖100%）
         shell: bash
         run: |
           set +e
@@ -74,7 +74,7 @@ jobs:
             STATUS=$?
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add best_params_zodiac.json optuna_macau_r2_90.db 2>/dev/null
+            git add best_params_zodiac.json optuna_macau_stable.db 2>/dev/null
             git commit -m "自动优化第${i}轮 [skip ci]" 2>/dev/null
             git push 2>/dev/null
             if [ $STATUS -eq 0 ]; then
@@ -96,6 +96,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add best_params_zodiac.json optuna_macau_r2_90.db report.txt newmacau_marksix.db lstm_zodiac.h5 lstm_seq_len.txt hmm_zodiac.pkl 2>/dev/null
+          git add best_params_zodiac.json optuna_macau_stable.db report.txt newmacau_marksix.db lstm_zodiac.h5 lstm_seq_len.txt hmm_zodiac.pkl 2>/dev/null
           git commit -m "澳门彩进化结果 [skip ci]" 2>/dev/null
           git push 2>/dev/null
