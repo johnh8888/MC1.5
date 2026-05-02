@@ -27,7 +27,7 @@ def load_issues(conn, recent=120):
     ).fetchall()
     return [(r["issue_no"], json.loads(r["numbers_json"]), int(r["special_number"])) for r in rows[-recent:]]
 
-# ---- 生肖预测函数（同v1，无变化） ----
+# ---- 生肖预测函数（与主脚本一致） ----
 def pred_single(hist, wsize, rec_w, safe_th):
     scores = {z: 0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist) >= wsize else hist
@@ -76,21 +76,17 @@ def pred_four(hist, four_boost):
             if z not in picks: picks.append(z); break
     return picks[:4]
 
-# ---- 新增：特别号精选预测函数 ----
+# ---- 特别号精选预测函数 ----
 def pred_special_3(hist, params):
-    """
-    基于历史 hist 和参数，返回精选的3个特别号。
-    hist 结构同 issues: [(issue_no, main_nums, special_num), ...]
-    """
+    """基于历史 hist 和参数，返回精选的3个特别号"""
     if len(hist) < 5:
         return [1, 2, 3]
     recent_specials = [row[2] for row in hist]
     latest_special = recent_specials[-1] if recent_specials else None
 
-    # 生肖池：取最近四肖推荐的后4个，结合高频生肖扩展
+    # 生肖池：取最近四肖 + 高频扩展
     four_zodiacs = pred_four(hist, params.get('four_boost', 1.0))
     zodiac_counter = Counter([get_zodiac(sp) for sp in recent_specials[-8:]])
-    # 扩展池到6-8个生肖
     extra = [z for z, _ in zodiac_counter.most_common(3) if z not in four_zodiacs][:2]
     pool_zodiacs = four_zodiacs + extra
     seen = set()
@@ -106,10 +102,7 @@ def pred_special_3(hist, params):
             if len(final_pool) >= 8:
                 break
 
-    candidates = []
-    for z in final_pool:
-        candidates.extend(ZODIAC_MAP[z])
-    candidates = list(set(candidates))
+    candidates = list(set(n for z in final_pool for n in ZODIAC_MAP[z]))
 
     # 遗漏计算
     omission = {}
@@ -142,14 +135,12 @@ def pred_special_3(hist, params):
                               key=lambda n: omission.get(n, 30), reverse=True)
                 while len(picks) < 3 and rest:
                     picks.append(rest.pop(0))
-    # 补充不足
     while len(picks) < 3:
         for n in candidates:
             if n not in picks:
                 picks.append(n)
                 if len(picks) >= 3:
                     break
-    # 权重微调（LGB逻辑简化：邻号加分已在上面体现，这里仅做最后的排序保障）
     return picks[:3]
 
 # ---- 评估函数（增加特别号） ----
@@ -195,7 +186,7 @@ def evaluate(issues, params):
     rsp = special_hits / n
     max_strk = max(max_single, max_two, max_four, max_special)
 
-    # 软性连空惩罚 (统一)
+    # 软性连空惩罚
     streak_factor = 1.0
     if max_strk >= 4: streak_factor = 0.2
     elif max_strk == 3: streak_factor = 0.5
