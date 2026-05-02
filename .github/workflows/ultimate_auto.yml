@@ -1,4 +1,4 @@
-name: 澳门彩全自动进化 (120期+最近10期优化)
+name: 澳门彩全自动进化 (120期+全策略搜索)
 
 on:
   schedule:
@@ -8,7 +8,7 @@ on:
 jobs:
   auto-evolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 200     # 预留充足时间给5000次试验+回测
     permissions:
       contents: write
 
@@ -27,9 +27,9 @@ jobs:
           pip install optuna numpy hmmlearn xgboost lightgbm tensorflow
           pip install -r requirements.txt || true
 
-      - name: 重置并获取最新120期数据 + 自动优化最近10期
+      - name: 全自动重置 + 获取最新120期 + 策略优化5000次
         run: |
-          python newmacau_marksix.py reset-and-auto --trials 1000
+          python newmacau_marksix.py reset-and-auto --trials 5000
 
       - name: 提交结果（数据库、最佳参数、报告）
         if: always()
