@@ -68,6 +68,15 @@ try:
 except ImportError:
     get_hmm_state_proba = None
 
+
+def safe_get_hmm_state_proba(conn):
+    if not get_hmm_state_proba:
+        return None
+    try:
+        return get_hmm_state_proba(conn)
+    except Exception:
+        return None
+
 try:
     from risk_manager import RiskManager
 except Exception:
@@ -2367,7 +2376,7 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) ->
                 zodiac_scores[z] = (1 - two_lstm_w) * zodiac_scores[z] + two_lstm_w * lstm_probs.get(z, 0.0)
 
     if conn and get_hmm_state_proba and hmm_weight > 0.01:
-        hmm_probs = get_hmm_state_proba(conn)
+        hmm_probs = safe_get_hmm_state_proba(conn)
         if hmm_probs:
             for z in zodiac_scores:
                 zodiac_scores[z] = (1 - two_hmm_w) * zodiac_scores[z] + two_hmm_w * hmm_probs.get(z, 0.0)
@@ -2409,7 +2418,7 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
                 zodiac_scores[z] = (1 - three_lstm_w) * zodiac_scores[z] + three_lstm_w * lstm_probs.get(z, 0.0)
 
     if conn and get_hmm_state_proba and hmm_weight > 0.01:
-        hmm_probs = get_hmm_state_proba(conn)
+        hmm_probs = safe_get_hmm_state_proba(conn)
         if hmm_probs:
             for z in zodiac_scores:
                 zodiac_scores[z] = (1 - three_hmm_w) * zodiac_scores[z] + three_hmm_w * hmm_probs.get(z, 0.0)
@@ -2453,7 +2462,7 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
 
     # HMM 调整遗漏值
     if conn and get_hmm_state_proba and hmm_weight > 0.01:
-        hmm_probs = get_hmm_state_proba(conn)
+        hmm_probs = safe_get_hmm_state_proba(conn)
         if hmm_probs:
             for z in omission:
                 omission[z] *= (1 - hmm_weight * hmm_probs.get(z, 0.0))
