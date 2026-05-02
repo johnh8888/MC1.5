@@ -3471,6 +3471,7 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
+        # 清空预测相关表
         conn.execute("DELETE FROM prediction_picks")
         conn.execute("DELETE FROM prediction_pools")
         conn.execute("DELETE FROM prediction_runs")
@@ -3478,21 +3479,43 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
         conn.execute("DELETE FROM special_picks_log")
         conn.execute("DELETE FROM model_state WHERE key = ?", (MINED_CONFIG_KEY,))
         conn.commit()
+
+        # 删除 Optuna 历史库（全新搜索）
         optuna_path = SCRIPT_DIR / "optuna_macau_stable.db"
         if optuna_path.exists():
             os.remove(optuna_path)
             print(f"[重置] 已删除 {optuna_path}")
+
+        # 获取最新 120 期数据
         records = fetch_macau_recent_records(limit=120, timeout=args.api_timeout, retries=args.api_retries)
         total, inserted, updated = sync_from_records(conn, records, source="macau_api_recent_120")
         mined_cfg = ensure_mined_pattern_config(conn, force=True)
+
+        # 自动循环优化
+        max_retries = 5
+        trials = getattr(args, "trials", 1000)
         optimize_script = SCRIPT_DIR / "hyper_optimize_ultimate_target.py"
-        ret = subprocess.run(
-            [sys.executable, str(optimize_script), "--db", args.db, "--recent", "120", "--trials", str(getattr(args, "trials", 500))],
-            capture_output=False,
-        )
+
+        for attempt in range(1, max_retries + 1):
+            print(f"\n====== 第 {attempt} 次优化 (trials={trials}) ======")
+            ret = subprocess.run(
+                [sys.executable, str(optimize_script),
+                 "--db", args.db,
+                 "--recent", "120",
+                 "--trials", str(trials)],
+                capture_output=False,
+            )
+            if ret.returncode == 0:
+                print(f"🎉 第 {attempt} 次优化已达标！")
+                break
+            else:
+                print(f"第 {attempt} 次优化未达标（退出码 {ret.returncode}），继续下一轮...")
+                trials = int(trials * 1.3)
+
+        # 重建回测并生成最终预测
         run_historical_backtest(conn, rebuild=True, max_issues=120)
         generate_predictions(conn)
-        print(f"Reset+auto done. total={total}, inserted={inserted}, updated={updated}, optimizer_exit={ret.returncode}")
+        print(f"Reset+auto done. total={total}, inserted={inserted}, updated={updated}")
         print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
     finally:
         conn.close()
@@ -3795,7 +3818,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_backfill_special.set_defaults(func=cmd_backfill_special)
 
     p_reset = sub.add_parser("reset-and-auto", help="全自动重置→获取120期→优化近10期→预测")
-    p_reset.add_argument("--trials", type=int, default=500, help="Optuna trials count")
+    p_reset.add_argument("--trials", type=int, default=1000, help="Optuna trials count")
     p_reset.set_defaults(func=cmd_reset_and_auto)
 
     p_check = sub.add_parser("check-data", help="校验数据库开奖记录是否完整且合法")
