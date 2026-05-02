@@ -2325,8 +2325,10 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) ->
     wsize = int(params.get("wsize", 6))
     rec_w = float(params.get("rec_w", 0.7339))
     safe_th = float(params.get("safe_th", 1.4589))
+    lstm_seq_len = int(params.get("lstm_seq_len", 30))
     two_lstm_w = float(params.get("two_lstm_weight", 0.3))
     two_hmm_w = float(params.get("two_hmm_weight", 0.2))
+    hmm_weight = float(params.get("hmm_weight", 0.2))
 
     recent = rows[-wsize:] if len(rows) >= wsize else rows
     zodiac_scores = _build_zodiac_scores_from_rows(recent, decay=0.10)
@@ -2359,12 +2361,12 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) ->
         zodiac_scores[z] -= 0.02 * rec_w
 
     if conn and predict_lstm_proba and two_lstm_w > 0.01:
-        lstm_probs = predict_lstm_proba(conn)
+        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
         if lstm_probs:
             for z in zodiac_scores:
                 zodiac_scores[z] = (1 - two_lstm_w) * zodiac_scores[z] + two_lstm_w * lstm_probs.get(z, 0.0)
 
-    if conn and get_hmm_state_proba and two_hmm_w > 0.01:
+    if conn and get_hmm_state_proba and hmm_weight > 0.01:
         hmm_probs = get_hmm_state_proba(conn)
         if hmm_probs:
             for z in zodiac_scores:
@@ -2385,8 +2387,10 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
         return ["马", "蛇", "龙"]
 
     params = load_best_zodiac_params()
+    lstm_seq_len = int(params.get("lstm_seq_len", 30))
     three_lstm_w = float(params.get("three_lstm_weight", 0.3))
     three_hmm_w = float(params.get("three_hmm_weight", 0.2))
+    hmm_weight = float(params.get("hmm_weight", 0.2))
 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
@@ -2399,12 +2403,12 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
         zodiac_scores[z] += cnt * 0.5
 
     if conn and predict_lstm_proba and three_lstm_w > 0.01:
-        lstm_probs = predict_lstm_proba(conn)
+        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
         if lstm_probs:
             for z in zodiac_scores:
                 zodiac_scores[z] = (1 - three_lstm_w) * zodiac_scores[z] + three_lstm_w * lstm_probs.get(z, 0.0)
 
-    if conn and get_hmm_state_proba and three_hmm_w > 0.01:
+    if conn and get_hmm_state_proba and hmm_weight > 0.01:
         hmm_probs = get_hmm_state_proba(conn)
         if hmm_probs:
             for z in zodiac_scores:
@@ -2468,12 +2472,13 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None)
     if not rows:
         return "马"
 
-    # 从优化结果加载参数，若无文件则使用稳健默认值
     params = load_best_zodiac_params()
     wsize = int(params.get("wsize", 6))
     rec_w = float(params.get("rec_w", 0.7339))
     safe_th = float(params.get("safe_th", 1.4589))
-    lstm_weight = params.get("lstm_weight", 0.3) if params else 0.3
+    lstm_weight = float(params.get("lstm_weight", 0.3))
+    lstm_seq_len = int(params.get("lstm_seq_len", 30))
+    hmm_weight = float(params.get("hmm_weight", 0.2))
 
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
     recent = rows[-wsize:] if len(rows) >= wsize else rows
@@ -2501,11 +2506,17 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None)
         elif cycle < 0.5:
             scores[z] -= 1.0
 
-    if conn is not None and predict_lstm_proba:
+    if conn and predict_lstm_proba and lstm_weight > 0.01:
         lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
         if lstm_probs:
             for z in scores:
-                scores[z] = (1 - lstm_weight) * scores[z] + lstm_weight * lstm_probs.get(z, 0)
+                scores[z] = (1 - lstm_weight) * scores[z] + lstm_weight * lstm_probs.get(z, 0.0)
+
+    if conn and get_hmm_state_proba and hmm_weight > 0.01:
+        hmm_probs = get_hmm_state_proba(conn)
+        if hmm_probs:
+            for z in scores:
+                scores[z] = (1 - hmm_weight) * scores[z] + hmm_weight * hmm_probs.get(z, 0.0)
 
     max_score = max(scores.values())
     if max_score < safe_th:
