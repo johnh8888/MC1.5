@@ -8,7 +8,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import argparse, csv, io, json, math, os, re, socket, sqlite3, time, pickle
+import argparse, csv, io, json, math, os, re, socket, sqlite3, time, pickle, subprocess
 from urllib.error import URLError
 from collections import Counter
 from dataclasses import dataclass
@@ -194,7 +194,6 @@ class SpecialLGBModel:
 # 全局常量
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
-CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 API_TIMEOUT_DEFAULT = 20
 API_RETRIES_DEFAULT = 4
@@ -211,7 +210,6 @@ WEIGHT_WINDOW_DEFAULT = 30
 HEALTH_WINDOW_DEFAULT = 18
 BACKTEST_ISSUES_DEFAULT = 120
 ZERO_HIT_TRIGGER_THRESHOLD = float(os.environ.get("ZERO_HIT_TRIGGER_THRESHOLD", "0.5"))
-PREDICT_LAG = int(os.environ.get("PREDICT_LAG", "1"))
 
 ENSEMBLE_DIVERSITY_BONUS = 0.18
 BIAS_THRESHOLD = 0.65
@@ -418,125 +416,6 @@ def _parse_numbers(value: str) -> List[int]:
     return out
 
 
-def parse_draw_csv(csv_path: str) -> List[DrawRecord]:
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
-
-    records: List[DrawRecord] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for raw in reader:
-            row = {k.strip(): (v or "").strip() for k, v in raw.items() if k}
-            issue_no = _pick(row, ["期号", "期數", "issueNo", "issue_no"])
-            draw_date = _parse_date(_pick(row, ["日期", "date", "drawDate", "draw_date"]))
-            special = _pick(row, ["特别号码", "特別號碼", "special", "specialNumber", "no7", "n7"])
-
-            numbers = _parse_numbers(_pick(row, ["中奖号码", "中獎號碼", "numbers", "result"]))
-            if len(numbers) != 6:
-                split_keys = ["中奖号码 1", "中獎號碼 1", "1"], ["2"], ["3"], ["4"], ["5"], ["6"]
-                split_nums: List[int] = []
-                ok = True
-                for key_group in split_keys:
-                    value = _pick(row, list(key_group))
-                    if not value:
-                        ok = False
-                        break
-                    try:
-                        n = int(value)
-                    except ValueError:
-                        ok = False
-                        break
-                    if not (1 <= n <= 49):
-                        ok = False
-                        break
-                    split_nums.append(n)
-                if ok:
-                    numbers = split_nums
-
-            try:
-                special_n = int(special)
-            except ValueError:
-                continue
-
-            if not issue_no or not draw_date:
-                continue
-            if len(numbers) != 6 or not (1 <= special_n <= 49):
-                continue
-
-            records.append(
-                DrawRecord(
-                    issue_no=issue_no,
-                    draw_date=draw_date,
-                    numbers=numbers,
-                    special_number=special_n,
-                )
-            )
-
-    records.sort(key=lambda r: (r.draw_date, r.issue_no))
-    dedup: Dict[str, DrawRecord] = {}
-    for r in records:
-        dedup[r.issue_no] = r
-    return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
-
-
-def parse_draw_csv_text(csv_text: str) -> List[DrawRecord]:
-    records: List[DrawRecord] = []
-    reader = csv.DictReader(io.StringIO(csv_text))
-    for raw in reader:
-        row = {k.strip(): (v or "").strip() for k, v in raw.items() if k}
-        issue_no = _pick(row, ["期号", "期數", "issueNo", "issue_no"])
-        draw_date = _parse_date(_pick(row, ["日期", "date", "drawDate", "draw_date"]))
-        special = _pick(row, ["特别号码", "特別號碼", "special", "specialNumber", "no7", "n7"])
-
-        numbers = _parse_numbers(_pick(row, ["中奖号码", "中獎號碼", "numbers", "result"]))
-        if len(numbers) != 6:
-            split_keys = ["中奖号码 1", "中獎號碼 1", "1"], ["2"], ["3"], ["4"], ["5"], ["6"]
-            split_nums: List[int] = []
-            ok = True
-            for key_group in split_keys:
-                value = _pick(row, list(key_group))
-                if not value:
-                    ok = False
-                    break
-                try:
-                    n = int(value)
-                except ValueError:
-                    ok = False
-                    break
-                if not (1 <= n <= 49):
-                    ok = False
-                    break
-                split_nums.append(n)
-            if ok:
-                numbers = split_nums
-
-        try:
-            special_n = int(special)
-        except ValueError:
-            continue
-
-        if not issue_no or not draw_date:
-            continue
-        if len(numbers) != 6 or not (1 <= special_n <= 49):
-            continue
-
-        records.append(
-            DrawRecord(
-                issue_no=issue_no,
-                draw_date=draw_date,
-                numbers=numbers,
-                special_number=special_n,
-            )
-        )
-
-    records.sort(key=lambda r: (r.draw_date, r.issue_no))
-    dedup: Dict[str, DrawRecord] = {}
-    for r in records:
-        dedup[r.issue_no] = r
-    return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
-
-
 def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     records: List[DrawRecord] = []
     lottery_list = payload.get("lottery_data", [])
@@ -692,11 +571,6 @@ def upsert_draw(conn: sqlite3.Connection, record: DrawRecord, source: str) -> st
     return "inserted"
 
 
-def sync_from_csv(conn: sqlite3.Connection, csv_path: str, source: str = "local_csv") -> Tuple[int, int, int]:
-    records = parse_draw_csv(csv_path)
-    return sync_from_records(conn, records, source)
-
-
 def sync_from_records(conn: sqlite3.Connection, records: List[DrawRecord], source: str) -> Tuple[int, int, int]:
     inserted, updated = 0, 0
     for r in records:
@@ -789,9 +663,8 @@ def missing_issues_since_latest(conn: sqlite3.Connection, incoming: List[DrawRec
 def load_recent_draws(conn: sqlite3.Connection, limit: int = 3) -> List[List[int]]:
     rows = conn.execute(
         "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (limit + PREDICT_LAG,),
+        (limit,),
     ).fetchall()
-    rows = rows[PREDICT_LAG:]
     return [json.loads(r["numbers_json"]) for r in rows]
 
 
@@ -1224,10 +1097,9 @@ def _generate_special_number_v4(
     issue_no: str
 ) -> Tuple[int, float, List[int]]:
     recent_specials = [int(r["special_number"]) for r in conn.execute(
-        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT ?",
-        (80 + PREDICT_LAG,),
+        "SELECT special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (issue_no, issue_no, issue_no, 80),
     ).fetchall()]
-    recent_specials = recent_specials[PREDICT_LAG:]
 
     latest_sp_row = conn.execute(
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 1"
@@ -2005,44 +1877,6 @@ def get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT):
         print(msg, flush=True)
     return {k: round(v / total, 4) for k, v in weights.items()}
 
-def get_trio_weights(conn, window=WEIGHT_WINDOW_DEFAULT):
-    rows = conn.execute("""
-        SELECT strategy, AVG(main_hit_count) as avg_hit
-        FROM strategy_performance
-        WHERE strategy IN ('momentum_v1', 'hot_v1', 'cold_rebound_v1')
-        AND issue_no IN (SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT ?)
-        GROUP BY strategy
-    """, (window,)).fetchall()
-    stats = {r["strategy"]: r["avg_hit"] for r in rows}
-    w_mom = max(float(stats.get('momentum_v1', 0.0) or 0.0), 0.6)
-    w_hot = max(float(stats.get('hot_v1', 0.0) or 0.0), 0.6)
-    w_cold = max(float(stats.get('cold_rebound_v1', 0.0) or 0.0), 0.6)
-    total = w_mom + w_hot + w_cold
-    return w_mom/total, w_hot/total, w_cold/total
-
-def get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT):
-    health = {}
-    for strategy in STRATEGY_IDS:
-        rows = conn.execute("""
-            SELECT hit_count FROM prediction_runs
-            WHERE strategy = ? AND status = 'REVIEWED'
-            ORDER BY reviewed_at DESC LIMIT ?
-        """, (strategy, window)).fetchall()
-        if not rows:
-            health[strategy] = {"samples":0.0,"recent_avg_hit":0.0,"hit1_rate":0.0,"hit2_rate":0.0,"cold_streak":0.0}
-            continue
-        hit_counts = [int(r["hit_count"] or 0) for r in rows]
-        samples = len(hit_counts)
-        hit1_rate = sum(1 for x in hit_counts if x >= 1) / samples
-        hit2_rate = sum(1 for x in hit_counts if x >= 2) / samples
-        recent_avg_hit = sum(hit_counts) / samples
-        cold_streak = 0
-        for x in hit_counts:
-            if x == 0: cold_streak += 1
-            else: break
-        health[strategy] = {"samples":float(samples),"recent_avg_hit":float(recent_avg_hit),"hit1_rate":float(hit1_rate),"hit2_rate":float(hit2_rate),"cold_streak":float(cold_streak)}
-    return health
-
 def get_trio_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Tuple[float, float, float]:
     rows = conn.execute("""
            SELECT strategy, AVG(main_hit_count) as avg_hit
@@ -2205,17 +2039,31 @@ def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0
 
 
 def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 16) -> List[str]:
+    target_row = conn.execute(
+        "SELECT draw_date FROM draws WHERE issue_no = ?",
+        (issue_no,),
+    ).fetchone()
+    if not target_row:
+        return ["马", "蛇"]
     rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT ?",
-        (window + PREDICT_LAG,),
+        "SELECT numbers_json, special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (issue_no, issue_no, issue_no, window),
     ).fetchall()
-    rows = rows[PREDICT_LAG:]
     if not rows:
         return ["马", "蛇"]
     if issue_no:
         prev_issue = _get_previous_issue(conn, issue_no)
         if prev_issue and not _check_two_zodiac_hit(conn, prev_issue):
-            return ["鸡", "狗"]
+            prev_draw = conn.execute(
+                "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
+                (prev_issue,)
+            ).fetchone()
+            if prev_draw:
+                prev_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
+                prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
+                hot_two = [z for z, _ in Counter(prev_zodiacs).most_common(2)]
+                if len(hot_two) >= 2:
+                    return hot_two[:2]
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
     omission_map = _zodiac_omission_map(rows)
     force_include = [z for z, omit in omission_map.items() if omit >= 6]
@@ -2273,12 +2121,12 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
 
 def get_single_zodiac_pick(conn, issue_no, window=6):
     params = load_best_zodiac_params()
-    wsize = int(params.get("wsize", window))
-    rec_w = float(params.get("rec_w", 0.7339))
-    safe_th = float(params.get("safe_th", 1.4589))
+    wsize = int(params.get("single_window", params.get("wsize", window)))
+    rec_w = float(params.get("single_recency_w", params.get("rec_w", 0.7339)))
+    safe_th = float(params.get("single_safe_threshold", params.get("safe_th", 1.4589)))
 
     rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 5"
+        "SELECT numbers_json, special_number, draw_date, issue_no FROM draws ORDER BY draw_date DESC LIMIT 5"
     ).fetchall()
     if not rows:
         return "马"
@@ -2326,64 +2174,29 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) ->
         return ["马", "蛇"]
 
     params = load_best_zodiac_params()
-    wsize = int(params.get("wsize", 6))
-    rec_w = float(params.get("rec_w", 0.7339))
-    safe_th = float(params.get("safe_th", 1.4589))
-    lstm_seq_len = int(params.get("lstm_seq_len", 30))
-    two_lstm_w = float(params.get("two_lstm_weight", 0.3))
-    two_hmm_w = float(params.get("two_hmm_weight", 0.2))
-    hmm_weight = float(params.get("hmm_weight", 0.2))
+    wsize = int(params.get("single_window", params.get("wsize", 6)))
+    rec_w = float(params.get("single_recency_w", params.get("rec_w", 0.7339)))
 
-    recent = rows[-wsize:] if len(rows) >= wsize else rows
-    zodiac_scores = _build_zodiac_scores_from_rows(recent, decay=0.10)
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in recent[::-1][:4]]
-    zodiac_counter = Counter(recent_special_zodiacs)
-    if zodiac_counter:
-        special_hot = max(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
-        zodiac_scores[special_hot] += 8.5 * rec_w
-        for z, cnt in zodiac_counter.items():
-            zodiac_scores[z] += cnt * 0.9 * rec_w
-    omission_zodiac: Dict[str, int] = _zodiac_omission_map(recent)
-    for z, omit in omission_zodiac.items():
-        if omit >= 6:
-            zodiac_scores[z] += 1.8 * rec_w
-        elif omit >= 3:
-            zodiac_scores[z] += 0.4 * rec_w
-    main_zodiacs = []
-    for r in recent[:4]:
-        main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
-    main_counter = Counter(main_zodiacs)
-    if main_counter:
-        main_hot = max(main_counter.keys(), key=lambda z: main_counter[z])
-        zodiac_scores[main_hot] += 0.10 * rec_w
-    recent_all = recent_special_zodiacs + main_zodiacs
-    for z, cnt in Counter(recent_all).items():
-        if cnt >= 2:
-            zodiac_scores[z] += 0.12 * rec_w
-    recent_noise = {get_zodiac_by_number(int(r["special_number"])) for r in recent[:2]}
-    for z in recent_noise:
-        zodiac_scores[z] -= 0.02 * rec_w
+    recent = rows[: max(4, min(wsize + 2, len(rows)))]
+    scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
+    for idx, r in enumerate(recent):
+        w = rec_w / (1.0 + idx * 0.10)
+        for n in json.loads(r["numbers_json"]):
+            scores[get_zodiac_by_number(int(n))] += w * 0.55
+        scores[get_zodiac_by_number(int(r["special_number"]))] += w * 1.9
 
-    if conn and predict_lstm_proba and two_lstm_w > 0.01:
-        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
-        if lstm_probs:
-            for z in zodiac_scores:
-                zodiac_scores[z] = (1 - two_lstm_w) * zodiac_scores[z] + two_lstm_w * lstm_probs.get(z, 0.0)
+    omission = _zodiac_omission_map(rows)
+    for z, omit in omission.items():
+        if omit >= 4:
+            scores[z] += min(1.5, omit / 6.0)
 
-    if conn and hmm_weight > 0.01:
-        hmm_probs = safe_get_hmm_state_proba(conn)
-        if hmm_probs:
-            for z in zodiac_scores:
-                zodiac_scores[z] = (1 - two_hmm_w) * zodiac_scores[z] + two_hmm_w * hmm_probs.get(z, 0.0)
-
-    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    if ranked and ranked[0][1] < safe_th:
-        return [max(omission_zodiac.items(), key=lambda x: x[1])[0], ranked[0][0] if ranked else "马"]
-    if len(ranked) >= 2:
-        hot = ranked[0][0]
-        cold = max((z for z in ZODIAC_MAP if z != hot), key=lambda z: omission_zodiac.get(z, 0))
-        return [hot, cold]
-    return ["马", "蛇"]
+    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+    picks = [ranked[0][0]]
+    for z, _ in ranked[1:]:
+        if z not in picks:
+            picks.append(z)
+            break
+    return picks[:2]
 
 
 def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) -> List[str]:
@@ -2396,15 +2209,14 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
     three_hmm_w = float(params.get("three_hmm_weight", 0.2))
     hmm_weight = float(params.get("hmm_weight", 0.2))
 
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.06)
+    recent = rows[:8]
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in recent]
+    recent_main_zodiacs = [get_zodiac_by_number(int(n)) for r in recent for n in json.loads(r["numbers_json"])]
     for z, cnt in Counter(recent_special_zodiacs).items():
-        zodiac_scores[z] += cnt * 1.357
-    recent_main_zodiacs = []
-    for r in rows[:5]:
-        recent_main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
+        zodiac_scores[z] += cnt * 2.55
     for z, cnt in Counter(recent_main_zodiacs).items():
-        zodiac_scores[z] += cnt * 0.5
+        zodiac_scores[z] += cnt * 0.95
 
     if conn and predict_lstm_proba and three_lstm_w > 0.01:
         lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
@@ -2419,9 +2231,13 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
                 zodiac_scores[z] = (1 - three_hmm_w) * zodiac_scores[z] + three_hmm_w * hmm_probs.get(z, 0.0)
 
     omission_zodiac = _zodiac_omission_map(rows)
+    for z, omit in omission_zodiac.items():
+        if omit >= 5:
+            zodiac_scores[z] += min(2.1, omit / 4.0)
+
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
-    for z, omit in sorted(omission_zodiac.items(), key=lambda x: -x[1]):
+    for z, _ in ranked[2:]:
         if z not in picks:
             picks.append(z)
             break
@@ -2448,30 +2264,50 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
     for z in omission:
         omission[z] *= four_boost
 
-    # LSTM 调整遗漏值
-    if conn and predict_lstm_proba and lstm_weight > 0.01:
-        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
-        if lstm_probs:
-            for z in omission:
-                omission[z] *= (1 - lstm_weight * lstm_probs.get(z, 0.0))
-
-    # HMM 调整遗漏值
-    if conn and hmm_weight > 0.01:
-        hmm_probs = safe_get_hmm_state_proba(conn)
-        if hmm_probs:
-            for z in omission:
-                omission[z] *= (1 - hmm_weight * hmm_probs.get(z, 0.0))
-
+    # 快一期版本：二冷 + 上期特别号 + 近期高频补位
     sorted_cold = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
-    picks = [z for z, _ in sorted_cold[:3]]
+    picks = [z for z, _ in sorted_cold[:2]]
+
     latest_z = get_zodiac_by_number(specials[0]) if specials else None
     if latest_z and latest_z not in picks:
         picks.append(latest_z)
-    else:
-        for z, _ in sorted_cold[3:]:
+
+    # 恢复“快一期”跟随：优先补最近两期特别号相关生肖
+    for z in zodiac_series[1:3]:
+        if z not in picks:
+            picks.append(z)
+            break
+
+    recent_counts = Counter(zodiac_series[:6])
+    for z, _ in recent_counts.most_common():
+        if z not in picks:
+            picks.append(z)
+            break
+
+    # 轻量 LSTM/HMM 修正仅在可用时生效
+    if conn and predict_lstm_proba and lstm_weight > 0.01:
+        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
+        if lstm_probs:
+            picks = sorted(dict.fromkeys(picks), key=lambda z: -lstm_probs.get(z, 0.0) * lstm_weight)
+    if conn and hmm_weight > 0.01:
+        hmm_probs = safe_get_hmm_state_proba(conn)
+        if hmm_probs:
+            picks = sorted(dict.fromkeys(picks), key=lambda z: -hmm_probs.get(z, 0.0) * hmm_weight)
+
+    # 如果出现单一生肖过度集中，做一次去偏
+    if len(set(picks[:3])) < 3:
+        for z in sorted_cold:
+            if z not in picks:
+                picks.append(z)
+            if len(picks) >= 4:
+                break
+
+    while len(picks) < 4:
+        for z in ZODIAC_MAP:
             if z not in picks:
                 picks.append(z)
                 break
+
     return picks[:4]
 
 
@@ -2484,57 +2320,33 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None)
         return "马"
 
     params = load_best_zodiac_params()
-    wsize = int(params.get("wsize", 6))
-    rec_w = float(params.get("rec_w", 0.7339))
-    safe_th = float(params.get("safe_th", 1.4589))
-    lstm_weight = float(params.get("lstm_weight", 0.3))
-    lstm_seq_len = int(params.get("lstm_seq_len", 30))
-    hmm_weight = float(params.get("hmm_weight", 0.2))
+    wsize = int(params.get("single_window", params.get("wsize", 6)))
+    rec_w = float(params.get("single_recency_w", params.get("rec_w", 0.7339)))
+    safe_th = float(params.get("single_safe_threshold", params.get("safe_th", 1.4589)))
 
     scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP}
-    recent = rows[-wsize:] if len(rows) >= wsize else rows
-    for idx, r in enumerate(recent[::-1]):
-        w = rec_w / (1.0 + idx * 0.15)
-        for n in json.loads(r["numbers_json"]):
-            scores[get_zodiac_by_number(int(n))] += w
-        scores[get_zodiac_by_number(int(r["special_number"]))] += w * 2.0
+    recent = rows[: max(3, min(wsize, len(rows)))]
+    for idx, r in enumerate(recent):
+        w = rec_w / (1.0 + idx * 0.12)
+        nums = json.loads(r["numbers_json"])
+        for n in nums:
+            scores[get_zodiac_by_number(int(n))] += w * 0.75
+        scores[get_zodiac_by_number(int(r["special_number"]))] += w * 2.35
 
-    recent_zodiacs = []
-    for r in rows[-20:]:
-        for n in json.loads(r["numbers_json"]):
-            recent_zodiacs.append(get_zodiac_by_number(int(n)))
-        recent_zodiacs.append(get_zodiac_by_number(int(r["special_number"])))
-
-    momentum = get_zodiac_momentum(recent_zodiacs, 10)
-    for z in scores:
-        if z in momentum:
-            scores[z] += momentum[z] * 0.6
-
-    for z in scores:
-        cycle = get_zodiac_cycle_position(recent_zodiacs, z)
-        if cycle > 1.5:
-            scores[z] += 3.0
-        elif cycle < 0.5:
-            scores[z] -= 1.0
-
-    if conn and predict_lstm_proba and lstm_weight > 0.01:
-        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
-        if lstm_probs:
-            for z in scores:
-                scores[z] = (1 - lstm_weight) * scores[z] + lstm_weight * lstm_probs.get(z, 0.0)
-
-    if conn and hmm_weight > 0.01:
-        hmm_probs = safe_get_hmm_state_proba(conn)
-        if hmm_probs:
-            for z in scores:
-                scores[z] = (1 - hmm_weight) * scores[z] + hmm_weight * hmm_probs.get(z, 0.0)
+    # 强化“上期特别号生肖”与“长期遗漏生肖”的协同
+    latest_special_z = get_zodiac_by_number(int(rows[0]["special_number"]))
+    scores[latest_special_z] += 0.65
+    omission = _zodiac_omission_map(rows)
+    for z, omit in omission.items():
+        if omit >= 6:
+            scores[z] += min(1.8, omit / 5.0)
 
     max_score = max(scores.values())
     if max_score < safe_th:
-        omission = _zodiac_omission_map(rows)
-        return max(omission.items(), key=lambda x: x[1])[0]
+        return max(omission.items(), key=lambda x: (x[1], x[0]))[0]
 
-    return max(scores.items(), key=lambda x: x[1])[0]
+    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+    return ranked[0][0]
 
 
 def get_recent_single_zodiac_report(conn: sqlite3.Connection, lookback: int = 20) -> Dict[str, float]:
@@ -2592,45 +2404,6 @@ def get_recent_two_zodiac_report(conn: sqlite3.Connection, lookback: int = 20) -
             miss_streak = 0
     rate = hits / samples if samples else 0.0
     return {"samples": float(samples), "hit_rate": rate, "max_miss_streak": float(max_streak)}
-
-
-def get_recent_two_zodiac_report(
-    conn: sqlite3.Connection,
-    lookback: int = 20,
-    history_window: int = 16,
-) -> Dict[str, float]:
-    rows = _draws_ordered_asc(conn)
-    if len(rows) < history_window + 1:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    start = max(history_window, len(rows) - lookback)
-    hits = 0
-    samples = 0
-    miss_streak = 0
-    max_miss_streak = 0
-    for i in range(start, len(rows)):
-        history_rows = rows[max(0, i - history_window):i]
-        if len(history_rows) < history_window:
-            continue
-        picks = _get_two_zodiac_from_history_rows(history_rows, conn)
-        win_main = json.loads(rows[i]["numbers_json"])
-        win_special = int(rows[i]["special_number"])
-        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
-        winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if all(z in winning_zodiacs for z in picks) else 0
-        hits += hit
-        samples += 1
-        if hit == 0:
-            miss_streak += 1
-            max_miss_streak = max(max_miss_streak, miss_streak)
-        else:
-            miss_streak = 0
-    if samples == 0:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {
-        "samples": float(samples),
-        "hit_rate": float(hits / samples),
-        "max_miss_streak": float(max_miss_streak),
-    }
 
 
 def get_recent_three_zodiac_report(
@@ -2783,6 +2556,14 @@ def get_dynamic_weights(conn: sqlite3.Connection, window: int = 50) -> Dict[str,
 
 
 def get_precise_specials(conn, zodiac_pool, top_n=3):
+    """废弃兼容壳，保留调用但避免直接穿越。"""
+    row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
+    if not row:
+        return []
+    return get_precise_specials_for_issue(conn, str(row["issue_no"]), zodiac_pool, top_n=top_n)
+
+
+def get_precise_specials_for_issue(conn, issue_no, zodiac_pool, top_n=3):
     if not zodiac_pool:
         return []
 
@@ -2793,54 +2574,41 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
     penalty_coeff = float(params.get("penalty_coeff", 0.76))
     lgb_weight = float(params.get("lgb_weight", 0.6146))
     omit_boost = float(params.get("four_omit_boost", 2.578))
-    lstm_weight = float(params.get("lstm_weight", 0.3))
-    lstm_seq_len = int(params.get("lstm_seq_len", 30))
-    hmm_weight = float(params.get("hmm_weight", 0.2))
-    precise_lstm_weight = float(params.get("precise_lstm_weight", lstm_weight))
-    precise_hmm_weight = float(params.get("precise_hmm_weight", hmm_weight))
 
-    # 拉取最近特别号，应用 PREDICT_LAG 跳过最新一期
+    target = conn.execute("SELECT draw_date FROM draws WHERE issue_no = ?", (issue_no,)).fetchone()
+    if not target:
+        return []
+    target_date = target["draw_date"]
+
     recent_rows = conn.execute(
-        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT ?",
-        (12 + PREDICT_LAG,)
+        "SELECT issue_no, special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT 12",
+        (issue_no, issue_no, issue_no),
     ).fetchall()
-    recent_specials = [int(r['special_number']) for r in recent_rows[PREDICT_LAG:]]
+    recent_specials = [int(r["special_number"]) for r in recent_rows]
     if not recent_specials:
         return list(ZODIAC_MAP.get(zodiac_pool[0], []))[:top_n]
 
     latest_special = recent_specials[0]
     omission = {}
     for i, sp in enumerate(recent_specials):
-        if sp not in omission:
-            omission[sp] = i + 1
+        omission.setdefault(sp, i + 1)
 
     candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
     if not candidates:
         return []
 
-    cold_picks = sorted(
-        [n for n in candidates if omission.get(n, 20) >= cold_threshold],
-        key=lambda n: omission.get(n, 20), reverse=True
-    )[:2]
-    if len(cold_picks) < 2:
-        extra = sorted(
-            [n for n in candidates if n not in cold_picks and omission.get(n, 20) >= 10],
-            key=lambda n: omission.get(n, 20), reverse=True
-        )
-        while len(cold_picks) < 2 and extra:
-            cold_picks.append(extra.pop(0))
+    cold_picks = sorted([n for n in candidates if omission.get(n, 20) >= cold_threshold], key=lambda n: omission.get(n, 20), reverse=True)[:2]
+    while len(cold_picks) < 2:
+        for n in candidates:
+            if n not in cold_picks:
+                cold_picks.append(n)
+                break
     picks = cold_picks[:2]
 
     if len(picks) < top_n:
         neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in picks]
         if neighbors:
             picks.append(max(neighbors, key=lambda n: omission.get(n, 20) + neighbor_1_bonus))
-        else:
-            rest = [n for n in candidates if n not in picks]
-            rest.sort(key=lambda n: omission.get(n, 20), reverse=True)
-            while len(picks) < top_n and rest:
-                picks.append(rest.pop(0))
-
     if len(picks) < top_n:
         neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in picks]
         if neighbors2:
@@ -2898,13 +2666,6 @@ def _weighted_consensus_pools(conn, issue_no):
 
     if not number_scores: return [], [], [], [], None
 
-    ranked_numbers = [n for n, _ in sorted(number_scores.items(), key=lambda x: (-x[1], x[0]))]
-    omission_all = _get_longest_omitted_numbers(conn, limit=49)
-    omission_weight = {}
-    for idx, n in enumerate(omission_all):
-        omission_weight[n] = (49 - idx) / 49.0 * 0.20
-    for n in number_scores:
-        number_scores[n] = number_scores.get(n, 0) + omission_weight.get(n, 0)
     ranked_numbers = [n for n, _ in sorted(number_scores.items(), key=lambda x: (-x[1], x[0]))]
     pool20 = ranked_numbers[:20]
     pool14 = pool20[:14]
@@ -3012,6 +2773,7 @@ def print_final_recommendation(conn, xgb_pool20=None):
     print(f"二生肖推荐: {'、'.join(zodiac_two)}")
     print(f"三生肖推荐: {'、'.join(get_three_zodiac_picks(conn))}")
     print(f"特别生肖推荐: {'、'.join(special_zodiacs)}")
+    print(f"推荐期数日期: {issue_no}（{draw_date}）")
     one_rep = get_recent_single_zodiac_report(conn, lookback=10)
     two_rep = get_recent_two_zodiac_report(conn, lookback=10)
     three_rep = get_recent_three_zodiac_report(conn, lookback=10)
@@ -3029,7 +2791,7 @@ def print_final_recommendation(conn, xgb_pool20=None):
             if z not in enhanced_zodiacs:
                 enhanced_zodiacs.append(z)
                 if len(enhanced_zodiacs) >= 4: break
-    precise = get_precise_specials(conn, enhanced_zodiacs, top_n=3)
+    precise = get_precise_specials_for_issue(conn, issue_no, enhanced_zodiacs, top_n=3)
     if precise:
         ps_str = " ".join(f"{n:02d}" for n in precise)
         ps_detail = ", ".join(f"{n:02d}({get_zodiac_by_number(n)})" for n in precise)
@@ -3170,9 +2932,10 @@ def backfill_special_picks_log(conn, max_issues=100):
         zodiac_freq = Counter(recent_zodiacs)
         specials_hist = [int(r['special_number']) for r in history[:30]]
         omission_zodiac = {z: 0 for z in ZODIAC_MAP}
-        for idx, sp in enumerate(specials_hist):
+        for i, sp in enumerate(specials_hist):
             z = get_zodiac_by_number(sp)
-            if omission_zodiac[z] == 0: omission_zodiac[z] = idx + 1
+            if omission_zodiac[z] == 0:
+                omission_zodiac[z] = i + 1
         sorted_omit = sorted(omission_zodiac.items(), key=lambda x: -x[1])
         extra_freq = [z for z, _ in zodiac_freq.most_common(3) if z not in base_four][:2]
         extra_cold = [z for z, _ in sorted_omit if z not in base_four and z not in extra_freq][:2]
@@ -3195,54 +2958,6 @@ def backfill_special_picks_log(conn, max_issues=100):
         zodiac_pool = final_pool[:8]
 
         picks = get_precise_specials_from_history(history, zodiac_pool, top_n=3)
-        if picks:
-            # ========== 关键：计算本期是否命中 ==========
-            actual_special_row = conn.execute(
-                "SELECT special_number FROM draws WHERE issue_no = ?", (target_issue,)
-            ).fetchone()
-            actual_special = actual_special_row['special_number'] if actual_special_row else None
-            special_hit = 1 if actual_special is not None and actual_special in picks else 0
-
-            conn.execute(
-                "INSERT OR IGNORE INTO special_picks_log (issue_no, picks_json, special_hit, created_at) VALUES (?, ?, ?, ?)",
-                (target_issue, json.dumps(picks), special_hit, utc_now())
-            )
-            # 强制按“2冷1邻”重建特别号记录
-        omission = {}
-        for i, sp in enumerate(specials_hist):
-            omission[sp] = omission.get(sp, i + 1) if sp not in omission else min(omission[sp], i + 1)
-
-        candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
-        if not candidates:
-            continue
-
-        cold_picks = sorted(
-            [n for n in candidates if omission.get(n, 20) >= 12],
-            key=lambda n: omission.get(n, 20), reverse=True
-        )[:2]
-        if len(cold_picks) < 2:
-            extra_cold = sorted(
-                [n for n in candidates if n not in cold_picks and omission.get(n, 20) >= 8],
-                key=lambda n: omission.get(n, 20), reverse=True
-            )
-            while len(cold_picks) < 2 and extra_cold:
-                cold_picks.append(extra_cold.pop(0))
-
-        picks = cold_picks[:2]
-        if len(picks) < 3:
-            latest_special = int(history[0]['special_number'])
-            neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in picks]
-            if neighbors:
-                picks.append(max(neighbors, key=lambda n: omission.get(n, 20)))
-            else:
-                rest = sorted(
-                    [n for n in candidates if n not in picks],
-                    key=lambda n: omission.get(n, 20), reverse=True
-                )
-                while len(picks) < 3 and rest:
-                    picks.append(rest.pop(0))
-
-        picks = picks[:3]
         if picks:
             actual_special_row = conn.execute(
                 "SELECT special_number FROM draws WHERE issue_no = ?", (target_issue,)
@@ -3306,26 +3021,6 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 8"
     ).fetchall()]
 
-    def _special_distance_bias(n: int) -> float:
-        score = 0.0
-        recent_1_special = recent_12_specials[0] if recent_12_specials else None
-        if recent_1_special is not None:
-            diff1 = abs(n - recent_1_special)
-            if diff1 == 1: score += 6.5
-            elif diff1 == 2: score += 4.6
-            elif diff1 == 3: score += 2.2
-        for sp in recent_12_specials[1:]:
-            diff = abs(n - sp)
-            if diff == 1: score += 3.2
-            elif diff == 2: score += 2.4
-            elif diff == 3: score += 1.2
-        for sp in recent_8_specials[:5]:
-            if abs(n - sp) == 1: score += 1.4
-            elif abs(n - sp) == 2: score += 0.9
-            if (n - 1) // 10 == (sp - 1) // 10: score += 0.2
-            if n % 10 == sp % 10: score += 0.1
-        return score
-
     vote_scores = Counter(top_votes)
     candidates = sorted(set(top_votes) | set(recent_12_specials) | set(recent_8_specials))
     if zodiac_two:
@@ -3340,7 +3035,6 @@ def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: S
         if n in mains:
             continue
         score = vote_scores.get(n, 0) * 4.0
-        score += _special_distance_bias(n) * 0.8949
         if recent_12_specials:
             recent_special_tail = recent_12_specials[0] % 10
             recent_special_zone = (recent_12_specials[0] - 1) // 10
@@ -3471,73 +3165,6 @@ def get_strong_special_from_strategies(
     return specials, top_zodiacs, best, get_zodiac_by_number(best)
 
 
-def get_special_rule_contribution_report(conn: sqlite3.Connection, lookback: int = 60) -> str:
-    rows = _draws_ordered_asc(conn)
-    if len(rows) <= 1:
-        return "特别号规则贡献回测：数据不足"
-    start = max(1, len(rows) - lookback)
-    stats = {
-        "neighbor_1": {"hits": 0, "samples": 0},
-        "neighbor_2": {"hits": 0, "samples": 0},
-        "tail": {"hits": 0, "samples": 0},
-        "zone": {"hits": 0, "samples": 0},
-        "zodiac": {"hits": 0, "samples": 0},
-        "omit20": {"hits": 0, "samples": 0},
-    }
-    for i in range(start, len(rows)):
-        history = rows[max(0, i - 12):i]
-        if len(history) < 3:
-            continue
-        current = rows[i]
-        prev_specials = [int(r["special_number"]) for r in rows[max(0, i - 12):i]]
-        prev_special = prev_specials[0] if prev_specials else None
-        actual_special = int(current["special_number"])
-        tail = prev_special % 10 if prev_special is not None else None
-        zone = (prev_special - 1) // 10 if prev_special is not None else None
-        zodiac = get_zodiac_by_number(prev_special) if prev_special is not None else None
-        omission = {n: 80 for n in ALL_NUMBERS}
-        for idx, n in enumerate(prev_specials):
-            omission[n] = min(omission.get(n, 80), idx + 1)
-        omit20_best = max(omission.items(), key=lambda x: x[1])[0]
-        neighbor_1 = {n for sp in prev_specials[:12] for n in (sp - 1, sp + 1) if 1 <= n <= 49}
-        neighbor_2 = {n for sp in prev_specials[:12] for n in (sp - 2, sp + 2) if 1 <= n <= 49}
-        stats["neighbor_1"]["samples"] += 1
-        stats["neighbor_1"]["hits"] += 1 if actual_special in neighbor_1 else 0
-        stats["neighbor_2"]["samples"] += 1
-        stats["neighbor_2"]["hits"] += 1 if actual_special in neighbor_2 else 0
-        if tail is not None:
-            stats["tail"]["samples"] += 1
-            stats["tail"]["hits"] += 1 if actual_special % 10 == tail else 0
-        if zone is not None:
-            stats["zone"]["samples"] += 1
-            stats["zone"]["hits"] += 1 if (actual_special - 1) // 10 == zone else 0
-        if zodiac is not None:
-            stats["zodiac"]["samples"] += 1
-            stats["zodiac"]["hits"] += 1 if get_zodiac_by_number(actual_special) == zodiac else 0
-        stats["omit20"]["samples"] += 1
-        stats["omit20"]["hits"] += 1 if actual_special == omit20_best else 0
-    def fmt(name: str) -> str:
-        s = stats[name]
-        rate = (s["hits"] / s["samples"] * 100.0) if s["samples"] else 0.0
-        return f"{name}: 样本={s['samples']} 命中={s['hits']} 命中率={rate:.2f}%"
-    return "\n".join([
-        f"特别号规则贡献回测（最近{lookback}期）:",
-        f"  - {fmt('neighbor_1')}",
-        f"  - {fmt('neighbor_2')}",
-        f"  - {fmt('tail')}",
-        f"  - {fmt('zone')}",
-        f"  - {fmt('zodiac')}",
-        f"  - {fmt('omit20')}",
-    ])
-
-
-def get_special_rule_contribution_report_multi(conn: sqlite3.Connection) -> str:
-    parts = [
-        get_special_rule_contribution_report(conn, lookback=20),
-        get_special_rule_contribution_report(conn, lookback=60),
-        get_special_rule_contribution_report(conn, lookback=100),
-    ]
-    return "\n\n".join(parts)
 
 
 # ========== 特别号投票 ==========
@@ -3557,32 +3184,6 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
     vote_counter = Counter(all_specials)
     sorted_items = sorted(vote_counter.items(), key=lambda x: (-x[1], x[0]))
     return [num for num, _ in sorted_items[:top_n]]
-
-
-    def fmt(name: str) -> str:
-        s = stats[name]
-        rate = (s["hits"] / s["samples"] * 100.0) if s["samples"] else 0.0
-        return f"{name}: 样本={s['samples']} 命中={s['hits']} 命中率={rate:.2f}%"
-
-    return "\n".join([
-        f"特别号规则贡献回测（最近{lookback}期）:",
-        f"  - {fmt('neighbor_1')}",
-        f"  - {fmt('neighbor_2')}",
-        f"  - {fmt('tail')}",
-        f"  - {fmt('zone')}",
-        f"  - {fmt('zodiac')}",
-        f"  - {fmt('omit20')}",
-    ])
-
-
-def get_special_rule_contribution_report_multi(conn: sqlite3.Connection) -> str:
-    parts = [
-        get_special_rule_contribution_report(conn, lookback=20),
-        get_special_rule_contribution_report(conn, lookback=60),
-        get_special_rule_contribution_report(conn, lookback=100),
-    ]
-    return "\n\n".join(parts)
-
 
 
 def send_pushplus_notification(title: str, content: str) -> bool:
@@ -3706,41 +3307,16 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
 
-    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20)
-    print("\n单生肖复盘（最近20期，命中1只即算命中）:")
+    zodiac_report = get_recent_single_zodiac_report(conn, lookback=10)
+    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=10)
+    zodiac_four_report = get_recent_four_zodiac_report(conn, lookback=10, history_window=16)
     print(
-        f"  - 最近样本={int(zodiac_report['samples'])}期 "
-        f"命中率={zodiac_report['hit_rate'] * 100:.1f}% "
-        f"最大连空={int(zodiac_report['max_miss_streak'])}"
+        f"近10期: 一生肖={zodiac_report['hit_rate']:.3f}(连空{int(zodiac_report['max_miss_streak'])}) "
+        f"二肖(任1)={zodiac_two_report['hit_rate']:.3f}(连空{int(zodiac_two_report['max_miss_streak'])}) "
+        f"四肖={zodiac_four_report['hit_rate']:.3f}(连空{int(zodiac_four_report['max_miss_streak'])})"
     )
-    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=20)
-    print("双生肖复盘（最近20期，任中1只即算命中）:")
-    print(
-        f"  - 最近样本={int(zodiac_two_report['samples'])}期 "
-        f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
-        f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
-    )
-    zodiac_two_strict_report = get_recent_two_zodiac_report(conn, lookback=20)
-    print("双生肖复盘（最近20期，二中二）:")
-    print(
-        f"  - 最近样本={int(zodiac_two_strict_report['samples'])}期 "
-        f"命中率={zodiac_two_strict_report['hit_rate'] * 100:.1f}% "
-        f"最大连空={int(zodiac_two_strict_report['max_miss_streak'])}"
-    )
-    zodiac_four_report = get_recent_four_zodiac_report(conn, lookback=20, history_window=16)
-    print("特别生肖复盘（最近20期，命中1只即算命中，4选）:")
-    print(
-        f"  - 最近样本={int(zodiac_four_report['samples'])}期 "
-        f"命中率={zodiac_four_report['hit_rate'] * 100:.1f}% "
-        f"最大连空={int(zodiac_four_report['max_miss_streak'])}"
-    )
-    zodiac_three_report = get_recent_three_zodiac_report(conn, lookback=20, history_window=16)
-    print("三生肖复盘（最近20期，命中2只即算命中）:")
-    print(
-        f"  - 最近样本={int(zodiac_three_report['samples'])}期 "
-        f"命中率={zodiac_three_report['hit_rate'] * 100:.1f}% "
-        f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
-    )
+    if zodiac_report['hit_rate'] >= 0.9 and zodiac_two_report['hit_rate'] >= 0.8 and zodiac_four_report['hit_rate'] >= 1.0:
+        print("🎉 达标！")
 
     print_final_recommendation(conn, xgb_pool20=xgb_pool20)
 
@@ -3885,6 +3461,37 @@ def cmd_sync(args: argparse.Namespace) -> None:
             print(f"Backtest updated. issues={bt_issues}, strategy_runs={bt_runs}")
         if patched > 0:
             print(f"Patched missing special picks: {patched}")
+    finally:
+        conn.close()
+
+
+def cmd_reset_and_auto(args: argparse.Namespace) -> None:
+    conn = connect_db(args.db)
+    try:
+        init_db(conn)
+        conn.execute("DELETE FROM prediction_picks")
+        conn.execute("DELETE FROM prediction_pools")
+        conn.execute("DELETE FROM prediction_runs")
+        conn.execute("DELETE FROM strategy_performance")
+        conn.execute("DELETE FROM special_picks_log")
+        conn.execute("DELETE FROM model_state WHERE key = ?", (MINED_CONFIG_KEY,))
+        conn.commit()
+        optuna_path = SCRIPT_DIR / "optuna_macau_stable.db"
+        if optuna_path.exists():
+            os.remove(optuna_path)
+            print(f"[重置] 已删除 {optuna_path}")
+        records = fetch_macau_recent_records(limit=120, timeout=args.api_timeout, retries=args.api_retries)
+        total, inserted, updated = sync_from_records(conn, records, source="macau_api_recent_120")
+        mined_cfg = ensure_mined_pattern_config(conn, force=True)
+        optimize_script = SCRIPT_DIR / "hyper_optimize_ultimate_target.py"
+        ret = subprocess.run(
+            [sys.executable, str(optimize_script), "--db", args.db, "--recent", "120", "--trials", str(getattr(args, "trials", 500))],
+            capture_output=False,
+        )
+        run_historical_backtest(conn, rebuild=True, max_issues=120)
+        generate_predictions(conn)
+        print(f"Reset+auto done. total={total}, inserted={inserted}, updated={updated}, optimizer_exit={ret.returncode}")
+        print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
     finally:
         conn.close()
 
@@ -4046,6 +3653,89 @@ def cmd_backfill_special(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_check_data(args: argparse.Namespace) -> None:
+    conn = connect_db(args.db)
+    try:
+        init_db(conn)
+        rows = conn.execute(
+            "SELECT issue_no, draw_date, numbers_json, special_number FROM draws ORDER BY draw_date ASC, issue_no ASC"
+        ).fetchall()
+        if not rows:
+            print("数据校验结果：数据库中没有开奖记录。")
+            return
+
+        issues = [str(r["issue_no"]) for r in rows]
+        duplicate_issues = sorted({x for x in issues if issues.count(x) > 1})
+        parsed_rows = []
+        invalid_rows = []
+        for r in rows:
+            try:
+                nums = json.loads(r["numbers_json"])
+            except Exception:
+                invalid_rows.append((r["issue_no"], "numbers_json 无法解析"))
+                continue
+            sp = r["special_number"]
+            if not isinstance(nums, list) or len(nums) != 6:
+                invalid_rows.append((r["issue_no"], f"主号数量异常: {len(nums) if isinstance(nums, list) else 'N/A'}"))
+            bad_nums = [n for n in nums if not isinstance(n, int) or not (1 <= int(n) <= 49)]
+            if bad_nums:
+                invalid_rows.append((r["issue_no"], f"主号存在非法号码: {bad_nums}"))
+            if not isinstance(sp, int) or not (1 <= int(sp) <= 49):
+                invalid_rows.append((r["issue_no"], f"特别号非法: {sp}"))
+            parsed_rows.append(r)
+
+        issue_keys = [issue_sort_key(x) for x in issues if issue_sort_key(x) is not None]
+        missing_issues = []
+        if issue_keys:
+            width = 3
+            first_parsed = parse_issue(issues[0])
+            if first_parsed:
+                _, _, width = first_parsed
+            year_s, seq, _ = parse_issue(issues[0]) or ("00", 0, width)
+            current_year = int(year_s)
+            current_seq = seq
+            expected = set(issues)
+            for _ in range(len(issues) + 5):
+                current_seq += 1
+                if current_seq > 366:
+                    current_year += 1
+                    current_seq = 1
+                candidate = build_issue(str(current_year).zfill(len(year_s)), current_seq, width)
+                if candidate not in expected and conn.execute("SELECT 1 FROM draws WHERE issue_no=?", (candidate,)).fetchone() is None:
+                    missing_issues.append(candidate)
+                    if len(missing_issues) >= 20:
+                        break
+
+        date_errors = []
+        for r in rows:
+            d = str(r["draw_date"])
+            if _parse_date(d) is None:
+                date_errors.append(r["issue_no"])
+
+        print("数据校验结果")
+        print(f"  - 总期数: {len(rows)}")
+        print(f"  - 重复期号: {len(duplicate_issues)}")
+        if duplicate_issues:
+            print(f"    {', '.join(duplicate_issues[:10])}")
+        print(f"  - 缺失期号(估算): {len(missing_issues)}")
+        if missing_issues:
+            print(f"    {', '.join(missing_issues[:10])}")
+        print(f"  - 非法记录: {len(invalid_rows)}")
+        if invalid_rows:
+            for issue_no, msg in invalid_rows[:10]:
+                print(f"    {issue_no}: {msg}")
+        print(f"  - 日期异常: {len(date_errors)}")
+        if date_errors:
+            print(f"    {', '.join(date_errors[:10])}")
+
+        if duplicate_issues or missing_issues or invalid_rows or date_errors:
+            print("结论：当前数据存在需要清理或核验的问题。")
+        else:
+            print("结论：未发现明显数据结构异常。")
+    finally:
+        conn.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - v4全面优化版")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
@@ -4101,6 +3791,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_backfill_special = sub.add_parser("backfill-special", help="回溯历史精选特别号记录")
     p_backfill_special.set_defaults(func=cmd_backfill_special)
+
+    p_reset = sub.add_parser("reset-and-auto", help="全自动重置→获取120期→优化近10期→预测")
+    p_reset.add_argument("--trials", type=int, default=500, help="Optuna trials count")
+    p_reset.set_defaults(func=cmd_reset_and_auto)
+
+    p_check = sub.add_parser("check-data", help="校验数据库开奖记录是否完整且合法")
+    p_check.set_defaults(func=cmd_check_data)
 
     return p
 
