@@ -229,6 +229,10 @@ ZODIAC_MAP = {
     "鼠": [7, 19, 31, 43], "猪": [8, 20, 32, 44], "狗": [9, 21, 33, 45],
     "鸡": [10, 22, 34, 46], "猴": [11, 23, 35, 47], "羊": [12, 24, 36, 48],
 }
+ZODIAC_PAIR = {
+    "鼠": "牛", "牛": "鼠", "虎": "猪", "猪": "虎", "兔": "狗", "狗": "兔",
+    "龙": "鸡", "鸡": "龙", "蛇": "猴", "猴": "蛇", "马": "羊", "羊": "马"
+}
 
 # =================== 来自优化器的策略函数 (适配主脚本) ===================
 def _row_numbers(r):
@@ -418,6 +422,81 @@ def _strategy_special_omission_only(rows, zodiac_pool, params, top_n=3):
     candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
     if not candidates: return [1, 2, 3]
     return sorted(candidates, key=lambda n: omission.get(n, 30), reverse=True)[:top_n]
+
+# ========== 新增特别号策略（与优化器同步） ==========
+def _strategy_special_zone_bias(rows, zodiac_pool, params, top_n=3):
+    recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
+    if not recent_specials: return [1, 2, 3]
+    zones = {"low":0,"mid":0,"high":0}
+    for sp in recent_specials:
+        if sp <= 19: zones["low"] += 1
+        elif sp <= 39: zones["mid"] += 1
+        else: zones["high"] += 1
+    target_zone = min(zones, key=zones.get)
+    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
+    if target_zone == "low":
+        candidates = [n for n in candidates if n <= 19]
+    elif target_zone == "mid":
+        candidates = [n for n in candidates if 20 <= n <= 39]
+    else:
+        candidates = [n for n in candidates if n >= 40]
+    if not candidates: return [1, 2, 3]
+    omission = {}
+    for i, sp in enumerate(recent_specials):
+        if sp not in omission: omission[sp] = i + 1
+    return sorted(candidates, key=lambda n: omission.get(n, 30), reverse=True)[:top_n]
+
+def _strategy_special_neighbor_tail(rows, zodiac_pool, params, top_n=3):
+    recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
+    if not recent_specials: return [1, 2, 3]
+    latest = recent_specials[0]
+    omission = {}
+    for i, sp in enumerate(recent_specials):
+        if sp not in omission: omission[sp] = i + 1
+    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
+    picks = []
+    nb1 = [n for n in candidates if abs(n - latest) == 1 and n not in picks]
+    picks.extend(sorted(nb1, key=lambda n: omission.get(n, 30), reverse=True)[:1])
+    tail = [n for n in candidates if n % 10 == latest % 10 and n not in picks]
+    picks.extend(sorted(tail, key=lambda n: omission.get(n, 30), reverse=True)[:1])
+    while len(picks) < top_n:
+        rest = sorted([n for n in candidates if n not in picks], key=lambda n: omission.get(n, 30), reverse=True)
+        if rest: picks.append(rest[0])
+        else: break
+    return picks[:top_n]
+
+def _strategy_special_mixed_2cold1hot(rows, zodiac_pool, params, top_n=3):
+    recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
+    if not recent_specials: return [1, 2, 3]
+    omission = {}
+    for i, sp in enumerate(recent_specials):
+        if sp not in omission: omission[sp] = i + 1
+    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
+    cold = sorted(candidates, key=lambda n: omission.get(n, 30), reverse=True)[:2]
+    hot = sorted(candidates, key=lambda n: recent_specials.count(n), reverse=True)
+    hot = [n for n in hot if n not in cold][:1]
+    return cold + hot
+
+def _strategy_special_omit_break(rows, zodiac_pool, params, top_n=3):
+    recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
+    if not recent_specials: return [1, 2, 3]
+    latest = recent_specials[0]
+    omission = {}
+    for i, sp in enumerate(recent_specials):
+        if sp not in omission: omission[sp] = i + 1
+    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
+    extreme = [n for n in candidates if omission.get(n, 30) >= 20]
+    if extreme: return extreme[:top_n]
+    nb1 = [n for n in candidates if abs(n - latest) == 1]
+    if nb1: return nb1[:top_n]
+    return sorted(candidates, key=lambda n: omission.get(n, 30), reverse=True)[:top_n]
+
+def _strategy_special_random_baseline(rows, zodiac_pool, params, top_n=3):
+    import random
+    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
+    if not candidates: return [1, 2, 3]
+    random.shuffle(candidates)
+    return candidates[:top_n]
 
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 
@@ -2231,86 +2310,60 @@ def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0
 def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 16) -> List[str]:
     params = load_best_zodiac_params()
     strat = params.get("two_strategy", "hot_cold")
+
+    target_row = conn.execute(
+        "SELECT draw_date FROM draws WHERE issue_no = ?",
+        (issue_no,),
+    ).fetchone()
+    if not target_row:
+        return ["马", "蛇"]
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
         (issue_no, issue_no, issue_no, window),
     ).fetchall()
     if not rows:
         return ["马", "蛇"]
+
     if strat == "double_hot":
         return _strategy_two_double_hot(rows)
-    if strat == "double_cold":
+    elif strat == "double_cold":
         return _strategy_two_double_cold(rows)
-    if strat == "hot_cold":
+    elif strat == "last2_specials":
+        return _strategy_two_last2_specials(rows)
+    elif strat == "hot_special_cold_main":
+        return _strategy_two_hot_special_cold_main(rows)
+    elif strat == "neighbor_pair":
+        return _strategy_two_neighbor_pair(rows)
+    else:
         return _strategy_two_hot_cold(rows)
-
-    if issue_no:
-        prev_issue = _get_previous_issue(conn, issue_no)
-        if prev_issue and not _check_two_zodiac_hit(conn, prev_issue):
-            prev_draw = conn.execute(
-                "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
-                (prev_issue,)
-            ).fetchone()
-            if prev_draw:
-                prev_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
-                prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
-                hot_two = [z for z, _ in Counter(prev_zodiacs).most_common(2)]
-                if len(hot_two) >= 2:
-                    return hot_two[:2]
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
-    omission_map = _zodiac_omission_map(rows)
-    force_include = [z for z, omit in omission_map.items() if omit >= 6]
-    recent_specials = [int(r["special_number"]) for r in rows[:8]]
-    for sp in recent_specials[:5]:
-        zodiac_scores[get_zodiac_by_number(sp)] += 1.4
-    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    if pool20:
-        pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
-        for z, cnt in Counter(pool_zodiacs).items():
-            zodiac_scores[z] += cnt * 0.35
-    recent_main_zodiacs = []
-    for r in rows[:6]:
-        recent_main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"]))
-    for z, cnt in Counter(recent_main_zodiacs).items():
-        if cnt >= 3:
-            zodiac_scores[z] += 0.6
-    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    picks = []
-    for z in force_include:
-        if z not in picks:
-            picks.append(z)
-    for z, _ in ranked:
-        if len(picks) >= 2:
-            break
-        if z not in picks:
-            picks.append(z)
-    if len(picks) < 2:
-        for z, _ in ranked:
-            if z not in picks:
-                picks.append(z)
-            if len(picks) == 2:
-                break
-    return picks[:2]
 
 
 def get_single_zodiac_pick(conn, issue_no, window=6):
     params = load_best_zodiac_params()
     strat = params.get("single_strategy", "weighted")
-    wsize = int(params.get("single_window", params.get("wsize", window)))
-    rec_w = float(params.get("single_recency_w", params.get("rec_w", 0.7339)))
-    safe_th = float(params.get("single_safe_threshold", params.get("safe_th", 1.4589)))
+    wsize = int(params.get("wsize", window))
+    rec_w = float(params.get("rec_w", 0.7339))
+    safe_th = float(params.get("safe_th", 1.4589))
+
     rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 16"
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 16"
     ).fetchall()
     if not rows:
         return "马"
+
     if strat == "weighted":
         return _strategy_single_weighted(rows, wsize, rec_w, safe_th)
     elif strat == "pure_hot":
         return _strategy_single_pure_hot(rows, wsize, rec_w, safe_th)
     elif strat == "pure_cold":
         return _strategy_single_pure_cold(rows, wsize, rec_w, safe_th)
-    return "马"
+    elif strat == "hybrid":
+        return _strategy_single_hybrid(rows, wsize, rec_w, safe_th)
+    elif strat == "hot_main_only":
+        return _strategy_single_hot_main_only(rows, wsize, rec_w, safe_th)
+    elif strat == "last_special":
+        return _strategy_single_last_special(rows, wsize, rec_w, safe_th)
+    return _strategy_single_weighted(rows, wsize, rec_w, safe_th)
 
 
 def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int = 3) -> Tuple[List[str], List[str]]:
@@ -2424,53 +2477,17 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
     elif strat == "momentum":
         momentum_w = float(params.get("momentum_w", 1.0))
         return _strategy_four_momentum(rows, momentum_w)
-    # 保持现有逻辑
-    four_boost = float(params.get("four_boost", 1.4221))
-    lstm_weight = float(params.get("lstm_weight", 0.3))
-    lstm_seq_len = int(params.get("lstm_seq_len", 30))
-    hmm_weight = float(params.get("hmm_weight", 0.2))
-    omission = {z: 0 for z in ZODIAC_MAP}
-    specials = [int(row["special_number"]) for row in rows]
-    zodiac_series = [get_zodiac_by_number(sp) for sp in specials]
-    for idx, z in enumerate(zodiac_series):
-        if omission[z] == 0:
-            omission[z] = idx + 1
-    for z in omission:
-        omission[z] *= four_boost
-    sorted_cold = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
-    picks = [z for z, _ in sorted_cold[:2]]
-    latest_z = get_zodiac_by_number(specials[0]) if specials else None
-    if latest_z and latest_z not in picks:
-        picks.append(latest_z)
-    for z in zodiac_series[1:3]:
-        if z not in picks:
-            picks.append(z)
-            break
-    recent_counts = Counter(zodiac_series[:6])
-    for z, _ in recent_counts.most_common():
-        if z not in picks:
-            picks.append(z)
-            break
-    if conn and predict_lstm_proba and lstm_weight > 0.01:
-        lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
-        if lstm_probs:
-            picks = sorted(dict.fromkeys(picks), key=lambda z: -lstm_probs.get(z, 0.0) * lstm_weight)
-    if conn and hmm_weight > 0.01:
-        hmm_probs = safe_get_hmm_state_proba(conn)
-        if hmm_probs:
-            picks = sorted(dict.fromkeys(picks), key=lambda z: -hmm_probs.get(z, 0.0) * hmm_weight)
-    if len(set(picks[:3])) < 3:
-        for z in sorted_cold:
-            if z not in picks:
-                picks.append(z)
-            if len(picks) >= 4:
-                break
-    while len(picks) < 4:
-        for z in ZODIAC_MAP:
-            if z not in picks:
-                picks.append(z)
-                break
-    return picks[:4]
+    elif strat == "hybrid":
+        four_boost = float(params.get("four_boost", 1.4221))
+        momentum_w = float(params.get("momentum_w", 1.0))
+        return _strategy_four_hybrid(rows, four_boost, momentum_w)
+    elif strat == "top4_freq":
+        return _strategy_four_top4_freq(rows)
+    elif strat == "cold_main_only":
+        return _strategy_four_cold_main_only(rows)
+    else:
+        four_boost = float(params.get("four_boost", 1.4221))
+        return _strategy_four_boosted(rows, four_boost)
 
 
 # 兼容旧调用：特别生肖统计暂时复用四生肖核心逻辑
@@ -2728,22 +2745,38 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
 def get_precise_specials_for_issue(conn, issue_no, zodiac_pool, top_n=3):
     if not zodiac_pool:
         return []
+
     params = load_best_zodiac_params()
     strat = params.get("special_strategy", "cold_neighbor")
-    target = conn.execute("SELECT draw_date FROM draws WHERE issue_no=?", (issue_no,)).fetchone()
-    if not target: return []
+
+    target = conn.execute("SELECT draw_date FROM draws WHERE issue_no = ?", (issue_no,)).fetchone()
+    if not target:
+        return []
     rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no=?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no=?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT 12",
-        (issue_no, issue_no, issue_no)
+        "SELECT numbers_json, special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT 12",
+        (issue_no, issue_no, issue_no),
     ).fetchall()
-    if not rows: return list(ZODIAC_MAP.get(zodiac_pool[0], []))[:top_n]
+    if not rows:
+        return list(ZODIAC_MAP.get(zodiac_pool[0], []))[:top_n]
+
     if strat == "cold_neighbor":
         return _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n)
     elif strat == "tail_focus":
         return _strategy_special_tail_focus(rows, zodiac_pool, params, top_n)
     elif strat == "omission_only":
         return _strategy_special_omission_only(rows, zodiac_pool, params, top_n)
-    return [1, 2, 3]
+    elif strat == "zone_bias":
+        return _strategy_special_zone_bias(rows, zodiac_pool, params, top_n)
+    elif strat == "neighbor_tail":
+        return _strategy_special_neighbor_tail(rows, zodiac_pool, params, top_n)
+    elif strat == "mixed_2cold1hot":
+        return _strategy_special_mixed_2cold1hot(rows, zodiac_pool, params, top_n)
+    elif strat == "omit_break":
+        return _strategy_special_omit_break(rows, zodiac_pool, params, top_n)
+    elif strat == "random_baseline":
+        return _strategy_special_random_baseline(rows, zodiac_pool, params, top_n)
+    else:
+        return _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n)
 def _get_longest_omitted_numbers(conn, limit=6):
     all_draws = conn.execute("SELECT numbers_json FROM draws ORDER BY draw_date DESC").fetchall()
     omission = {n: 0 for n in ALL_NUMBERS}
