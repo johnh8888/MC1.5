@@ -2537,43 +2537,61 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None)
     return max(scores.items(), key=lambda x: x[1])[0]
 
 
-def get_recent_single_zodiac_report(
-    conn: sqlite3.Connection,
-    lookback: int = 20,
-    history_window: int = 14,
-) -> Dict[str, float]:
+def get_recent_single_zodiac_report(conn: sqlite3.Connection, lookback: int = 20) -> Dict[str, float]:
     rows = _draws_ordered_asc(conn)
-    if len(rows) < history_window + 1:
+    if len(rows) < 2:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    start = max(history_window, len(rows) - lookback)
+    start = max(1, len(rows) - lookback)
     hits = 0
     samples = 0
     miss_streak = 0
-    max_miss_streak = 0
+    max_streak = 0
     for i in range(start, len(rows)):
-        history_rows = rows[max(0, i - history_window):i]
-        if len(history_rows) < history_window:
-            continue
-        pick = _get_single_zodiac_from_history_rows(history_rows, conn)
+        # 使用第1期到 i-1 期作为历史（同优化器）
+        hist_rows = rows[:i]
+        pick = _get_single_zodiac_from_history_rows(hist_rows, conn=conn)
         win_main = json.loads(rows[i]["numbers_json"])
-        win_special = int(rows[i]["special_number"])
-        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
-        winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if pick in winning_zodiacs else 0
+        win_sp = int(rows[i]["special_number"])
+        win_zod = {get_zodiac_by_number(n) for n in win_main}
+        win_zod.add(get_zodiac_by_number(win_sp))
+        hit = 1 if pick in win_zod else 0
         hits += hit
         samples += 1
         if hit == 0:
             miss_streak += 1
-            max_miss_streak = max(max_miss_streak, miss_streak)
+            max_streak = max(max_streak, miss_streak)
         else:
             miss_streak = 0
-    if samples == 0:
+    rate = hits / samples if samples else 0.0
+    return {"samples": float(samples), "hit_rate": rate, "max_miss_streak": float(max_streak)}
+
+
+def get_recent_two_zodiac_report(conn: sqlite3.Connection, lookback: int = 20) -> Dict[str, float]:
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < 2:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {
-        "samples": float(samples),
-        "hit_rate": float(hits / samples),
-        "max_miss_streak": float(max_miss_streak),
-    }
+    start = max(1, len(rows) - lookback)
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_streak = 0
+    for i in range(start, len(rows)):
+        hist_rows = rows[:i]
+        picks = _get_two_zodiac_from_history_rows(hist_rows, conn=conn)
+        win_main = json.loads(rows[i]["numbers_json"])
+        win_sp = int(rows[i]["special_number"])
+        win_zod = {get_zodiac_by_number(n) for n in win_main}
+        win_zod.add(get_zodiac_by_number(win_sp))
+        hit = 1 if any(z in win_zod for z in picks) else 0   # 修改为二中一标准，与优化器一致
+        hits += hit
+        samples += 1
+        if hit == 0:
+            miss_streak += 1
+            max_streak = max(max_streak, miss_streak)
+        else:
+            miss_streak = 0
+    rate = hits / samples if samples else 0.0
+    return {"samples": float(samples), "hit_rate": rate, "max_miss_streak": float(max_streak)}
 
 
 def get_recent_two_zodiac_report(
