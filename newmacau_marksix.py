@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import sys
 from pathlib import Path
 
@@ -2772,7 +2773,9 @@ def print_final_recommendation(conn, xgb_pool20=None):
     print(f"二生肖推荐: {'、'.join(zodiac_two)}")
     print(f"三生肖推荐: {'、'.join(get_three_zodiac_picks(conn))}")
     print(f"特别生肖推荐: {'、'.join(special_zodiacs)}")
-    print(f"推荐期数日期: {issue_no}（{draw_date}）")
+    latest = get_latest_draw(conn)
+    if latest:
+        print(f"推荐期数日期: {latest['issue_no']}（{latest['draw_date']}）")
     one_rep = get_recent_single_zodiac_report(conn, lookback=10)
     two_rep = get_recent_two_zodiac_report(conn, lookback=10)
     three_rep = get_recent_three_zodiac_report(conn, lookback=10)
