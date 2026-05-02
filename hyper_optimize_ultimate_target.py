@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""澳门彩优化器（修正版）：特别号预测匹配主脚本逻辑，目标近10期 一生肖≥70% 二肖≥80% 四肖≥95% 特别号≥50% 连空≤1"""
+"""澳门彩优化器（完全匹配主脚本版本）
+目标：近10期 一生肖≥70% 二肖≥80% 四肖≥95% 特别号≥50% 连空≤1
+特别号评估逻辑与 newmacau_marksix.get_precise_specials_for_issue 完全一致
+"""
 import sqlite3, json, sys, argparse
 from collections import Counter
 import optuna
@@ -27,7 +30,7 @@ def load_issues(conn, recent=120):
     ).fetchall()
     return [(r["issue_no"], json.loads(r["numbers_json"]), int(r["special_number"])) for r in rows[-recent:]]
 
-# ---- 生肖预测函数（保持不变） ----
+# ------ 生肖预测（保持不变） ------
 def pred_single(hist, wsize, rec_w, safe_th):
     scores = {z: 0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist) >= wsize else hist
@@ -75,14 +78,26 @@ def pred_four(hist, four_boost):
             if z not in picks: picks.append(z); break
     return picks[:4]
 
-# ---- 特别号精选预测（与主脚本 get_precise_specials_from_history 完全一致） ----
-def pred_special_from_history(history, zodiac_pool, params, top_n=3):
+# ------ 特别号预测（复制自主脚本 get_precise_specials_for_issue） ------
+def pred_special_online(hist, zodiac_pool, params, top_n=3):
+    """
+    完全匹配 newmacau_marksix.get_precise_specials_for_issue 的逻辑
+    hist: [(issue_no, [main_nums], special_num), ...]
+    zodiac_pool: list of zodiac strings
+    params: 优化参数字典
+    """
     if not zodiac_pool:
         return []
-    latest_row = history[0]
-    latest_special = latest_row[2]  # 特别号
-    recent_specials = [r[2] for r in history[:12]]
 
+    # 提取最近的特别号序列（hist 已按时间升序，最后一个是最近一期）
+    # 注意：调用前 hist 应该是不包含当前期的历史数据
+    recent_specials = [row[2] for row in hist[::-1]]   # 从近到远排列
+    if not recent_specials:
+        return list(set(ZODIAC_MAP.get(zodiac_pool[0], [])))[:top_n]
+
+    latest_special = recent_specials[0]
+
+    # 遗漏值计算（特别号）
     omission = {}
     for i, sp in enumerate(recent_specials):
         if sp not in omission:
@@ -92,106 +107,109 @@ def pred_special_from_history(history, zodiac_pool, params, top_n=3):
     if not candidates:
         return []
 
-    # 尾数统计
-    tail_counter = Counter()
-    for row in history[:8]:
-        for n in row[1]:            # 主号
-            tail_counter[n % 10] += 1
-    for sp in recent_specials[:8]:
-        tail_counter[sp % 10] += 3
+    # 读取参数，使用默认值与主脚本一致
+    cold_threshold = int(params.get('cold_threshold', 11))
+    neighbor_1_bonus = float(params.get('neighbor_1_bonus', 6.918))
+    neighbor_2_bonus = float(params.get('neighbor_2_bonus', 0.514))
+    penalty_coeff = float(params.get('penalty_coeff', 0.76))
+    lgb_weight = float(params.get('lgb_weight', 0.6146))
+    omit_boost = float(params.get('four_omit_boost', 2.578))
 
-    hot_tails = {t for t, _ in tail_counter.most_common(6)}
-    last_tail = latest_special % 10
-    neighbor_tails = {last_tail, (last_tail + 1) % 10, (last_tail - 1) % 10}
+    # 取前两个最冷的号码（遗漏值 >= cold_threshold）
+    cold_picks = sorted(
+        [n for n in candidates if omission.get(n, 20) >= cold_threshold],
+        key=lambda n: omission.get(n, 20), reverse=True
+    )[:2]
+    # 若不足2个，用剩余遗漏最大的补足
+    while len(cold_picks) < 2:
+        remaining = [n for n in candidates if n not in cold_picks]
+        if not remaining:
+            break
+        next_cold = max(remaining, key=lambda n: omission.get(n, 20))
+        cold_picks.append(next_cold)
 
-    selected = []
-    penalty_nums = set(recent_specials[:2])
+    picks = cold_picks[:2]
 
-    # 邻号1优先
-    neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in penalty_nums]
-    if not neighbors:
-        neighbors = [n for n in candidates if abs(n - latest_special) == 1]
-    if neighbors:
-        selected.append(max(neighbors, key=lambda n: omission.get(n, 20)))
+    # 如果数量不够 top_n，尝试加邻号1
+    if len(picks) < top_n:
+        neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in picks]
+        if neighbors:
+            picks.append(max(neighbors, key=lambda n: omission.get(n, 20) + neighbor_1_bonus))
 
-    # 尾数匹配
-    if len(selected) < top_n:
-        tail_candidates = [n for n in candidates if n not in selected and n % 10 == last_tail and n not in penalty_nums]
-        if not tail_candidates:
-            tail_candidates = [n for n in candidates if n not in selected and n % 10 in neighbor_tails and n not in penalty_nums]
-        if not tail_candidates:
-            tail_candidates = [n for n in candidates if n not in selected and n % 10 in hot_tails and n not in penalty_nums]
-        if not tail_candidates:
-            tail_candidates = [n for n in candidates if n not in selected and n % 10 == last_tail]
-        if tail_candidates:
-            selected.append(max(tail_candidates, key=lambda n: omission.get(n, 20)))
-
-    # 邻号2
-    if len(selected) < top_n:
-        neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in selected and n not in penalty_nums]
-        if not neighbors2:
-            neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in selected]
+    # 还不够加邻号2
+    if len(picks) < top_n:
+        neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in picks]
         if neighbors2:
-            selected.append(max(neighbors2, key=lambda n: omission.get(n, 20)))
+            picks.append(max(neighbors2, key=lambda n: omission.get(n, 20) + neighbor_2_bonus))
 
-    # 若还不够，选遗漏最大值
-    if len(selected) < top_n:
-        cold_pool = [n for n in candidates if n not in selected and n != latest_special]
-        if cold_pool:
-            selected.append(max(cold_pool, key=lambda n: omission.get(n, 20)))
+    # 如果还有空位，按遗漏从大到小补足
+    while len(picks) < top_n:
+        rest = sorted(
+            [n for n in candidates if n not in picks],
+            key=lambda n: omission.get(n, 20), reverse=True
+        )
+        if rest:
+            picks.append(rest[0])
+        else:
+            break
 
-    # 仍不足则填充
-    if len(selected) < top_n:
-        remaining = [n for n in candidates if n not in selected]
-        remaining.sort(key=lambda n: omission.get(n, 20), reverse=True)
-        for n in remaining:
-            selected.append(n)
-            if len(selected) >= top_n:
-                break
+    # 权重微调（与主脚本一致的加权排序）
+    if recent_specials:
+        scored = []
+        for n in picks:
+            score = float(omission.get(n, 20)) * lgb_weight
+            if n in recent_specials[:3]:           # 最近3期特别号惩罚
+                score *= penalty_coeff
+            if omission.get(n, 20) >= cold_threshold:
+                score += omit_boost
+            scored.append((n, score))
+        scored.sort(key=lambda x: (-x[1], x[0]))
+        picks = [n for n, _ in scored]
 
-    # 应用优化参数微调（仅对已选号码的排序作补充，但不改变已选集合）
-    # 注：原主脚本中此处会使用 cold_threshold, neighbor_1_bonus 等，但 get_precise_specials_from_history 本身固定规则。
-    # 为保持与主脚本一致，此处直接返回 selected[:top_n]
-    return selected[:top_n]
+    return picks[:top_n]
 
-def build_zodiac_pool(hist):
-    """生成生肖池，与主脚本 backfill_special_picks_log 中的构建逻辑一致"""
-    base_four = pred_four(hist, 1.0)  # 使用默认1.0，后文会乘 four_boost，这里只取基础四肖
-    recent_zodiacs = [get_zodiac(r[2]) for r in hist[:8]]
+# ------ 构建生肖池（近似主脚本 print_final_recommendation 中的 enhanced_zodiacs） ------
+def build_zodiac_pool(hist, params):
+    """返回一个包含8个生肖的池，模拟最终推荐中使用的 special_zodiacs + 最近3期特别号生肖"""
+    # 基础四肖（使用当前 four_boost 参数）
+    base_four = pred_four(hist, params['four_boost'])
+    # 补充近期高频生肖
+    specials_hist = [r[2] for r in hist]
+    recent_zodiacs = [get_zodiac(sp) for sp in specials_hist[-8:]]
     zodiac_freq = Counter(recent_zodiacs)
-    specials_hist = [r[2] for r in hist[:30]]
-    omission_zodiac = {z: 0 for z in ZODIAC_MAP}
-    for idx, sp in enumerate(specials_hist):
-        z = get_zodiac(sp)
-        if omission_zodiac[z] == 0:
-            omission_zodiac[z] = idx + 1
-    sorted_omit = sorted(omission_zodiac.items(), key=lambda x: -x[1])
     extra_freq = [z for z, _ in zodiac_freq.most_common(3) if z not in base_four][:2]
+
+    # 遗漏生肖
+    omission_z = {z: 0 for z in ZODIAC_MAP}
+    for idx, sp in enumerate(specials_hist[::-1]):
+        z = get_zodiac(sp)
+        if omission_z[z] == 0:
+            omission_z[z] = idx + 1
+    sorted_omit = sorted(omission_z.items(), key=lambda x: -x[1])
     extra_cold = [z for z, _ in sorted_omit if z not in base_four and z not in extra_freq][:2]
-    last3_zodiacs = [get_zodiac(r[2]) for r in hist[:3]]
-    latest_main = hist[0][1]
-    main_counter = Counter(get_zodiac(n) for n in latest_main)
-    top_main = main_counter.most_common(1)[0][0] if main_counter else None
-    zodiac_pool = base_four + extra_freq + extra_cold + last3_zodiacs + ([top_main] if top_main else [])
+
+    # 最近3期特别号生肖
+    last3 = [get_zodiac(r[2]) for r in hist[-3:]]
+
+    union = base_four + extra_freq + extra_cold + last3
     seen = set()
-    final_pool = []
-    for z in zodiac_pool:
+    pool = []
+    for z in union:
         if z not in seen:
             seen.add(z)
-            final_pool.append(z)
-    while len(final_pool) < 8:
-        for z in ZODIAC_MAP:
-            if z not in final_pool:
-                final_pool.append(z)
-            if len(final_pool) >= 8:
-                break
-    return final_pool[:8]
+            pool.append(z)
+    # 补足8个
+    for z in ZODIAC_MAP:
+        if len(pool) >= 8:
+            break
+        if z not in pool:
+            pool.append(z)
+    return pool[:8]
 
-# ---- 评估函数 ----
+# ------ 评估函数 ------
 def evaluate(issues, params):
     total = len(issues)
-    if total < 15:
-        return -999.0, 0,0,0,0,0,0,0
+    if total < 15: return -999.0, 0,0,0,0,0,0,0
     recent10_start = max(0, total - 10)
     single_hits = two_hits = four_hits = special_hits = 0
     single_streak = two_streak = four_streak = special_streak = 0
@@ -218,15 +236,14 @@ def evaluate(issues, params):
         if any(z in cur_zod for z in four): four_hits += 1; four_streak = 0
         else: four_streak += 1; max_four = max(max_four, four_streak)
 
-        # 特别号：匹配主脚本的真实逻辑
-        zodiac_pool = build_zodiac_pool(past)
-        sp_picks = pred_special_from_history(past, zodiac_pool, params, top_n=3)
+        # 特别号（使用与主脚本完全一样的算法）
+        zodiac_pool = build_zodiac_pool(past, params)
+        sp_picks = pred_special_online(past, zodiac_pool, params, top_n=3)
         if cur_sp in sp_picks: special_hits += 1; special_streak = 0
         else: special_streak += 1; max_special = max(max_special, special_streak)
 
     n = total - recent10_start
-    if n == 0:
-        return -999.0, 0,0,0,0,0,0,0
+    if n == 0: return -999.0, 0,0,0,0,0,0,0
     r1 = single_hits / n
     r2 = two_hits / n
     r4 = four_hits / n
@@ -251,12 +268,12 @@ def objective(trial, issues):
         'rec_w': trial.suggest_float('rec_w', 0.1, 4.0),
         'safe_th': trial.suggest_float('safe_th', 0.4, 2.5),
         'four_boost': trial.suggest_float('four_boost', 0.3, 6.0),
-        # 特别号参数（尽管当前使用的主逻辑是固定规则，但保留以供将来扩展）
         'cold_threshold': trial.suggest_int('cold_threshold', 8, 18),
         'neighbor_1_bonus': trial.suggest_float('neighbor_1_bonus', 2.0, 10.0),
         'neighbor_2_bonus': trial.suggest_float('neighbor_2_bonus', 0.0, 5.0),
+        'penalty_coeff': trial.suggest_float('penalty_coeff', 0.5, 1.0),
         'lgb_weight': trial.suggest_float('lgb_weight', 0.3, 1.0),
-        'omit_boost': trial.suggest_float('omit_boost', 1.0, 5.0),
+        'four_omit_boost': trial.suggest_float('four_omit_boost', 1.0, 5.0),
     }
     score, _, _, _, _, _, _, _, _ = evaluate(issues, p)
     return score
