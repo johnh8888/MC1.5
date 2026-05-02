@@ -67,7 +67,6 @@ except ImportError:
 def safe_get_hmm_state_proba(conn):
     try:
         from hmm_features import get_hmm_state_proba  # 澳门用这个
-        # from hmm_features_hk import get_hmm_state_proba  # 香港用这个
         return get_hmm_state_proba(conn)
     except Exception:
         return None
