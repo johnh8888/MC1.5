@@ -3706,21 +3706,21 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
 
-    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=16)
+    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20)
     print("\n单生肖复盘（最近20期，命中1只即算命中）:")
     print(
         f"  - 最近样本={int(zodiac_report['samples'])}期 "
         f"命中率={zodiac_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_report['max_miss_streak'])}"
     )
-    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=20, history_window=16)
+    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=20)
     print("双生肖复盘（最近20期，任中1只即算命中）:")
     print(
         f"  - 最近样本={int(zodiac_two_report['samples'])}期 "
         f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
-    zodiac_two_strict_report = get_recent_two_zodiac_report(conn, lookback=20, history_window=16)
+    zodiac_two_strict_report = get_recent_two_zodiac_report(conn, lookback=20)
     print("双生肖复盘（最近20期，二中二）:")
     print(
         f"  - 最近样本={int(zodiac_two_strict_report['samples'])}期 "
