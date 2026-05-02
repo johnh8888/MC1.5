@@ -27,7 +27,7 @@ jobs:
         with:
           path: |
             newmacau_marksix.db
-            optuna_macau_any2.db          # ← 匹配优化器中的数据库名
+            optuna_macau_r2_90.db
             lstm_zodiac.h5
             lstm_seq_len.txt
             hmm_zodiac.pkl
@@ -64,7 +64,7 @@ jobs:
             git push || true
           fi
 
-      - name: 长时优化
+      - name: 长时优化（专攻二肖90%）
         shell: bash
         run: |
           set +e
@@ -74,7 +74,7 @@ jobs:
             STATUS=$?
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add best_params_zodiac.json optuna_macau_any2.db 2>/dev/null
+            git add best_params_zodiac.json optuna_macau_r2_90.db 2>/dev/null
             git commit -m "自动优化第${i}轮 [skip ci]" 2>/dev/null
             git push 2>/dev/null
             if [ $STATUS -eq 0 ]; then
@@ -96,6 +96,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add best_params_zodiac.json optuna_macau_any2.db report.txt newmacau_marksix.db lstm_zodiac.h5 lstm_seq_len.txt hmm_zodiac.pkl 2>/dev/null
+          git add best_params_zodiac.json optuna_macau_r2_90.db report.txt newmacau_marksix.db lstm_zodiac.h5 lstm_seq_len.txt hmm_zodiac.pkl 2>/dev/null
           git commit -m "澳门彩进化结果 [skip ci]" 2>/dev/null
           git push 2>/dev/null
