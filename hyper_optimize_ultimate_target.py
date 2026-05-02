@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""澳门彩优化器：近10期 一生肖≥70% 二肖(任中1)≥80% 四肖≥95% 连空≤1（软性惩罚）"""
+"""澳门彩优化器：近10期 一生肖≥70% 二肖(任1)≥90% 四肖≥90% 连空≤1（专攻二肖版）"""
 import sqlite3, json, sys, argparse
 from collections import Counter
 import optuna
@@ -92,11 +92,8 @@ def evaluate(issues, params):
         if s in cur_zod: single_hits += 1; single_streak = 0
         else: single_streak += 1; max_single_streak = max(max_single_streak, single_streak)
         two = pred_two(past)
-        # ★ 改为“任中一个”即命中
-        if any(z in cur_zod for z in two):
-            two_hits += 1; two_streak = 0
-        else:
-            two_streak += 1; max_two_streak = max(max_two_streak, two_streak)
+        if any(z in cur_zod for z in two): two_hits += 1; two_streak = 0
+        else: two_streak += 1; max_two_streak = max(max_two_streak, two_streak)
         four = pred_four(past, params['four_boost'])
         if any(z in cur_zod for z in four): four_hits += 1; four_streak = 0
         else: four_streak += 1; max_four_streak = max(max_four_streak, four_streak)
@@ -107,16 +104,17 @@ def evaluate(issues, params):
     r4 = four_hits / n
     max_strk = max(max_single_streak, max_two_streak, max_four_streak)
 
-    # 软性连空惩罚
+    # 软性连空惩罚（同前）
     streak_factor = 1.0
     if max_strk >= 4: streak_factor = 0.3
     elif max_strk == 3: streak_factor = 0.6
     elif max_strk == 2: streak_factor = 0.85
 
-    score = r1 * 0.4 + r2 * 0.4 + r4 * 0.2
+    # ★ 大幅提高二肖权重，并提升目标到 0.90
+    score = r1 * 0.25 + r2 * 0.55 + r4 * 0.20
     if r1 < 0.70: score *= 0.85
-    if r2 < 0.80: score *= 0.85   # 二中一很容易达到80%
-    if r4 < 0.95: score *= 0.90
+    if r2 < 0.90: score *= 0.75   # 不达标更重扣分
+    if r4 < 0.90: score *= 0.90
     return score * streak_factor, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
 
 def objective(trial, issues):
@@ -142,8 +140,8 @@ def main():
 
     study = optuna.create_study(
         direction='maximize',
-        study_name='macau_any2_070',
-        storage='sqlite:///optuna_macau_any2.db',
+        study_name='macau_r2_90',
+        storage='sqlite:///optuna_macau_r2_90.db',   # 新数据库
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=42)
     )
@@ -155,7 +153,7 @@ def main():
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
 
-    if r1 >= 0.70 and r2 >= 0.80 and r4 >= 0.95 and max(ms1, ms2, ms4) <= 1:
+    if r2 >= 0.90 and r1 >= 0.70 and r4 >= 0.90 and max(ms1, ms2, ms4) <= 1:
         print("🎉 达标！")
         sys.exit(0)
     else:
