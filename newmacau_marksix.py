@@ -63,16 +63,11 @@ try:
 except ImportError:
     predict_lstm_proba = None
 
-try:
-    from hmm_features import get_hmm_state_proba
-except ImportError:
-    get_hmm_state_proba = None
-
-
+# 安全包装 HMM 预测，避免缺少 hmmlearn 时崩溃
 def safe_get_hmm_state_proba(conn):
-    if not get_hmm_state_proba:
-        return None
     try:
+        from hmm_features import get_hmm_state_proba  # 澳门用这个
+        # from hmm_features_hk import get_hmm_state_proba  # 香港用这个
         return get_hmm_state_proba(conn)
     except Exception:
         return None
@@ -2375,7 +2370,7 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) ->
             for z in zodiac_scores:
                 zodiac_scores[z] = (1 - two_lstm_w) * zodiac_scores[z] + two_lstm_w * lstm_probs.get(z, 0.0)
 
-    if conn and get_hmm_state_proba and hmm_weight > 0.01:
+    if conn and hmm_weight > 0.01:
         hmm_probs = safe_get_hmm_state_proba(conn)
         if hmm_probs:
             for z in zodiac_scores:
@@ -2417,7 +2412,7 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
             for z in zodiac_scores:
                 zodiac_scores[z] = (1 - three_lstm_w) * zodiac_scores[z] + three_lstm_w * lstm_probs.get(z, 0.0)
 
-    if conn and get_hmm_state_proba and hmm_weight > 0.01:
+    if conn and hmm_weight > 0.01:
         hmm_probs = safe_get_hmm_state_proba(conn)
         if hmm_probs:
             for z in zodiac_scores:
@@ -2461,7 +2456,7 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
                 omission[z] *= (1 - lstm_weight * lstm_probs.get(z, 0.0))
 
     # HMM 调整遗漏值
-    if conn and get_hmm_state_proba and hmm_weight > 0.01:
+    if conn and hmm_weight > 0.01:
         hmm_probs = safe_get_hmm_state_proba(conn)
         if hmm_probs:
             for z in omission:
@@ -2528,8 +2523,8 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None)
             for z in scores:
                 scores[z] = (1 - lstm_weight) * scores[z] + lstm_weight * lstm_probs.get(z, 0.0)
 
-    if conn and get_hmm_state_proba and hmm_weight > 0.01:
-        hmm_probs = get_hmm_state_proba(conn)
+    if conn and hmm_weight > 0.01:
+        hmm_probs = safe_get_hmm_state_proba(conn)
         if hmm_probs:
             for z in scores:
                 scores[z] = (1 - hmm_weight) * scores[z] + hmm_weight * hmm_probs.get(z, 0.0)
