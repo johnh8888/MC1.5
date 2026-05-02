@@ -508,6 +508,10 @@ def main():
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
 
+    # 关闭 Optuna 的 trial 日志输出
+    import optuna.logging
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
     conn = connect_db(args.db)
     issues = load_issues(conn, recent=args.recent)
     conn.close()
@@ -522,7 +526,8 @@ def main():
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=42)
     )
-    study.optimize(lambda t: objective(t, issues), n_trials=args.trials, show_progress_bar=True)
+    # 不显示进度条
+    study.optimize(lambda t: objective(t, issues), n_trials=args.trials, show_progress_bar=False)
 
     best_p = study.best_params
     score, r1, r2, r4, rsp, ms1, ms2, ms4, mssp = evaluate(issues, best_p, debug=args.debug)
