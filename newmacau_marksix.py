@@ -67,6 +67,7 @@ except ImportError:
 def safe_get_hmm_state_proba(conn):
     try:
         from hmm_features import get_hmm_state_proba  # 澳门用这个
+        # from hmm_features_hk import get_hmm_state_proba  # 香港用这个
         return get_hmm_state_proba(conn)
     except Exception:
         return None
@@ -2767,13 +2768,18 @@ def get_precise_specials(conn, zodiac_pool, top_n=3):
     if not zodiac_pool:
         return []
 
-    params = load_best_params()
-    cold_threshold = params.get("cold_threshold", 11) if params else 11
-    neighbor_1_bonus = params.get("neighbor_1_bonus", 6.918) if params else 6.918
-    neighbor_2_bonus = params.get("neighbor_2_bonus", 0.514) if params else 0.514
-    penalty_coeff = params.get("penalty_coeff", 0.76) if params else 0.76
-    lgb_weight = params.get("lgb_weight", 0.6146) if params else 0.6146
-    omit_boost = params.get("four_omit_boost", 2.578) if params else 2.578
+    params = load_best_zodiac_params()
+    cold_threshold = int(params.get("cold_threshold", 11))
+    neighbor_1_bonus = float(params.get("neighbor_1_bonus", 6.918))
+    neighbor_2_bonus = float(params.get("neighbor_2_bonus", 0.514))
+    penalty_coeff = float(params.get("penalty_coeff", 0.76))
+    lgb_weight = float(params.get("lgb_weight", 0.6146))
+    omit_boost = float(params.get("four_omit_boost", 2.578))
+    lstm_weight = float(params.get("lstm_weight", 0.3))
+    lstm_seq_len = int(params.get("lstm_seq_len", 30))
+    hmm_weight = float(params.get("hmm_weight", 0.2))
+    precise_lstm_weight = float(params.get("precise_lstm_weight", lstm_weight))
+    precise_hmm_weight = float(params.get("precise_hmm_weight", hmm_weight))
 
     # 拉取最近特别号，应用 PREDICT_LAG 跳过最新一期
     recent_rows = conn.execute(
