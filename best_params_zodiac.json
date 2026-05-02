@@ -1,17 +1,6 @@
 {
-  "wsize": 6,
-  "rec_w": 2.070657987147601,
-  "safe_th": 1.837056383662439,
-  "four_boost": 3.4244642726799155,
-  "lstm_weight": 0.31272418362162674,
-  "lstm_seq_len": 60,
-  "sp_cold_threshold": 10,
-  "sp_neighbor_bonus1": 7.435518509848009,
-  "sp_neighbor_bonus2": 0.9949570865675001,
-  "sp_recent_penalty": 0.35219974312398533,
-  "sp_lstm_weight": 0.6182216988501988,
-  "two_lstm_weight": 0.7752380077204056,
-  "two_hmm_weight": 0.12582503744175552,
-  "three_lstm_weight": 0.2167906323453642,
-  "three_hmm_weight": 0.43540022752569146
+  "wsize": 2,
+  "rec_w": 1.1328000508666023,
+  "safe_th": 2.3193364832226004,
+  "four_boost": 5.009062041908493
 }
