@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """澳门彩终极优化器：近10期 一肖≥90% 二肖≥90% 四肖≥95% 连空≤1"""
-import sqlite3, json, sys, argparse, random
+import sqlite3, json, sys, argparse
 from collections import Counter
 import optuna
 
@@ -10,7 +10,6 @@ ZODIAC_MAP = {
     "鼠": [7, 19, 31, 43], "猪": [8, 20, 32, 44], "狗": [9, 21, 33, 45],
     "鸡": [10, 22, 34, 46], "猴": [11, 23, 35, 47], "羊": [12, 24, 36, 48],
 }
-ALL_NUMS = list(range(1, 50))
 
 def get_zodiac(n):
     for z, ns in ZODIAC_MAP.items():
@@ -26,7 +25,6 @@ def load_issues(conn, recent=60):
     rows = conn.execute("SELECT issue_no,draw_date,numbers_json,special_number FROM draws ORDER BY draw_date ASC").fetchall()
     return [(r["issue_no"], json.loads(r["numbers_json"]), int(r["special_number"])) for r in rows[-recent:]]
 
-# ---------- 预测函数 ----------
 def pred_single(hist, wsize, rec_w, safe_th):
     scores = {z: 0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist) >= wsize else hist
@@ -75,7 +73,6 @@ def pred_four(hist, four_boost):
             if z not in picks: picks.append(z); break
     return picks[:4]
 
-# ---------- 评估函数（硬性连空惩罚） ----------
 def evaluate(issues, params):
     total = len(issues)
     if total < 15: return -999.0, 0,0,0,0,0,0
@@ -104,7 +101,6 @@ def evaluate(issues, params):
     r4 = four_hits / n
     max_strk = max(max_single_streak, max_two_streak, max_four_streak)
 
-    # 连空超过1，直接0分
     if max_strk > 1:
         return 0.0, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
 
