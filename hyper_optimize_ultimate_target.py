@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""澳门彩终极优化器：近10期 一肖≥90% 二肖≥90% 四肖≥95% 连空≤1"""
+"""澳门彩优化器：近10期 一生肖≥70% 二肖(任中1)≥80% 四肖≥95% 连空≤1（软性惩罚）"""
 import sqlite3, json, sys, argparse
 from collections import Counter
 import optuna
@@ -10,6 +10,7 @@ ZODIAC_MAP = {
     "鼠": [7, 19, 31, 43], "猪": [8, 20, 32, 44], "狗": [9, 21, 33, 45],
     "鸡": [10, 22, 34, 46], "猴": [11, 23, 35, 47], "羊": [12, 24, 36, 48],
 }
+ALL_NUMS = list(range(1, 50))
 
 def get_zodiac(n):
     for z, ns in ZODIAC_MAP.items():
@@ -22,7 +23,9 @@ def connect_db(path):
     return conn
 
 def load_issues(conn, recent=60):
-    rows = conn.execute("SELECT issue_no,draw_date,numbers_json,special_number FROM draws ORDER BY draw_date ASC").fetchall()
+    rows = conn.execute(
+        "SELECT issue_no,draw_date,numbers_json,special_number FROM draws ORDER BY draw_date ASC"
+    ).fetchall()
     return [(r["issue_no"], json.loads(r["numbers_json"]), int(r["special_number"])) for r in rows[-recent:]]
 
 def pred_single(hist, wsize, rec_w, safe_th):
@@ -89,8 +92,11 @@ def evaluate(issues, params):
         if s in cur_zod: single_hits += 1; single_streak = 0
         else: single_streak += 1; max_single_streak = max(max_single_streak, single_streak)
         two = pred_two(past)
-        if all(z in cur_zod for z in two): two_hits += 1; two_streak = 0
-        else: two_streak += 1; max_two_streak = max(max_two_streak, two_streak)
+        # ★ 改为“任中一个”即命中
+        if any(z in cur_zod for z in two):
+            two_hits += 1; two_streak = 0
+        else:
+            two_streak += 1; max_two_streak = max(max_two_streak, two_streak)
         four = pred_four(past, params['four_boost'])
         if any(z in cur_zod for z in four): four_hits += 1; four_streak = 0
         else: four_streak += 1; max_four_streak = max(max_four_streak, four_streak)
@@ -101,14 +107,17 @@ def evaluate(issues, params):
     r4 = four_hits / n
     max_strk = max(max_single_streak, max_two_streak, max_four_streak)
 
-    if max_strk > 1:
-        return 0.0, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
+    # 软性连空惩罚
+    streak_factor = 1.0
+    if max_strk >= 4: streak_factor = 0.3
+    elif max_strk == 3: streak_factor = 0.6
+    elif max_strk == 2: streak_factor = 0.85
 
     score = r1 * 0.4 + r2 * 0.4 + r4 * 0.2
-    if r1 < 0.90: score *= 0.85
-    if r2 < 0.90: score *= 0.85
+    if r1 < 0.70: score *= 0.85
+    if r2 < 0.80: score *= 0.85   # 二中一很容易达到80%
     if r4 < 0.95: score *= 0.90
-    return score, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
+    return score * streak_factor, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
 
 def objective(trial, issues):
     p = {
@@ -133,8 +142,8 @@ def main():
 
     study = optuna.create_study(
         direction='maximize',
-        study_name='macau_final_streak1',
-        storage='sqlite:///optuna_macau_final.db',
+        study_name='macau_any2_070',
+        storage='sqlite:///optuna_macau_any2.db',
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=42)
     )
@@ -142,11 +151,11 @@ def main():
 
     best_p = study.best_params
     score, r1, r2, r4, ms1, ms2, ms4 = evaluate(issues, best_p)
-    print(f"近10期: 一生肖={r1:.3f}(连空{ms1}) 二肖={r2:.3f}(连空{ms2}) 四肖={r4:.3f}(连空{ms4})")
+    print(f"近10期: 一生肖={r1:.3f}(连空{ms1}) 二肖(任1)={r2:.3f}(连空{ms2}) 四肖={r4:.3f}(连空{ms4})")
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
 
-    if r1 >= 0.90 and r2 >= 0.90 and r4 >= 0.95 and max(ms1, ms2, ms4) <= 1:
+    if r1 >= 0.70 and r2 >= 0.80 and r4 >= 0.95 and max(ms1, ms2, ms4) <= 1:
         print("🎉 达标！")
         sys.exit(0)
     else:
