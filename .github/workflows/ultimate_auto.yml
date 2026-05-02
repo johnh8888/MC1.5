@@ -8,7 +8,7 @@ on:
 jobs:
   auto-evolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 150     # 预留足够时间
+    timeout-minutes: 150
     permissions:
       contents: write
 
