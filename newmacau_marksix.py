@@ -2427,12 +2427,13 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
 def _get_four_zodiac_from_history_rows(rows, conn=None):
     if len(rows) < 3:
         return ["马", "蛇", "龙", "兔"]
-    params = load_best_zodiac_params()
-    four_boost = params.get("four_boost", 1.4221)
-    lstm_weight = params.get("lstm_weight", 0.3) if params else 0.3
-    lstm_seq_len = int(params.get("lstm_seq_len", 30)) if params else 30
 
-    # 计算遗漏（原有逻辑）
+    params = load_best_zodiac_params()
+    four_boost = float(params.get("four_boost", 1.4221))
+    lstm_weight = float(params.get("lstm_weight", 0.3))
+    lstm_seq_len = int(params.get("lstm_seq_len", 30))
+    hmm_weight = float(params.get("hmm_weight", 0.2))
+
     omission = {z: 0 for z in ZODIAC_MAP}
     specials = [int(row["special_number"]) for row in rows]
     zodiac_series = [get_zodiac_by_number(sp) for sp in specials]
@@ -2440,16 +2441,22 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
         if omission[z] == 0:
             omission[z] = idx + 1
 
-    # LSTM 概率融合
-    if conn is not None and predict_lstm_proba:
+    for z in omission:
+        omission[z] *= four_boost
+
+    # LSTM 调整遗漏值
+    if conn and predict_lstm_proba and lstm_weight > 0.01:
         lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
         if lstm_probs:
             for z in omission:
-                omission[z] = (1 - lstm_weight) * omission[z] + lstm_weight * lstm_probs.get(z, 0)
+                omission[z] *= (1 - lstm_weight * lstm_probs.get(z, 0.0))
 
-    # 遗漏分母缩小（体现 four_boost）
-    for z in omission:
-        omission[z] = omission[z] * four_boost
+    # HMM 调整遗漏值
+    if conn and get_hmm_state_proba and hmm_weight > 0.01:
+        hmm_probs = get_hmm_state_proba(conn)
+        if hmm_probs:
+            for z in omission:
+                omission[z] *= (1 - hmm_weight * hmm_probs.get(z, 0.0))
 
     sorted_cold = sorted(omission.items(), key=lambda x: (-x[1], x[0]))
     picks = [z for z, _ in sorted_cold[:3]]
