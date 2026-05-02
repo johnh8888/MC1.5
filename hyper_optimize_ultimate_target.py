@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""澳门彩近期高命中率优化器 v2（修复版）"""
+"""澳门彩终极优化器：近10期 一肖≥90% 二肖≥90% 四肖≥95% 连空≤1"""
 import sqlite3, json, sys, argparse, random
 from collections import Counter
 import optuna
@@ -75,7 +75,7 @@ def pred_four(hist, four_boost):
             if z not in picks: picks.append(z); break
     return picks[:4]
 
-# ---------- 评估函数（近10期） ----------
+# ---------- 评估函数（硬性连空惩罚） ----------
 def evaluate(issues, params):
     total = len(issues)
     if total < 15: return -999.0, 0,0,0,0,0,0
@@ -102,10 +102,16 @@ def evaluate(issues, params):
     r1 = single_hits / n
     r2 = two_hits / n
     r4 = four_hits / n
-    max_streak = max(max_single_streak, max_two_streak, max_four_streak)
-    score = (r1 + r2 + r4) / 3
-    if r1 < 0.90 or r2 < 0.90 or r4 < 0.95 or max_streak > 1:
-        score = -1000.0 + score
+    max_strk = max(max_single_streak, max_two_streak, max_four_streak)
+
+    # 连空超过1，直接0分
+    if max_strk > 1:
+        return 0.0, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
+
+    score = r1 * 0.4 + r2 * 0.4 + r4 * 0.2
+    if r1 < 0.90: score *= 0.85
+    if r2 < 0.90: score *= 0.85
+    if r4 < 0.95: score *= 0.90
     return score, r1, r2, r4, max_single_streak, max_two_streak, max_four_streak
 
 def objective(trial, issues):
@@ -129,12 +135,11 @@ def main():
     conn.close()
     if len(issues) < 20: sys.exit(1)
 
-    # ★ 修复：load_if_exists=True 允许断点续传
     study = optuna.create_study(
         direction='maximize',
-        study_name='macau_ultimate_target',
-        storage='sqlite:///optuna_macau_target.db',
-        load_if_exists=True,          # 关键修复
+        study_name='macau_final_streak1',
+        storage='sqlite:///optuna_macau_final.db',
+        load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=42)
     )
     study.optimize(lambda t: objective(t, issues), n_trials=args.trials, show_progress_bar=True)
@@ -146,10 +151,10 @@ def main():
         json.dump(best_p, f, indent=2)
 
     if r1 >= 0.90 and r2 >= 0.90 and r4 >= 0.95 and max(ms1, ms2, ms4) <= 1:
-        print("🎉 奇迹达标！")
+        print("🎉 达标！")
         sys.exit(0)
     else:
-        print("本次未达标，继续搜索。")
+        print("未达标，继续搜索。")
         sys.exit(1)
 
 if __name__ == "__main__":
