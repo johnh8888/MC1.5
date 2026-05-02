@@ -3,7 +3,7 @@ name: 澳门彩全自动进化
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'   # 每4小时
+    - cron: '0 */4 * * *'
 
 jobs:
   evolve:
