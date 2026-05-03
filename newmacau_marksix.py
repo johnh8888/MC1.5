@@ -315,6 +315,23 @@ def _strategy_single_last_special(rows, wsize, rec_w, safe_th):
         return get_zodiac_by_number(sp)
     return "马"
 
+
+def _strategy_single_cold_hot_mix(rows, wsize, rec_w, safe_th):
+    hot_scores = {z: 0.0 for z in ZODIAC_MAP}
+    cold_scores = {z: 0.0 for z in ZODIAC_MAP}
+    recent = rows[-wsize:] if len(rows) >= wsize else rows
+    for idx, r in enumerate(recent[::-1]):
+        nums = _row_numbers(r)
+        w = rec_w / (1.0 + idx * 0.1)
+        for n in nums:
+            hot_scores[get_zodiac_by_number(n)] += w
+    omission = _zodiac_omission_map_from_rows(rows)
+    max_om = max(omission.values()) if omission else 1
+    for z in cold_scores:
+        cold_scores[z] = omission.get(z, 0) / max_om if max_om > 0 else 0
+    combined = {z: (hot_scores[z] + cold_scores[z]) * 0.5 for z in ZODIAC_MAP}
+    return max(combined, key=combined.get)
+
 def _strategy_two_hot_cold(rows):
     specials = [_row_special(r) for r in rows[-10:]]
     hot_cnt = Counter([get_zodiac_by_number(sp) for sp in specials])
@@ -2340,6 +2357,12 @@ def _zodiac_omission_map(rows: Sequence[sqlite3.Row]) -> Dict[str, int]:
     return zodiac_omission
 
 
+def _zodiac_omission_map_from_rows(rows: Sequence[sqlite3.Row]) -> Dict[str, int]:
+    if not rows:
+        return {z: 0 for z in ZODIAC_MAP}
+    return _zodiac_omission_map(rows)
+
+
 def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0.08) -> Dict[str, float]:
     zodiac_scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
     omission_map = _zodiac_omission_map(rows)
@@ -2414,6 +2437,8 @@ def get_single_zodiac_pick(conn, issue_no, window=6):
         return _strategy_single_hot_main_only(rows, wsize, rec_w, safe_th)
     elif strat == "last_special":
         return _strategy_single_last_special(rows, wsize, rec_w, safe_th)
+    elif strat == "cold_hot_mix":
+        return _strategy_single_cold_hot_mix(rows, wsize, rec_w, safe_th)
     return _strategy_single_weighted(rows, wsize, rec_w, safe_th)
 
 
