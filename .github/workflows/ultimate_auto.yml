@@ -2,7 +2,7 @@ name: 澳门彩全自动进化 (120期+全策略搜索)
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # 每6小时自动执行
+    - cron: '0 */5 * * *'   # 每6小时自动执行
   workflow_dispatch:         # 允许手动触发
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
 
       - name: 全自动重置 + 获取最新120期 + 策略优化5000次
         run: |
-          python newmacau_marksix.py reset-and-auto --trials 5000
+          python newmacau_marksix.py reset-and-auto --trials 5000 2>&1 | tee report.txt
 
       - name: 提交结果（数据库、最佳参数、报告）
         if: always()
