@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-澳门六合彩全自动策略进化优化器（最终稳定版）
-移除 random_baseline，权重 0.20/0.20/0.20/0.40，带微小扰动
+澳门六合彩全自动策略进化优化器（四肖强化版）
+权重调整为：一生肖0.10 / 二肖0.20 / 四肖0.30 / 特别号0.40
+连空>1 额外打8.5折
 """
 import sqlite3, json, sys, argparse, random
 from collections import Counter
@@ -34,7 +35,6 @@ def load_issues(conn, recent=120):
     ).fetchall()
     return [(r["issue_no"], json.loads(r["numbers_json"]), int(r["special_number"])) for r in rows[-recent:]]
 
-# ---------- 基础工具 ----------
 def _zodiac_omission_map(rows):
     zod_omis = {z: len(rows)+1 for z in ZODIAC_MAP}
     for i, (_, nums, sp) in enumerate(rows):
@@ -57,7 +57,7 @@ def _build_zodiac_scores_from_rows(rows, decay=0.08):
         elif omit >= 3: scores[z] += omit/6.0
     return scores
 
-# ========== 一生肖策略 (6) ==========
+# ========== 一生肖策略 (7) 新增 cold_hot_mix ==========
 def single_weighted(hist, wsize, rec_w, safe_th):
     scores = {z:0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist)>=wsize else hist
@@ -99,6 +99,21 @@ def single_last_special(hist, wsize, rec_w, safe_th):
     if hist: return get_zodiac(hist[-1][2])
     return "马"
 
+def single_cold_hot_mix(hist, wsize, rec_w, safe_th):
+    """冷热混合：取纯热和纯冷的平均分"""
+    hot_scores = {z:0.0 for z in ZODIAC_MAP}
+    cold_scores = {z:0.0 for z in ZODIAC_MAP}
+    recent = hist[-wsize:] if len(hist)>=wsize else hist
+    for idx,(_,nums,sp) in enumerate(recent[::-1]):
+        w = rec_w/(1.0+idx*0.1)
+        for n in nums: hot_scores[get_zodiac(n)] += w
+    omission = _zodiac_omission_map(hist)
+    max_om = max(omission.values()) if omission else 1
+    for z in cold_scores:
+        cold_scores[z] = omission.get(z,0)/max_om if max_om>0 else 0
+    combined = {z: (hot_scores[z]+cold_scores[z])*0.5 for z in ZODIAC_MAP}
+    return max(combined, key=combined.get)
+
 STRATEGIES_SINGLE = {
     "weighted": single_weighted,
     "pure_hot": single_pure_hot,
@@ -106,6 +121,7 @@ STRATEGIES_SINGLE = {
     "hybrid": single_hybrid,
     "hot_main_only": single_hot_main_only,
     "last_special": single_last_special,
+    "cold_hot_mix": single_cold_hot_mix,
 }
 
 # ========== 二生肖策略 (6) ==========
@@ -211,7 +227,7 @@ STRATEGIES_FOUR = {
     "cold_main_only": four_cold_main_only,
 }
 
-# ========== 特别号策略 (7) 与主脚本完全一致 ==========
+# ========== 特别号策略 (7) ==========
 def special_cold_neighbor(hist, zodiac_pool, params, top_n=3):
     recent_specials = [row[2] for row in hist[-12:][::-1]]
     if not recent_specials: return [1,2,3]
@@ -349,7 +365,6 @@ def special_omit_break(hist, zodiac_pool, params, top_n=3):
     if nb1: return nb1[:top_n]
     return sorted(candidates,key=lambda n:omission.get(n,30),reverse=True)[:top_n]
 
-# 移除 random_baseline
 STRATEGIES_SPECIAL = {
     "cold_neighbor": special_cold_neighbor,
     "tail_focus": special_tail_focus,
@@ -360,7 +375,7 @@ STRATEGIES_SPECIAL = {
     "omit_break": special_omit_break,
 }
 
-# ========== 评估函数 (权重调整) ==========
+# ========== 评估函数（权重强化四肖） ==========
 def evaluate(issues, params, debug=False):
     total = len(issues)
     if total < 15: return -999.0, 0,0,0,0,0,0,0
@@ -374,39 +389,28 @@ def evaluate(issues, params, debug=False):
         cur_nums, cur_sp = issues[i][1], issues[i][2]
         cur_zod = set(get_zodiac(n) for n in cur_nums) | {get_zodiac(cur_sp)}
 
-        # 一生肖
         s_func = STRATEGIES_SINGLE[params['single_strategy']]
         s = s_func(past, params['wsize'], params['rec_w'], params['safe_th'])
         if s in cur_zod: single_hits+=1; s_st=0
         else: s_st+=1; max_s=max(max_s,s_st)
 
-        # 二生肖
         t_func = STRATEGIES_TWO[params['two_strategy']]
         two = t_func(past)
         if any(z in cur_zod for z in two): two_hits+=1; t_st=0
         else: t_st+=1; max_t=max(max_t,t_st)
 
-        # 四生肖 (针对特别号生肖)
         f_strat = params['four_strategy']
-        if f_strat == "boosted":
-            four = four_boosted(past, params['four_boost'])
-        elif f_strat == "momentum":
-            four = four_momentum(past, params.get('momentum_w',1.0))
-        elif f_strat == "hybrid":
-            four = four_hybrid(past, params['four_boost'], params.get('momentum_w',1.0))
-        elif f_strat == "top4_freq":
-            four = four_top4_freq(past)
-        elif f_strat == "cold_main_only":
-            four = four_cold_main_only(past)
-        else:
-            four = four_boosted(past, params['four_boost'])
-        # 四生肖命中标准：实际特别号生肖在预测的四肖中
+        if f_strat == "boosted": four = four_boosted(past, params['four_boost'])
+        elif f_strat == "momentum": four = four_momentum(past, params.get('momentum_w',1.0))
+        elif f_strat == "hybrid": four = four_hybrid(past, params['four_boost'], params.get('momentum_w',1.0))
+        elif f_strat == "top4_freq": four = four_top4_freq(past)
+        elif f_strat == "cold_main_only": four = four_cold_main_only(past)
+        else: four = four_boosted(past, params['four_boost'])
         actual_zod = get_zodiac(cur_sp)
         if actual_zod in four: four_hits+=1; f_st=0
         else: f_st+=1; max_f=max(max_f,f_st)
 
-        # 特别号 (3码精选)
-        base_four = four  # 用四肖作为基础
+        base_four = four
         last3_zodiacs = [get_zodiac(r[2]) for r in past[-3:]]
         enh_pool = list(dict.fromkeys(base_four + last3_zodiacs))
         while len(enh_pool) < 4:
@@ -417,11 +421,6 @@ def evaluate(issues, params, debug=False):
         if cur_sp in sp_picks: special_hits+=1; sp_st=0
         else: sp_st+=1; max_sp=max(max_sp,sp_st)
 
-        if debug and i>=recent10_start:
-            print(f"[调试] {issues[i][0]} 单:{params['single_strategy']} 二:{params['two_strategy']} "
-                  f"四:{params['four_strategy']} 特:{params['special_strategy']} | "
-                  f"预测特号:{sp_picks} 实际:{cur_sp} {'√' if cur_sp in sp_picks else '×'}")
-
     n = total - recent10_start
     if n==0: return -999.0,0,0,0,0,0,0,0
     r1 = single_hits/n
@@ -429,17 +428,23 @@ def evaluate(issues, params, debug=False):
     r4 = four_hits/n
     rsp = special_hits/n
     max_strk = max(max_s, max_t, max_f, max_sp)
+
+    # 权重：一生肖压到很低，四肖最高
+    score = r1*0.10 + r2*0.20 + r4*0.30 + rsp*0.40
+    if r1<0.70: score*=0.85
+    if r2<0.80: score*=0.85
+    if r4<0.85: score*=0.90
+    if rsp<0.50: score*=0.90
+
+    # 连空惩罚加重：任意连空 >1 打8.5折
+    if max_strk > 1:
+        score *= 0.85
+
     streak_factor = 1.0
     if max_strk>=4: streak_factor=0.2
     elif max_strk==3: streak_factor=0.5
     elif max_strk==2: streak_factor=0.8
 
-    # 调整权重：四肖和特别号权重提升
-    score = r1*0.20 + r2*0.20 + r4*0.20 + rsp*0.40
-    if r1<0.70: score*=0.80
-    if r2<0.80: score*=0.80
-    if r4<0.80: score*=0.90    # 放宽四肖阈值
-    if rsp<0.50: score*=0.90
     return score*streak_factor, r1, r2, r4, rsp, max_s, max_t, max_f, max_sp
 
 def objective(trial, issues):
@@ -461,7 +466,6 @@ def objective(trial, issues):
         'four_omit_boost': trial.suggest_float('four_omit_boost', 1.0, 5.0),
     }
     score, _,_,_,_,_,_,_,_ = evaluate(issues, p)
-    # 微小扰动，打破平局
     score += random.uniform(-0.03, 0.03)
     return score
 
@@ -479,8 +483,7 @@ def main():
     conn = connect_db(args.db)
     issues = load_issues(conn, recent=args.recent)
     conn.close()
-    if len(issues) < 20:
-        print("数据不足"); sys.exit(1)
+    if len(issues) < 20: print("数据不足"); sys.exit(1)
 
     study = optuna.create_study(
         direction='maximize',
@@ -493,10 +496,8 @@ def main():
 
     best_p = study.best_params
     score, r1, r2, r4, rsp, ms1, ms2, ms4, mssp = evaluate(issues, best_p, debug=args.debug)
-    print(f"\n最优策略: 单:{best_p['single_strategy']} 二:{best_p['two_strategy']} "
-          f"四:{best_p['four_strategy']} 特:{best_p['special_strategy']}")
-    print(f"近10期: 一生肖={r1:.3f}(连空{ms1}) 二肖={r2:.3f}(连空{ms2}) "
-          f"四肖={r4:.3f}(连空{ms4}) 特别号={rsp:.3f}(连空{mssp})")
+    print(f"\n最优策略: 单:{best_p['single_strategy']} 二:{best_p['two_strategy']} 四:{best_p['four_strategy']} 特:{best_p['special_strategy']}")
+    print(f"近10期: 一生肖={r1:.3f}(连空{ms1}) 二肖={r2:.3f}(连空{ms2}) 四肖={r4:.3f}(连空{ms4}) 特别号={rsp:.3f}(连空{mssp})")
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
 
