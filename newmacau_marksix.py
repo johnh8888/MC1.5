@@ -291,6 +291,30 @@ def _strategy_single_pure_cold(rows, wsize, rec_w, safe_th):
         omission[get_zodiac_by_number(sp)] = 0
     return max(omission.items(), key=lambda x: x[1])[0]
 
+def _strategy_single_hybrid(rows, wsize, rec_w, safe_th):
+    hot = _strategy_single_pure_hot(rows, wsize, rec_w, safe_th)
+    cold = _strategy_single_pure_cold(rows, wsize, rec_w, safe_th)
+    scores = {z: 0.0 for z in ZODIAC_MAP}
+    scores[hot] += 0.6
+    scores[cold] += 0.4
+    return max(scores, key=scores.get)
+
+def _strategy_single_hot_main_only(rows, wsize, rec_w, safe_th):
+    scores = {z: 0.0 for z in ZODIAC_MAP}
+    recent = rows[-wsize:] if len(rows) >= wsize else rows
+    for idx, r in enumerate(recent[::-1]):
+        nums = _row_numbers(r)
+        w = rec_w / (1.0 + idx * 0.1)
+        for n in nums:
+            scores[get_zodiac_by_number(n)] += w
+    return max(scores.items(), key=lambda x: x[1])[0]
+
+def _strategy_single_last_special(rows, wsize, rec_w, safe_th):
+    if rows:
+        sp = _row_special(rows[-1])
+        return get_zodiac_by_number(sp)
+    return "马"
+
 def _strategy_two_hot_cold(rows):
     specials = [_row_special(r) for r in rows[-10:]]
     hot_cnt = Counter([get_zodiac_by_number(sp) for sp in specials])
@@ -348,10 +372,37 @@ def _strategy_four_momentum(rows, momentum_w):
         scores[get_zodiac_by_number(sp)] += w * 1.5
     return [z for z, _ in sorted(scores.items(), key=lambda x: -x[1])[:4]]
 
+def _strategy_four_hybrid(rows, four_boost, momentum_w):
+    b = _strategy_four_boosted(rows, four_boost)
+    m = _strategy_four_momentum(rows, momentum_w)
+    union = list(dict.fromkeys(b + m))
+    return union[:4]
+
+def _strategy_four_top4_freq(rows, recent_n=12):
+    counter = Counter()
+    for r in rows[-recent_n:]:
+        nums = _row_numbers(r)
+        sp = _row_special(r)
+        for n in nums:
+            counter[get_zodiac_by_number(n)] += 1
+        counter[get_zodiac_by_number(sp)] += 1
+    return [z for z, _ in counter.most_common(4)]
+
+def _strategy_four_cold_main_only(rows, recent_n=20):
+    omission = {z: 0 for z in ZODIAC_MAP}
+    for i, r in enumerate(rows[-recent_n:]):
+        nums = _row_numbers(r)
+        for z in ZODIAC_MAP:
+            omission[z] = omission.get(z, i + 1)
+        for n in nums:
+            omission[get_zodiac_by_number(int(n))] = 0
+    sorted_cold = sorted(omission.items(), key=lambda x: -x[1])
+    return [z for z, _ in sorted_cold[:4]]
+
 def _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
     if not recent_specials: return [1, 2, 3]
-    latest_special = recent_specials[0]
+    latest = recent_specials[0]
     omission = {}
     for i, sp in enumerate(recent_specials):
         if sp not in omission: omission[sp] = i + 1
@@ -369,10 +420,10 @@ def _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n=3):
         if not remaining: break
         picks.append(max(remaining, key=lambda n: omission.get(n, 20)))
     if len(picks) < top_n:
-        neighbors = [n for n in candidates if abs(n - latest_special) == 1 and n not in picks]
+        neighbors = [n for n in candidates if abs(n - latest) == 1 and n not in picks]
         if neighbors: picks.append(max(neighbors, key=lambda n: omission.get(n, 20) + nb1))
     if len(picks) < top_n:
-        neighbors2 = [n for n in candidates if abs(n - latest_special) == 2 and n not in picks]
+        neighbors2 = [n for n in candidates if abs(n - latest) == 2 and n not in picks]
         if neighbors2: picks.append(max(neighbors2, key=lambda n: omission.get(n, 20) + nb2))
     while len(picks) < top_n:
         rest = sorted([n for n in candidates if n not in picks], key=lambda n: omission.get(n, 20), reverse=True)
@@ -390,7 +441,7 @@ def _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n=3):
 def _strategy_special_tail_focus(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
     if not recent_specials: return [1, 2, 3]
-    latest_special = recent_specials[0]
+    latest = recent_specials[0]
     tail_counter = Counter()
     for r in rows[-12:]:
         nums = _row_numbers(r)
@@ -401,11 +452,12 @@ def _strategy_special_tail_focus(rows, zodiac_pool, params, top_n=3):
     candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
     if not candidates: return [1, 2, 3]
     picks = []
-    last_tail = latest_special % 10
+    last_tail = latest % 10
     for t in [last_tail, (last_tail + 1) % 10, (last_tail - 1) % 10, *hot_tails]:
         tail_nums = [n for n in candidates if n % 10 == t and n not in picks]
         if tail_nums:
-            picks.append(max(tail_nums, key=lambda n: sum(1 for r in rows[-20:] if n in _row_numbers(r) or n == _row_special(r))))
+            pick = max(tail_nums, key=lambda n: sum(1 for r in rows[-20:] if n in (_row_numbers(r)) or n == _row_special(r)))
+            picks.append(pick)
         if len(picks) >= top_n: break
     while len(picks) < top_n:
         rest = [n for n in candidates if n not in picks]
@@ -423,23 +475,19 @@ def _strategy_special_omission_only(rows, zodiac_pool, params, top_n=3):
     if not candidates: return [1, 2, 3]
     return sorted(candidates, key=lambda n: omission.get(n, 30), reverse=True)[:top_n]
 
-# ========== 新增特别号策略（与优化器同步） ==========
 def _strategy_special_zone_bias(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
     if not recent_specials: return [1, 2, 3]
-    zones = {"low":0,"mid":0,"high":0}
+    zones = {"low": 0, "mid": 0, "high": 0}
     for sp in recent_specials:
         if sp <= 19: zones["low"] += 1
         elif sp <= 39: zones["mid"] += 1
         else: zones["high"] += 1
     target_zone = min(zones, key=zones.get)
     candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
-    if target_zone == "low":
-        candidates = [n for n in candidates if n <= 19]
-    elif target_zone == "mid":
-        candidates = [n for n in candidates if 20 <= n <= 39]
-    else:
-        candidates = [n for n in candidates if n >= 40]
+    if target_zone == "low": candidates = [n for n in candidates if n <= 19]
+    elif target_zone == "mid": candidates = [n for n in candidates if 20 <= n <= 39]
+    else: candidates = [n for n in candidates if n >= 40]
     if not candidates: return [1, 2, 3]
     omission = {}
     for i, sp in enumerate(recent_specials):
@@ -491,12 +539,15 @@ def _strategy_special_omit_break(rows, zodiac_pool, params, top_n=3):
     if nb1: return nb1[:top_n]
     return sorted(candidates, key=lambda n: omission.get(n, 30), reverse=True)[:top_n]
 
-def _strategy_special_random_baseline(rows, zodiac_pool, params, top_n=3):
-    import random
-    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
-    if not candidates: return [1, 2, 3]
-    random.shuffle(candidates)
-    return candidates[:top_n]
+STRATEGIES_SPECIAL = {
+    "cold_neighbor": _strategy_special_cold_neighbor,
+    "tail_focus": _strategy_special_tail_focus,
+    "omission_only": _strategy_special_omission_only,
+    "zone_bias": _strategy_special_zone_bias,
+    "neighbor_tail": _strategy_special_neighbor_tail,
+    "mixed_2cold1hot": _strategy_special_mixed_2cold1hot,
+    "omit_break": _strategy_special_omit_break,
+}
 
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 
@@ -2485,9 +2536,30 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
         return _strategy_four_top4_freq(rows)
     elif strat == "cold_main_only":
         return _strategy_four_cold_main_only(rows)
-    else:
-        four_boost = float(params.get("four_boost", 1.4221))
-        return _strategy_four_boosted(rows, four_boost)
+    four_boost = float(params.get("four_boost", 1.4221))
+    return _strategy_four_boosted(rows, four_boost)
+
+
+def get_recent_texiao5_report(conn: sqlite3.Connection, lookback: int = 20) -> Dict[str, float]:
+    rows = conn.execute(
+        "SELECT issue_no, picks_json, special_hit FROM special_picks_log ORDER BY id DESC LIMIT ?",
+        (lookback,),
+    ).fetchall()
+    if not rows:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    hits = 0
+    miss_streak = 0
+    max_miss = 0
+    for row in rows:
+        hit = int(row["special_hit"] or 0)
+        hits += hit
+        if hit == 0:
+            miss_streak += 1
+            max_miss = max(max_miss, miss_streak)
+        else:
+            miss_streak = 0
+    samples = len(rows)
+    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss)}
 
 
 # 兼容旧调用：特别生肖统计暂时复用四生肖核心逻辑
@@ -2759,24 +2831,10 @@ def get_precise_specials_for_issue(conn, issue_no, zodiac_pool, top_n=3):
     if not rows:
         return list(ZODIAC_MAP.get(zodiac_pool[0], []))[:top_n]
 
-    if strat == "cold_neighbor":
-        return _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n)
-    elif strat == "tail_focus":
-        return _strategy_special_tail_focus(rows, zodiac_pool, params, top_n)
-    elif strat == "omission_only":
-        return _strategy_special_omission_only(rows, zodiac_pool, params, top_n)
-    elif strat == "zone_bias":
-        return _strategy_special_zone_bias(rows, zodiac_pool, params, top_n)
-    elif strat == "neighbor_tail":
-        return _strategy_special_neighbor_tail(rows, zodiac_pool, params, top_n)
-    elif strat == "mixed_2cold1hot":
-        return _strategy_special_mixed_2cold1hot(rows, zodiac_pool, params, top_n)
-    elif strat == "omit_break":
-        return _strategy_special_omit_break(rows, zodiac_pool, params, top_n)
-    elif strat == "random_baseline":
-        return _strategy_special_random_baseline(rows, zodiac_pool, params, top_n)
-    else:
-        return _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n)
+    handler = STRATEGIES_SPECIAL.get(strat, _strategy_special_cold_neighbor)
+    return handler(rows, zodiac_pool, params, top_n)
+
+
 def _get_longest_omitted_numbers(conn, limit=6):
     all_draws = conn.execute("SELECT numbers_json FROM draws ORDER BY draw_date DESC").fetchall()
     omission = {n: 0 for n in ALL_NUMBERS}
@@ -3464,11 +3522,13 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
     zodiac_report = get_recent_single_zodiac_report(conn, lookback=10)
     zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=10)
     zodiac_four_report = get_recent_four_zodiac_report(conn, lookback=10, history_window=16)
+    texiao5_report = get_recent_texiao5_report(conn, lookback=10)
     print(
         f"近10期: 一生肖={zodiac_report['hit_rate']:.3f}(连空{int(zodiac_report['max_miss_streak'])}) "
         f"二肖(任1)={zodiac_two_report['hit_rate']:.3f}(连空{int(zodiac_two_report['max_miss_streak'])}) "
         f"四肖={zodiac_four_report['hit_rate']:.3f}(连空{int(zodiac_four_report['max_miss_streak'])})"
     )
+    print(f"特五肖(仅特别号) 近10期命中率: {texiao5_report['hit_rate']:.3f} 最大连空{int(texiao5_report['max_miss_streak'])}")
     if zodiac_report['hit_rate'] >= 0.9 and zodiac_two_report['hit_rate'] >= 0.8 and zodiac_four_report['hit_rate'] >= 1.0:
         print("🎉 达标！")
 
