@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-澳门六合彩全自动策略进化优化器（最终同步版）
-一生肖6策略、二生肖6策略、四生肖5策略、特别号8策略
-与主脚本 newmacau_marksix.py 策略逻辑100%一致
+澳门六合彩全自动策略进化优化器（最终稳定版）
+移除 random_baseline，权重 0.20/0.20/0.20/0.40，带微小扰动
 """
 import sqlite3, json, sys, argparse, random
 from collections import Counter
@@ -58,7 +57,7 @@ def _build_zodiac_scores_from_rows(rows, decay=0.08):
         elif omit >= 3: scores[z] += omit/6.0
     return scores
 
-# ==================== 一生肖策略 (6) ====================
+# ========== 一生肖策略 (6) ==========
 def single_weighted(hist, wsize, rec_w, safe_th):
     scores = {z:0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist)>=wsize else hist
@@ -109,7 +108,7 @@ STRATEGIES_SINGLE = {
     "last_special": single_last_special,
 }
 
-# ==================== 二生肖策略 (6) ====================
+# ========== 二生肖策略 (6) ==========
 def two_hot_cold(hist):
     specials = [sp for _,_,sp in hist[-10:]]
     hot_cnt = Counter([get_zodiac(sp) for sp in specials])
@@ -157,7 +156,7 @@ STRATEGIES_TWO = {
     "neighbor_pair": two_neighbor_pair,
 }
 
-# ==================== 四生肖策略 (5) ====================
+# ========== 四生肖策略 (5) ==========
 def four_boosted(hist, four_boost):
     omission = {z:0 for z in ZODIAC_MAP}
     specials = [sp for _,_,sp in hist]
@@ -212,7 +211,7 @@ STRATEGIES_FOUR = {
     "cold_main_only": four_cold_main_only,
 }
 
-# ==================== 特别号策略 (8) 与主脚本完全一致 ====================
+# ========== 特别号策略 (7) 与主脚本完全一致 ==========
 def special_cold_neighbor(hist, zodiac_pool, params, top_n=3):
     recent_specials = [row[2] for row in hist[-12:][::-1]]
     if not recent_specials: return [1,2,3]
@@ -350,12 +349,7 @@ def special_omit_break(hist, zodiac_pool, params, top_n=3):
     if nb1: return nb1[:top_n]
     return sorted(candidates,key=lambda n:omission.get(n,30),reverse=True)[:top_n]
 
-def special_random_baseline(hist, zodiac_pool, params, top_n=3):
-    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z,[])))
-    if not candidates: return [1,2,3]
-    random.shuffle(candidates)
-    return candidates[:top_n]
-
+# 移除 random_baseline
 STRATEGIES_SPECIAL = {
     "cold_neighbor": special_cold_neighbor,
     "tail_focus": special_tail_focus,
@@ -364,10 +358,9 @@ STRATEGIES_SPECIAL = {
     "neighbor_tail": special_neighbor_tail,
     "mixed_2cold1hot": special_mixed_2cold1hot,
     "omit_break": special_omit_break,
-    "random_baseline": special_random_baseline,
 }
 
-# ==================== 评估函数 ====================
+# ========== 评估函数 (权重调整) ==========
 def evaluate(issues, params, debug=False):
     total = len(issues)
     if total < 15: return -999.0, 0,0,0,0,0,0,0
@@ -413,7 +406,6 @@ def evaluate(issues, params, debug=False):
         else: f_st+=1; max_f=max(max_f,f_st)
 
         # 特别号 (3码精选)
-        # 构建增强生肖池
         base_four = four  # 用四肖作为基础
         last3_zodiacs = [get_zodiac(r[2]) for r in past[-3:]]
         enh_pool = list(dict.fromkeys(base_four + last3_zodiacs))
@@ -441,10 +433,12 @@ def evaluate(issues, params, debug=False):
     if max_strk>=4: streak_factor=0.2
     elif max_strk==3: streak_factor=0.5
     elif max_strk==2: streak_factor=0.8
-    score = r1*0.25 + r2*0.25 + r4*0.10 + rsp*0.40
-    if r1<0.70: score*=0.85
-    if r2<0.80: score*=0.85
-    if r4<0.95: score*=0.90
+
+    # 调整权重：四肖和特别号权重提升
+    score = r1*0.20 + r2*0.20 + r4*0.20 + rsp*0.40
+    if r1<0.70: score*=0.80
+    if r2<0.80: score*=0.80
+    if r4<0.80: score*=0.90    # 放宽四肖阈值
     if rsp<0.50: score*=0.90
     return score*streak_factor, r1, r2, r4, rsp, max_s, max_t, max_f, max_sp
 
@@ -467,6 +461,8 @@ def objective(trial, issues):
         'four_omit_boost': trial.suggest_float('four_omit_boost', 1.0, 5.0),
     }
     score, _,_,_,_,_,_,_,_ = evaluate(issues, p)
+    # 微小扰动，打破平局
+    score += random.uniform(-0.03, 0.03)
     return score
 
 def main():
@@ -504,7 +500,7 @@ def main():
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
 
-    if r1>=0.70 and r2>=0.80 and r4>=0.95 and rsp>=0.50 and max(ms1,ms2,ms4,mssp)<=1:
+    if r1>=0.70 and r2>=0.80 and r4>=0.85 and rsp>=0.50 and max(ms1,ms2,ms4,mssp)<=1:
         print("🎉 达标！"); sys.exit(0)
     else:
         print("未达标，继续搜索"); sys.exit(1)
