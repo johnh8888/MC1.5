@@ -1,19 +1,16 @@
-name: 澳门彩全自动进化 (120期+全策略搜索)
+name: 澳门彩全自动预测
 
 on:
   schedule:
-    - cron: '0 */5 * * *'   # 每6小时自动执行
-  workflow_dispatch:         # 允许手动触发
+    # 每天 UTC 时间 00:30 运行（北京时间 08:30）
+    - cron: '30 0 * * *'
+  workflow_dispatch:   # 允许手动触发
 
 jobs:
-  auto-evolve:
+  auto-predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 200     # 预留充足时间给5000次试验+回测
-    permissions:
-      contents: write
-
     steps:
-      - name: 检出仓库
+      - name: 检出代码
         uses: actions/checkout@v4
 
       - name: 设置 Python
@@ -24,18 +21,27 @@ jobs:
       - name: 安装依赖
         run: |
           pip install --upgrade pip
-          pip install optuna numpy hmmlearn xgboost lightgbm tensorflow
-          pip install -r requirements.txt || true
+          pip install -r requirements.txt
+          # 额外安装 optuna（如果未在 requirements 中）
+          pip install optuna
 
-      - name: 全自动重置 + 获取最新120期 + 策略优化5000次
-        run: |
-          python newmacau_marksix.py reset-and-auto --trials 5000 2>&1 | tee report.txt
+      - name: 运行全自动优化（可选，耗时较长）
+        # 如果想每次重新优化，取消下面注释；否则使用现有参数。
+        # run: python newmacau_marksix.py auto-optimize --n-trials 100
+        run: echo "跳过优化，使用已有 best_params_zodiac.json"
 
-      - name: 提交结果（数据库、最佳参数、报告）
-        if: always()
+      - name: 同步数据并预测
+        run: python newmacau_marksix.py sync --with-backtest
+
+      - name: 生成推荐报告
+        run: python newmacau_marksix.py show > report.txt
+
+      - name: 提交结果到仓库
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f newmacau_marksix.db best_params_zodiac.json optuna_macau_stable.db report.txt 2>/dev/null || true
-          git commit -m "自动优化结果 [skip ci]" || true
-          git push || true
+          git add newmacau_marksix.db best_params_zodiac.json report.txt
+          git commit -m "自动预测报告 $(date +'%Y-%m-%d')" || echo "无变化"
+          git push
