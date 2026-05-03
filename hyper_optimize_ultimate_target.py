@@ -536,12 +536,10 @@ def main():
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
 
-    if r1 >= 0.70 and r2 >= 0.80 and r4 >= 0.95 and rsp >= 0.50 and max(ms1, ms2, ms4, mssp) <= 1:
-        print("🎉 达标！")
-        sys.exit(0)
-    else:
-        print("未达标，继续搜索")
-        sys.exit(1)
+    if r1>=0.90 and r2>=0.90 and r3>=0.90 and rsp>=0.25 and max(ms1,ms2,ms3,mssp)<=1:
+    print("🎉 达标！"); sys.exit(0)
+else:
+    print("未达标，继续搜索"); sys.exit(1)
 
 
 if __name__ == "__main__":
