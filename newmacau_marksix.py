@@ -4027,105 +4027,118 @@ def evaluate_zodiac_performance(conn, params: dict, lookback: int = 20):
             backup_path.unlink()
 
 
-def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1, n_trials=300):
-    """自适应强化优化器 - 自动达到命中率≥90% 且连空≤1"""
+def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1, n_trials=300, max_rounds=5):
+    """自适应循环优化：未达标则自动增加试验次数并重新搜索，直到达标或达到最大轮数"""
     try:
         import optuna
     except ImportError:
         print("❌ 请安装 optuna: pip install optuna")
         return None
 
-    # 1. 确保有足够历史数据（至少150期）
+    # 1. 确保数据足够（至少150期）
     print("📥 同步最新150期开奖数据...")
     records = fetch_macau_recent_records(limit=150)
     sync_from_records(conn, records, source="auto_optimize")
-    print(f"✅ 共 {conn.execute('SELECT COUNT(*) FROM draws').fetchone()[0]} 期数据")
+    total_rows = conn.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
+    print(f"✅ 当前数据库共 {total_rows} 期开奖记录")
 
-    # 2. 定义搜索空间 (可自适应扩展)
-    def get_params(trial, iteration=0):
-        # 基础参数
-        params = {
-            "single_strategy": trial.suggest_categorical("single_strategy",
-                ["weighted", "pure_hot", "pure_cold", "hybrid", "hot_main_only", "last_special", "cold_hot_mix"]),
-            "two_strategy": trial.suggest_categorical("two_strategy",
-                ["hot_cold", "double_hot", "double_cold", "last2_specials", "hot_special_cold_main", "neighbor_pair"]),
-            "four_strategy": trial.suggest_categorical("four_strategy",
-                ["boosted", "momentum", "hybrid", "top4_freq", "cold_main_only"]),
-            "special_strategy": trial.suggest_categorical("special_strategy",
-                ["cold_neighbor", "tail_focus", "omission_only", "zone_bias", "neighbor_tail", "mixed_2cold1hot", "omit_break"]),
-            "wsize": trial.suggest_int("wsize", 3, 15),
-            "rec_w": trial.suggest_float("rec_w", 0.3, 1.6),
-            "safe_th": trial.suggest_float("safe_th", 0.5, 3.0),
-            "four_boost": trial.suggest_float("four_boost", 0.8, 3.0),
-            "momentum_w": trial.suggest_float("momentum_w", 0.3, 2.0),
-            "cold_threshold": trial.suggest_int("cold_threshold", 5, 25),
-            "neighbor_1_bonus": trial.suggest_float("neighbor_1_bonus", 1.0, 12.0),
-            "neighbor_2_bonus": trial.suggest_float("neighbor_2_bonus", 0.1, 4.0),
-            "penalty_coeff": trial.suggest_float("penalty_coeff", 0.2, 1.8),
-            "lgb_weight": trial.suggest_float("lgb_weight", 0.1, 1.5),
-            "four_omit_boost": trial.suggest_float("four_omit_boost", 0.5, 6.0),
-        }
-        # 如果某轮迭代特别肖一直低，额外加大 cold_threshold 范围
-        if iteration > 10 and params["special_strategy"] == "cold_neighbor":
-            params["cold_threshold"] = trial.suggest_int("cold_threshold_adapt", 5, 35)
-        return params
+    best_overall_params = None
+    best_overall_score = -1
 
-    # 3. 自定义目标函数 (强化惩罚机制)
-    def objective(trial, iteration=0):
-        params = get_params(trial, iteration)
-        hit_rates, max_misses = evaluate_zodiac_performance(conn, params, lookback=20)
+    for round_num in range(1, max_rounds + 1):
+        print(f"\n{'='*50}\n第 {round_num} 轮优化 (试验次数: {n_trials})\n{'='*50}")
 
-        # 基础分：四项命中率之和
-        base_score = hit_rates['single'] + hit_rates['two'] + hit_rates['three'] + hit_rates['special']
-        # 惩罚系数
-        penalty = 1.0
-        # 单肖必须达90%，否则降为0分
-        if hit_rates['single'] < target_hit_rate or max_misses['single'] > target_max_miss:
-            penalty *= 0.01   # 极重度惩罚
-        # 特别肖同样
-        if hit_rates['special'] < target_hit_rate or max_misses['special'] > target_max_miss:
-            penalty *= 0.01
-        # 双肖
-        if hit_rates['two'] < target_hit_rate or max_misses['two'] > target_max_miss:
-            penalty *= 0.3
-        # 三肖
-        if hit_rates['three'] < target_hit_rate or max_misses['three'] > target_max_miss:
-            penalty *= 0.3
+        # 动态调整搜索空间（每轮扩大范围）
+        def get_params(trial, round_num):
+            # 基础参数
+            params = {
+                "single_strategy": trial.suggest_categorical("single_strategy",
+                    ["weighted", "pure_hot", "pure_cold", "hybrid", "hot_main_only", "last_special", "cold_hot_mix"]),
+                "two_strategy": trial.suggest_categorical("two_strategy",
+                    ["hot_cold", "double_hot", "double_cold", "last2_specials", "hot_special_cold_main", "neighbor_pair"]),
+                "four_strategy": trial.suggest_categorical("four_strategy",
+                    ["boosted", "momentum", "hybrid", "top4_freq", "cold_main_only"]),
+                "special_strategy": trial.suggest_categorical("special_strategy",
+                    ["cold_neighbor", "tail_focus", "omission_only", "zone_bias", "neighbor_tail", "mixed_2cold1hot", "omit_break"]),
+                # 随轮次扩大范围
+                "wsize": trial.suggest_int("wsize", 3, min(15, 8 + round_num * 2)),
+                "rec_w": trial.suggest_float("rec_w", 0.3, min(1.6, 1.0 + round_num * 0.2)),
+                "safe_th": trial.suggest_float("safe_th", 0.5, min(3.0, 1.5 + round_num * 0.3)),
+                "four_boost": trial.suggest_float("four_boost", 0.8, min(3.0, 1.5 + round_num * 0.3)),
+                "momentum_w": trial.suggest_float("momentum_w", 0.3, min(2.0, 1.2 + round_num * 0.2)),
+                "cold_threshold": trial.suggest_int("cold_threshold", 5, min(25, 12 + round_num * 3)),
+                "neighbor_1_bonus": trial.suggest_float("neighbor_1_bonus", 1.0, min(12.0, 6.0 + round_num * 1.5)),
+                "neighbor_2_bonus": trial.suggest_float("neighbor_2_bonus", 0.1, min(4.0, 1.5 + round_num * 0.5)),
+                "penalty_coeff": trial.suggest_float("penalty_coeff", 0.2, min(1.8, 1.0 + round_num * 0.2)),
+                "lgb_weight": trial.suggest_float("lgb_weight", 0.1, min(1.5, 0.8 + round_num * 0.15)),
+                "four_omit_boost": trial.suggest_float("four_omit_boost", 0.5, min(6.0, 2.5 + round_num * 0.7)),
+            }
+            return params
 
-        score = base_score * penalty
-        # 额外奖励：若已经接近目标，给予加成
-        if hit_rates['single'] >= 0.85 and hit_rates['special'] >= 0.85:
-            score *= 1.5
-        return score
+        def objective(trial, round_num):
+            params = get_params(trial, round_num)
+            hit_rates, max_misses = evaluate_zodiac_performance(conn, params, lookback=20)
 
-    # 4. Optuna 优化，动态调整 trials
-    study = optuna.create_study(direction="maximize", study_name="zodiac_optimize_v2", load_if_exists=True)
-    # 分阶段：第一次 200 次，如果单肖+特别肖得分过低，再追加 200 次
-    for phase in range(2):
-        n_trials_phase = n_trials // 2 if phase == 0 else n_trials - (n_trials // 2)
-        study.optimize(lambda trial: objective(trial, phase), n_trials=n_trials_phase, show_progress_bar=True)
-        # 检查当前最佳是否达标
+            score = hit_rates['single'] + hit_rates['two'] + hit_rates['three'] + hit_rates['special']
+            # 严重惩罚未达标项
+            if hit_rates['single'] < target_hit_rate or max_misses['single'] > target_max_miss:
+                score *= 0.1
+            if hit_rates['special'] < target_hit_rate or max_misses['special'] > target_max_miss:
+                score *= 0.1
+            if hit_rates['two'] < target_hit_rate or max_misses['two'] > target_max_miss:
+                score *= 0.4
+            if hit_rates['three'] < target_hit_rate or max_misses['three'] > target_max_miss:
+                score *= 0.4
+            # 额外奖励接近达标的组合
+            if hit_rates['single'] >= 0.85 and hit_rates['special'] >= 0.85:
+                score *= 1.5
+            return score
+
+        study = optuna.create_study(direction="maximize", study_name=f"zodiac_optimize_round{round_num}", load_if_exists=False)
+        study.optimize(lambda trial: objective(trial, round_num), n_trials=n_trials, show_progress_bar=True)
+
         best_params = study.best_params
-        best_hit, _ = evaluate_zodiac_performance(conn, best_params, lookback=20)
-        if (best_hit['single'] >= target_hit_rate and best_hit['special'] >= target_hit_rate and
-            best_hit['two'] >= target_hit_rate and best_hit['three'] >= target_hit_rate):
-            print("🎉 达标！提前结束优化。")
-            break
+        best_params.setdefault("single_window", best_params.get("wsize", 6))
+        best_params.setdefault("single_recency_w", best_params.get("rec_w", 0.7339))
+        best_params.setdefault("single_safe_threshold", best_params.get("safe_th", 1.4589))
 
-    best_params = study.best_params
-    # 补充必要字段
-    best_params.setdefault("single_window", best_params.get("wsize", 6))
-    best_params.setdefault("single_recency_w", best_params.get("rec_w", 0.7339))
-    best_params.setdefault("single_safe_threshold", best_params.get("safe_th", 1.4589))
+        hit_rates, max_misses = evaluate_zodiac_performance(conn, best_params, lookback=20)
+        score = hit_rates['single'] + hit_rates['two'] + hit_rates['three'] + hit_rates['special']
+        if score > best_overall_score:
+            best_overall_score = score
+            best_overall_params = best_params
 
-    # 保存最终参数
-    with open(_BEST_PARAMS_PATH, "w", encoding="utf-8") as f:
-        json.dump(best_params, f, ensure_ascii=False, indent=2)
-    print(f"✅ 最佳参数已保存至 {_BEST_PARAMS_PATH}")
+        print(f"\n第 {round_num} 轮最佳表现:")
+        print(f"  单肖: {hit_rates['single']:.3f} (连空 {max_misses['single']})")
+        print(f"  双肖: {hit_rates['two']:.3f} (连空 {max_misses['two']})")
+        print(f"  三肖: {hit_rates['three']:.3f} (连空 {max_misses['three']})")
+        print(f"  特别肖: {hit_rates['special']:.3f} (连空 {max_misses['special']})")
 
-    final_hit, final_miss = evaluate_zodiac_performance(conn, best_params, lookback=20)
-    print(f"最终表现: 单肖{final_hit['single']:.3f}(连空{final_miss['single']}) 双肖{final_hit['two']:.3f}(连空{final_miss['two']}) 三肖{final_hit['three']:.3f}(连空{final_miss['three']}) 特别肖{final_hit['special']:.3f}(连空{final_miss['special']})")
-    return best_params
+        # 达标检查
+        if (hit_rates['single'] >= target_hit_rate and max_misses['single'] <= target_max_miss and
+            hit_rates['two'] >= target_hit_rate and max_misses['two'] <= target_max_miss and
+            hit_rates['three'] >= target_hit_rate and max_misses['three'] <= target_max_miss and
+            hit_rates['special'] >= target_hit_rate and max_misses['special'] <= target_max_miss):
+            print("\n🎉 恭喜！所有指标均已达标！")
+            with open(_BEST_PARAMS_PATH, "w", encoding="utf-8") as f:
+                json.dump(best_params, f, ensure_ascii=False, indent=2)
+            print(f"✅ 最佳参数已保存至 {_BEST_PARAMS_PATH}")
+            return best_params
+
+        # 未达标：增加试验次数，继续下一轮
+        print(f"⚠️ 本轮未达标，扩大搜索范围，下一轮试验次数增加至 {n_trials + 200}")
+        n_trials += 200
+        # 如果已经是最后一轮，保存当前最佳参数
+        if round_num == max_rounds:
+            print(f"\n已达到最大优化轮数 ({max_rounds})，保存当前最佳参数。")
+            with open(_BEST_PARAMS_PATH, "w", encoding="utf-8") as f:
+                json.dump(best_overall_params, f, ensure_ascii=False, indent=2)
+            print(f"✅ 最佳参数已保存至 {_BEST_PARAMS_PATH}")
+            final_hit, final_miss = evaluate_zodiac_performance(conn, best_overall_params, lookback=20)
+            print(f"最终表现: 单肖{final_hit['single']:.3f}(连空{final_miss['single']}) 双肖{final_hit['two']:.3f}(连空{final_miss['two']}) 三肖{final_hit['three']:.3f}(连空{final_miss['three']}) 特别肖{final_hit['special']:.3f}(连空{final_miss['special']})")
+            return best_overall_params
+
+    return best_overall_params
 
 
 def cmd_auto_optimize(args: argparse.Namespace) -> None:
