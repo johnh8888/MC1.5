@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-澳门六合彩全自动策略进化优化器（四肖强化版）
-权重调整为：一生肖0.10 / 二肖0.20 / 四肖0.30 / 特别号0.40
-连空>1 额外打8.5折
+澳门六合彩全自动策略进化优化器（四肖+一生肖双强化版）
+权重：一生肖0.15 二肖0.15 四肖0.35 特别号0.35
+连空>1 打8.5折，连空≥4 额外打5折
 """
 import sqlite3, json, sys, argparse, random
 from collections import Counter
@@ -57,7 +57,7 @@ def _build_zodiac_scores_from_rows(rows, decay=0.08):
         elif omit >= 3: scores[z] += omit/6.0
     return scores
 
-# ========== 一生肖策略 (7) 新增 cold_hot_mix ==========
+# ========== 一生肖策略 (7) ==========
 def single_weighted(hist, wsize, rec_w, safe_th):
     scores = {z:0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist)>=wsize else hist
@@ -100,7 +100,6 @@ def single_last_special(hist, wsize, rec_w, safe_th):
     return "马"
 
 def single_cold_hot_mix(hist, wsize, rec_w, safe_th):
-    """冷热混合：取纯热和纯冷的平均分"""
     hot_scores = {z:0.0 for z in ZODIAC_MAP}
     cold_scores = {z:0.0 for z in ZODIAC_MAP}
     recent = hist[-wsize:] if len(hist)>=wsize else hist
@@ -375,7 +374,7 @@ STRATEGIES_SPECIAL = {
     "omit_break": special_omit_break,
 }
 
-# ========== 评估函数（权重强化四肖） ==========
+# ========== 评估函数 ==========
 def evaluate(issues, params, debug=False):
     total = len(issues)
     if total < 15: return -999.0, 0,0,0,0,0,0,0
@@ -429,16 +428,18 @@ def evaluate(issues, params, debug=False):
     rsp = special_hits/n
     max_strk = max(max_s, max_t, max_f, max_sp)
 
-    # 权重：一生肖压到很低，四肖最高
-    score = r1*0.10 + r2*0.20 + r4*0.30 + rsp*0.40
-    if r1<0.70: score*=0.85
-    if r2<0.80: score*=0.85
-    if r4<0.85: score*=0.90
-    if rsp<0.50: score*=0.90
+    # 权重平衡：一生肖微升，四肖主力，特别号保持
+    score = r1*0.15 + r2*0.15 + r4*0.35 + rsp*0.35
+    if r1<0.75: score*=0.88                 # 一生肖阈值微提高到0.75
+    if r2<0.85: score*=0.88
+    if r4<0.80: score*=0.92                 # 四肖目标0.8+
+    if rsp<0.45: score*=0.92
 
-    # 连空惩罚加重：任意连空 >1 打8.5折
+    # 连空惩罚：>1 打8.5折，≥4 打5折
     if max_strk > 1:
         score *= 0.85
+    if max_strk >= 4:
+        score *= 0.5
 
     streak_factor = 1.0
     if max_strk>=4: streak_factor=0.2
@@ -501,7 +502,7 @@ def main():
     with open("best_params_zodiac.json", "w") as f:
         json.dump(best_p, f, indent=2)
 
-    if r1>=0.70 and r2>=0.80 and r4>=0.85 and rsp>=0.50 and max(ms1,ms2,ms4,mssp)<=1:
+    if r1>=0.75 and r2>=0.85 and r4>=0.80 and rsp>=0.45 and max(ms1,ms2,ms4,mssp)<=1:
         print("🎉 达标！"); sys.exit(0)
     else:
         print("未达标，继续搜索"); sys.exit(1)
