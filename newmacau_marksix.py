@@ -222,6 +222,7 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1"]
+TEXIAO5_SIZE_DEFAULT = 5
 
 ZODIAC_MAP = {
     "马": [1, 13, 25, 37, 49], "蛇": [2, 14, 26, 38], "龙": [3, 15, 27, 39],
@@ -362,6 +363,66 @@ def _strategy_two_double_cold(rows):
     sorted_cold = sorted(omission.items(), key=lambda x: -x[1])
     return [sorted_cold[0][0], sorted_cold[1][0]]
 
+# ===== 补充的缺失策略函数 =====
+def _strategy_two_last2_specials(rows):
+    """取最近两期的特别号生肖作为二生肖推荐"""
+    specials = [_row_special(r) for r in rows[:2]]  # rows已按时间倒序，前两条是最近两期
+    zodiacs = [get_zodiac_by_number(sp) for sp in specials if sp is not None]
+    if len(zodiacs) >= 2:
+        return zodiacs[:2]
+    # 不足则补齐默认
+    default = ["马", "蛇"]
+    while len(zodiacs) < 2:
+        for z in default:
+            if z not in zodiacs:
+                zodiacs.append(z)
+                break
+    return zodiacs[:2]
+
+
+def _strategy_two_hot_special_cold_main(rows):
+    """热特别生肖 + 冷主号生肖"""
+    # 热特别生肖：最近8期特别号中出现最多的生肖
+    recent_specials = [_row_special(r) for r in rows[:8]]
+    special_zodiacs = [get_zodiac_by_number(sp) for sp in recent_specials]
+    hot_special = Counter(special_zodiacs).most_common(1)[0][0] if special_zodiacs else "马"
+
+    # 冷主号生肖：最近12期主号中出现最少的生肖
+    main_zodiacs = []
+    for r in rows[:12]:
+        for n in json.loads(r["numbers_json"]):
+            main_zodiacs.append(get_zodiac_by_number(n))
+    if main_zodiacs:
+        cold_main = Counter(main_zodiacs).most_common()[-1][0]
+    else:
+        cold_main = "龙"
+
+    # 去重后返回
+    picks = [hot_special, cold_main]
+    if picks[0] == picks[1]:
+        # 如果相同，取次热特别生肖或次冷主号
+        if len(special_zodiacs) > 1:
+            picks[1] = Counter(special_zodiacs).most_common(2)[1][0]
+        else:
+            picks[1] = "蛇" if picks[0] != "蛇" else "牛"
+    return picks[:2]
+
+
+def _strategy_two_neighbor_pair(rows):
+    """基于最近特别号生肖及其相冲（六冲）生肖作为二推荐"""
+    if not rows:
+        return ["马", "蛇"]
+    latest_sp = _row_special(rows[0])
+    latest_z = get_zodiac_by_number(latest_sp)
+    # 从 ZODIAC_PAIR 获取相冲生肖（如鼠-牛相冲？实际 ZODIAC_PAIR 存储的是六合？代码中定义的是"鼠":"牛"...，但通常六冲是鼠马、牛羊等。
+    # 为简单起见，使用定义的 ZODIAC_PAIR 映射（它可能是自反的，如鼠牛互为六合？但这里我们取配偶对）。
+    # 更稳妥：取 ZODIAC_PAIR 中 latest_z 的值，若不存在则取蛇。
+    pair = ZODIAC_PAIR.get(latest_z, "蛇")
+    # 如果相冲生肖与自身相同（理论上不会），或需要两个不同，则取另一个常见生肖
+    if pair == latest_z:
+        pair = "蛇"
+    return [latest_z, pair]
+
 def _strategy_four_boosted(rows, four_boost):
     omission = {z: 0 for z in ZODIAC_MAP}
     specials = [_row_special(r) for r in rows]
@@ -418,42 +479,42 @@ def _strategy_four_cold_main_only(rows, recent_n=20):
 
 def _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
-    if not recent_specials: return [1, 2, 3]
+    if not recent_specials: return [1,2,3]
     latest = recent_specials[0]
     omission = {}
-    for i, sp in enumerate(recent_specials):
-        if sp not in omission: omission[sp] = i + 1
-    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
-    if not candidates: return [1, 2, 3]
-    cold_th = int(params.get('cold_threshold', 11))
-    nb1 = float(params.get('neighbor_1_bonus', 6.918))
-    nb2 = float(params.get('neighbor_2_bonus', 0.514))
-    pen = float(params.get('penalty_coeff', 0.76))
-    lw = float(params.get('lgb_weight', 0.6146))
-    ob = float(params.get('four_omit_boost', 2.578))
-    picks = sorted([n for n in candidates if omission.get(n, 20) >= cold_th], key=lambda n: omission.get(n, 20), reverse=True)[:2]
-    while len(picks) < 2:
+    for i,sp in enumerate(recent_specials):
+        if sp not in omission: omission[sp]=i+1
+    candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z,[])))
+    if not candidates: return [1,2,3]
+    cold_th = int(params.get('cold_threshold',11))
+    nb1 = float(params.get('neighbor_1_bonus',6.918))
+    nb2 = float(params.get('neighbor_2_bonus',0.514))
+    pen = float(params.get('penalty_coeff',0.76))
+    lw = float(params.get('lgb_weight',0.6146))
+    ob = float(params.get('four_omit_boost',2.578))
+    picks = sorted([n for n in candidates if omission.get(n,20)>=cold_th],key=lambda n:omission.get(n,20),reverse=True)[:2]
+    while len(picks)<2:
         remaining = [n for n in candidates if n not in picks]
         if not remaining: break
-        picks.append(max(remaining, key=lambda n: omission.get(n, 20)))
-    if len(picks) < top_n:
-        neighbors = [n for n in candidates if abs(n - latest) == 1 and n not in picks]
-        if neighbors: picks.append(max(neighbors, key=lambda n: omission.get(n, 20) + nb1))
-    if len(picks) < top_n:
-        neighbors2 = [n for n in candidates if abs(n - latest) == 2 and n not in picks]
-        if neighbors2: picks.append(max(neighbors2, key=lambda n: omission.get(n, 20) + nb2))
-    while len(picks) < top_n:
-        rest = sorted([n for n in candidates if n not in picks], key=lambda n: omission.get(n, 20), reverse=True)
+        picks.append(max(remaining,key=lambda n:omission.get(n,20)))
+    if len(picks)<top_n:
+        nb = [n for n in candidates if abs(n-latest)==1 and n not in picks]
+        if nb: picks.append(max(nb,key=lambda n:omission.get(n,20)+nb1))
+    if len(picks)<top_n:
+        nb2l = [n for n in candidates if abs(n-latest)==2 and n not in picks]
+        if nb2l: picks.append(max(nb2l,key=lambda n:omission.get(n,20)+nb2))
+    while len(picks)<top_n:
+        rest = sorted([n for n in candidates if n not in picks],key=lambda n:omission.get(n,20),reverse=True)
         if rest: picks.append(rest[0])
         else: break
-    scored = []
+    scored=[]
     for n in picks:
-        score = omission.get(n, 20) * lw
-        if n in recent_specials[:3]: score *= pen
-        if omission.get(n, 20) >= cold_th: score += ob
-        scored.append((n, score))
-    scored.sort(key=lambda x: -x[1])
-    return [n for n, _ in scored[:top_n]]
+        score = omission.get(n,20)*lw
+        if n in recent_specials[:3]: score*=pen
+        if omission.get(n,20)>=cold_th: score+=ob
+        scored.append((n,score))
+    scored.sort(key=lambda x:-x[1])
+    return [n for n,_ in scored[:top_n]]
 
 def _strategy_special_tail_focus(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
@@ -2565,26 +2626,42 @@ def _get_four_zodiac_from_history_rows(rows, conn=None):
     return _strategy_four_boosted(rows, four_boost)
 
 
-def get_recent_texiao5_report(conn: sqlite3.Connection, lookback: int = 20) -> Dict[str, float]:
+def get_texiao4_picks(conn, issue_no, status="REVIEWED", k=TEXIAO5_SIZE_DEFAULT):
+    row = conn.execute("SELECT draw_date FROM draws WHERE issue_no = ?", (issue_no,)).fetchone()
+    if not row:
+        return []
     rows = conn.execute(
-        "SELECT issue_no, picks_json, special_hit FROM special_picks_log ORDER BY id DESC LIMIT ?",
-        (lookback,),
+        "SELECT numbers_json, special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT 12",
+        (issue_no, issue_no, issue_no),
     ).fetchall()
     if not rows:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    hits = 0
-    miss_streak = 0
-    max_miss = 0
-    for row in rows:
-        hit = int(row["special_hit"] or 0)
-        hits += hit
-        if hit == 0:
-            miss_streak += 1
-            max_miss = max(max_miss, miss_streak)
+        return list(ZODIAC_MAP.keys())[:k]
+    params = load_best_zodiac_params()
+    zodiac_pool = _get_four_zodiac_from_history_rows(rows, conn)
+    picks = get_precise_specials_for_issue(conn, issue_no, zodiac_pool, top_n=k)
+    return [get_zodiac_by_number(n) for n in picks]
+
+
+def get_recent_texiao5_report(conn, lookback=10):
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < 2:
+        return {"samples":0, "hit_rate":0.0, "max_miss_streak":0}
+    start = max(1, len(rows)-lookback)
+    hits, samples, miss, max_miss = 0,0,0,0
+    for i in range(start, len(rows)):
+        issue_no = rows[i]["issue_no"]
+        picks5 = get_texiao4_picks(conn, issue_no, status="REVIEWED", k=TEXIAO5_SIZE_DEFAULT)
+        win_special = int(rows[i]["special_number"])
+        win_zodiac = get_zodiac_by_number(win_special)
+        if win_zodiac in set(picks5):
+            hits += 1
+            miss = 0
         else:
-            miss_streak = 0
-    samples = len(rows)
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss)}
+            miss += 1
+            max_miss = max(max_miss, miss)
+        samples += 1
+    rate = hits/samples if samples>0 else 0.0
+    return {"samples":samples, "hit_rate":rate, "max_miss_streak":max_miss}
 
 
 # 兼容旧调用：特别生肖统计暂时复用四生肖核心逻辑
@@ -3544,17 +3621,18 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
 
-    zodiac_report = get_recent_single_zodiac_report(conn, lookback=10)
-    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=10)
-    zodiac_four_report = get_recent_four_zodiac_report(conn, lookback=10, history_window=16)
-    texiao5_report = get_recent_texiao5_report(conn, lookback=10)
-    print(
-        f"近10期: 一生肖={zodiac_report['hit_rate']:.3f}(连空{int(zodiac_report['max_miss_streak'])}) "
-        f"二肖(任1)={zodiac_two_report['hit_rate']:.3f}(连空{int(zodiac_two_report['max_miss_streak'])}) "
-        f"四肖={zodiac_four_report['hit_rate']:.3f}(连空{int(zodiac_four_report['max_miss_streak'])})"
-    )
-    print(f"特五肖(仅特别号) 近10期命中率: {texiao5_report['hit_rate']:.3f} 最大连空{int(texiao5_report['max_miss_streak'])}")
-    if zodiac_report['hit_rate'] >= 0.9 and zodiac_two_report['hit_rate'] >= 0.8 and zodiac_four_report['hit_rate'] >= 1.0:
+    one_rep = get_recent_single_zodiac_report(conn, lookback=10)
+    two_rep = get_recent_two_zodiac_report(conn, lookback=10)
+    four_rep = get_recent_four_zodiac_report(conn, lookback=10, history_window=16)
+    texiao5_rep = get_recent_texiao5_report(conn, lookback=10)
+    sp_rep = get_recent_special_picks_report(conn, lookback=10)
+
+    print(f"近10期: 一生肖={one_rep['hit_rate']:.3f}(连空{int(one_rep['max_miss_streak'])}) "
+          f"二肖={two_rep['hit_rate']:.3f}(连空{int(two_rep['max_miss_streak'])}) "
+          f"四肖={four_rep['hit_rate']:.3f}(连空{int(four_rep['max_miss_streak'])}) "
+          f"特别号={sp_rep['hit_rate']:.3f}(连空{int(sp_rep.get('max_miss_streak',0))})")
+    print(f"特五肖(仅特别号) 近10期命中率: {texiao5_rep['hit_rate']:.3f} 最大连空{int(texiao5_rep['max_miss_streak'])}")
+    if one_rep['hit_rate'] >= 0.9 and two_rep['hit_rate'] >= 0.8 and four_rep['hit_rate'] >= 1.0:
         print("🎉 达标！")
 
     print_final_recommendation(conn, xgb_pool20=xgb_pool20)
@@ -3732,6 +3810,7 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
         max_retries = 5
         trials = getattr(args, "trials", 1000)
         optimize_script = SCRIPT_DIR / "hyper_optimize_ultimate_target.py"
+        debug_flag = ["--debug"] if getattr(args, "debug", False) else []
 
         for attempt in range(1, max_retries + 1):
             print(f"\n====== 第 {attempt} 次优化 (trials={trials}) ======")
@@ -3739,7 +3818,7 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
                 [sys.executable, str(optimize_script),
                  "--db", args.db,
                  "--recent", "120",
-                 "--trials", str(trials)],
+                 "--trials", str(trials)] + debug_flag,
                 capture_output=False,
             )
             if ret.returncode == 0:
@@ -4056,6 +4135,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_reset = sub.add_parser("reset-and-auto", help="全自动重置→获取120期→优化近10期→预测")
     p_reset.add_argument("--trials", type=int, default=1000, help="Optuna trials count")
+    p_reset.add_argument("--debug", action="store_true", help="打印每期调试信息")
     p_reset.set_defaults(func=cmd_reset_and_auto)
 
     p_check = sub.add_parser("check-data", help="校验数据库开奖记录是否完整且合法")
