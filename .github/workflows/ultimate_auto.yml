@@ -25,8 +25,8 @@ jobs:
           pip install -r requirements.txt
           pip install optuna
 
-      - name: 运行全自动优化（300次试验）
-        run: python newmacau_marksix.py auto-optimize --n-trials 300
+      - name: 运行全自动优化（800次试验）
+        run: python newmacau_marksix.py auto-optimize --n-trials 800
 
       - name: 提取并判断是否达标
         id: check
