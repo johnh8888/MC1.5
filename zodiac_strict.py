@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""三生肖严格优化模块 - 支持动态参数"""
+"""三生肖严格预测模块 - 供优化器使用"""
 import json
 from collections import Counter
 from pathlib import Path
+from typing import List
 
 ZODIAC_MAP = {
     "马": [1,13,25,37,49], "蛇": [2,14,26,38], "龙": [3,15,27,39],
@@ -10,24 +11,21 @@ ZODIAC_MAP = {
     "鼠": [7,19,31,43], "猪": [8,20,32,44], "狗": [9,21,33,45],
     "鸡": [10,22,34,46], "猴": [11,23,35,47], "羊": [12,24,36,48],
 }
-
-def get_zodiac_by_number(num: int) -> str:
+def get_zodiac_by_number(n: int) -> str:
     for z, nums in ZODIAC_MAP.items():
-        if num in nums:
+        if n in nums:
             return z
     return "马"
 
-def get_three_zodiac_picks(conn, lookback: int = 30, **kwargs):
-    """返回三个最可能出现的生肖（基于历史、LSTM、HMM）"""
+def get_three_zodiac_picks(conn, lookback: int = 30, **kwargs) -> List[str]:
     params_path = Path(__file__).parent / "best_params_zodiac.json"
     params = {}
     if params_path.exists():
         with open(params_path, "r") as f:
             params = json.load(f)
-
     lstm_weight = float(params.get("three_lstm_weight", 0.3))
     hmm_weight = float(params.get("three_hmm_weight", 0.2))
-    lstm_seq_len = int(params.get("lstm_seq_len", 30))
+    lstm_seq_len = int(params.get("lstm_seq_len", 30)) if params.get("three_lstm_seq_len") is None else int(params["three_lstm_seq_len"])
 
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT ?",
@@ -45,7 +43,7 @@ def get_three_zodiac_picks(conn, lookback: int = 30, **kwargs):
         sp = row["special_number"]
         scores[get_zodiac_by_number(sp)] += 2.2 * recency
 
-    # LSTM
+    # 可选 LSTM 增强
     try:
         from lstm_predictor import predict_lstm_proba
         lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
@@ -55,7 +53,7 @@ def get_three_zodiac_picks(conn, lookback: int = 30, **kwargs):
     except Exception:
         pass
 
-    # HMM
+    # 可选 HMM 增强
     try:
         from hmm_features import get_hmm_state_proba
         hmm_probs = get_hmm_state_proba(conn)
@@ -65,7 +63,7 @@ def get_three_zodiac_picks(conn, lookback: int = 30, **kwargs):
     except Exception:
         pass
 
-    # 遗漏奖励
+    # 遗漏值奖励
     omission = {z: len(rows)+1 for z in ZODIAC_MAP}
     for i, row in enumerate(rows):
         nums = json.loads(row["numbers_json"])
