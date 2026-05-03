@@ -3994,6 +3994,115 @@ def cmd_backfill_special(args: argparse.Namespace) -> None:
         conn.close()
 
 
+# ========== 新增全自动优化命令 ==========
+def evaluate_zodiac_performance(conn, params: dict, lookback: int = 20):
+    """使用指定参数评估生肖命中率和最大连空"""
+    import shutil
+    backup_path = _BEST_PARAMS_PATH.with_suffix(".backup")
+    if _BEST_PARAMS_PATH.exists():
+        shutil.copy(_BEST_PARAMS_PATH, backup_path)
+    try:
+        with open(_BEST_PARAMS_PATH, "w", encoding="utf-8") as f:
+            json.dump(params, f, ensure_ascii=False)
+        single_rep = get_recent_single_zodiac_report(conn, lookback=lookback)
+        two_rep = get_recent_two_zodiac_report(conn, lookback=lookback)
+        three_rep = get_recent_three_zodiac_report(conn, lookback=lookback)
+        four_rep = get_recent_four_zodiac_report(conn, lookback=lookback)
+        hit_rates = {
+            'single': single_rep['hit_rate'],
+            'two': two_rep['hit_rate'],
+            'three': three_rep['hit_rate'],
+            'special': four_rep['hit_rate']
+        }
+        max_misses = {
+            'single': single_rep['max_miss_streak'],
+            'two': two_rep['max_miss_streak'],
+            'three': three_rep['max_miss_streak'],
+            'special': four_rep['max_miss_streak']
+        }
+        return hit_rates, max_misses
+    finally:
+        if backup_path.exists():
+            shutil.copy(backup_path, _BEST_PARAMS_PATH)
+            backup_path.unlink()
+
+
+def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1, n_trials=200):
+    """使用 Optuna 自动搜索最佳参数"""
+    try:
+        import optuna
+    except ImportError:
+        print("❌ 请先安装 optuna: pip install optuna")
+        return None
+
+    records = fetch_macau_recent_records(limit=120)
+    sync_from_records(conn, records, source="auto_optimize")
+    print("✅ 数据同步完成，开始 Optuna 优化...")
+
+    def objective(trial):
+        params = {
+            "single_strategy": trial.suggest_categorical("single_strategy", ["weighted", "pure_hot", "pure_cold", "hybrid", "hot_main_only", "last_special", "cold_hot_mix"]),
+            "two_strategy": trial.suggest_categorical("two_strategy", ["hot_cold", "double_hot", "double_cold", "last2_specials", "hot_special_cold_main", "neighbor_pair"]),
+            "four_strategy": trial.suggest_categorical("four_strategy", ["boosted", "momentum", "hybrid", "top4_freq", "cold_main_only"]),
+            "special_strategy": trial.suggest_categorical("special_strategy", ["cold_neighbor", "tail_focus", "omission_only", "zone_bias", "neighbor_tail", "mixed_2cold1hot", "omit_break"]),
+            "wsize": trial.suggest_int("wsize", 4, 12),
+            "rec_w": trial.suggest_float("rec_w", 0.5, 1.2),
+            "safe_th": trial.suggest_float("safe_th", 0.8, 2.5),
+            "four_boost": trial.suggest_float("four_boost", 1.0, 2.5),
+            "momentum_w": trial.suggest_float("momentum_w", 0.5, 1.8),
+            "cold_threshold": trial.suggest_int("cold_threshold", 8, 16),
+            "neighbor_1_bonus": trial.suggest_float("neighbor_1_bonus", 2.0, 8.0),
+            "neighbor_2_bonus": trial.suggest_float("neighbor_2_bonus", 0.2, 1.5),
+            "penalty_coeff": trial.suggest_float("penalty_coeff", 0.5, 1.2),
+            "lgb_weight": trial.suggest_float("lgb_weight", 0.3, 1.0),
+            "four_omit_boost": trial.suggest_float("four_omit_boost", 1.0, 3.5),
+        }
+        hit_rates, max_misses = evaluate_zodiac_performance(conn, params, lookback=20)
+        score = hit_rates['single'] + hit_rates['two'] + hit_rates['three'] + hit_rates['special']
+        if hit_rates['single'] < target_hit_rate or max_misses['single'] > target_max_miss:
+            score *= 0.3
+        if hit_rates['two'] < target_hit_rate or max_misses['two'] > target_max_miss:
+            score *= 0.3
+        if hit_rates['three'] < target_hit_rate or max_misses['three'] > target_max_miss:
+            score *= 0.3
+        if hit_rates['special'] < target_hit_rate or max_misses['special'] > target_max_miss:
+            score *= 0.3
+        return score
+
+    study = optuna.create_study(direction="maximize", study_name="zodiac_optimize", load_if_exists=True)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best_params = study.best_params
+    best_params.setdefault("single_window", best_params.get("wsize", 6))
+    best_params.setdefault("single_recency_w", best_params.get("rec_w", 0.7339))
+    best_params.setdefault("single_safe_threshold", best_params.get("safe_th", 1.4589))
+
+    with open(_BEST_PARAMS_PATH, "w", encoding="utf-8") as f:
+        json.dump(best_params, f, ensure_ascii=False, indent=2)
+    print(f"✅ 最佳参数已保存至 {_BEST_PARAMS_PATH}")
+    final_hit, final_miss = evaluate_zodiac_performance(conn, best_params, lookback=20)
+    print(f"最终表现: 单肖{final_hit['single']:.3f}(连空{final_miss['single']}) 双肖{final_hit['two']:.3f}(连空{final_miss['two']}) 三肖{final_hit['three']:.3f}(连空{final_miss['three']}) 特别肖{final_hit['special']:.3f}(连空{final_miss['special']})")
+    return best_params
+
+
+def cmd_auto_optimize(args: argparse.Namespace) -> None:
+    conn = connect_db(args.db)
+    try:
+        init_db(conn)
+        best = auto_optimize_loop(
+            conn,
+            target_hit_rate=args.target_hit_rate,
+            target_max_miss=args.target_max_miss,
+            n_trials=args.n_trials
+        )
+        if best:
+            run_historical_backtest(conn, rebuild=True, max_issues=120)
+            generate_predictions(conn)
+            print_dashboard(conn)
+    finally:
+        conn.close()
+
+
 def cmd_check_data(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
@@ -4132,6 +4241,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_backfill_special = sub.add_parser("backfill-special", help="回溯历史精选特别号记录")
     p_backfill_special.set_defaults(func=cmd_backfill_special)
+
+    p_auto = sub.add_parser("auto-optimize", help="全自动优化生肖及特别号参数（目标命中率≥90%，最大连空≤1）")
+    p_auto.add_argument("--target-hit-rate", type=float, default=0.90, help="目标命中率 (0~1)")
+    p_auto.add_argument("--target-max-miss", type=int, default=1, help="目标最大连空")
+    p_auto.add_argument("--n-trials", type=int, default=200, help="Optuna 试验次数")
+    p_auto.set_defaults(func=cmd_auto_optimize)
 
     p_reset = sub.add_parser("reset-and-auto", help="全自动重置→获取120期→优化近10期→预测")
     p_reset.add_argument("--trials", type=int, default=1000, help="Optuna trials count")
