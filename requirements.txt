@@ -1,5 +1,9 @@
-scikit-learn==1.8.0
-xgboost
-lightgbm
-optuna
-numpy
+numpy>=1.24
+pandas>=2.0
+requests>=2.31
+optuna>=3.6
+lightgbm>=4.0
+xgboost>=2.0
+scikit-learn>=1.8,<1.9
+hmmlearn>=0.3.0
+# tensorflow>=2.15   # 可选，如果需要 LSTM 则取消注释
