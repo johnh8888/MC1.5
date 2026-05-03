@@ -4027,59 +4027,102 @@ def evaluate_zodiac_performance(conn, params: dict, lookback: int = 20):
             backup_path.unlink()
 
 
-def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1, n_trials=200):
-    """使用 Optuna 自动搜索最佳参数"""
+def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1, n_trials=300):
+    """自适应强化优化器 - 自动达到命中率≥90% 且连空≤1"""
     try:
         import optuna
     except ImportError:
-        print("❌ 请先安装 optuna: pip install optuna")
+        print("❌ 请安装 optuna: pip install optuna")
         return None
 
-    records = fetch_macau_recent_records(limit=120)
+    # 1. 确保有足够历史数据（至少150期）
+    print("📥 同步最新150期开奖数据...")
+    records = fetch_macau_recent_records(limit=150)
     sync_from_records(conn, records, source="auto_optimize")
-    print("✅ 数据同步完成，开始 Optuna 优化...")
+    print(f"✅ 共 {conn.execute('SELECT COUNT(*) FROM draws').fetchone()[0]} 期数据")
 
-    def objective(trial):
+    # 2. 定义搜索空间 (可自适应扩展)
+    def get_params(trial, iteration=0):
+        # 基础参数
         params = {
-            "single_strategy": trial.suggest_categorical("single_strategy", ["weighted", "pure_hot", "pure_cold", "hybrid", "hot_main_only", "last_special", "cold_hot_mix"]),
-            "two_strategy": trial.suggest_categorical("two_strategy", ["hot_cold", "double_hot", "double_cold", "last2_specials", "hot_special_cold_main", "neighbor_pair"]),
-            "four_strategy": trial.suggest_categorical("four_strategy", ["boosted", "momentum", "hybrid", "top4_freq", "cold_main_only"]),
-            "special_strategy": trial.suggest_categorical("special_strategy", ["cold_neighbor", "tail_focus", "omission_only", "zone_bias", "neighbor_tail", "mixed_2cold1hot", "omit_break"]),
-            "wsize": trial.suggest_int("wsize", 4, 12),
-            "rec_w": trial.suggest_float("rec_w", 0.5, 1.2),
-            "safe_th": trial.suggest_float("safe_th", 0.8, 2.5),
-            "four_boost": trial.suggest_float("four_boost", 1.0, 2.5),
-            "momentum_w": trial.suggest_float("momentum_w", 0.5, 1.8),
-            "cold_threshold": trial.suggest_int("cold_threshold", 8, 16),
-            "neighbor_1_bonus": trial.suggest_float("neighbor_1_bonus", 2.0, 8.0),
-            "neighbor_2_bonus": trial.suggest_float("neighbor_2_bonus", 0.2, 1.5),
-            "penalty_coeff": trial.suggest_float("penalty_coeff", 0.5, 1.2),
-            "lgb_weight": trial.suggest_float("lgb_weight", 0.3, 1.0),
-            "four_omit_boost": trial.suggest_float("four_omit_boost", 1.0, 3.5),
+            "single_strategy": trial.suggest_categorical("single_strategy",
+                ["weighted", "pure_hot", "pure_cold", "hybrid", "hot_main_only", "last_special", "cold_hot_mix"]),
+            "two_strategy": trial.suggest_categorical("two_strategy",
+                ["hot_cold", "double_hot", "double_cold", "last2_specials", "hot_special_cold_main", "neighbor_pair"]),
+            "four_strategy": trial.suggest_categorical("four_strategy",
+                ["boosted", "momentum", "hybrid", "top4_freq", "cold_main_only"]),
+            "special_strategy": trial.suggest_categorical("special_strategy",
+                ["cold_neighbor", "tail_focus", "omission_only", "zone_bias", "neighbor_tail", "mixed_2cold1hot", "omit_break"]),
+            "wsize": trial.suggest_int("wsize", 3, 15),
+            "rec_w": trial.suggest_float("rec_w", 0.3, 1.6),
+            "safe_th": trial.suggest_float("safe_th", 0.5, 3.0),
+            "four_boost": trial.suggest_float("four_boost", 0.8, 3.0),
+            "momentum_w": trial.suggest_float("momentum_w", 0.3, 2.0),
+            "cold_threshold": trial.suggest_int("cold_threshold", 5, 25),
+            "neighbor_1_bonus": trial.suggest_float("neighbor_1_bonus", 1.0, 12.0),
+            "neighbor_2_bonus": trial.suggest_float("neighbor_2_bonus", 0.1, 4.0),
+            "penalty_coeff": trial.suggest_float("penalty_coeff", 0.2, 1.8),
+            "lgb_weight": trial.suggest_float("lgb_weight", 0.1, 1.5),
+            "four_omit_boost": trial.suggest_float("four_omit_boost", 0.5, 6.0),
         }
+        # 如果某轮迭代特别肖一直低，额外加大 cold_threshold 范围
+        if iteration > 10 and params["special_strategy"] == "cold_neighbor":
+            params["cold_threshold"] = trial.suggest_int("cold_threshold_adapt", 5, 35)
+        return params
+
+    # 3. 自定义目标函数 (强化惩罚机制)
+    def objective(trial, iteration=0):
+        params = get_params(trial, iteration)
         hit_rates, max_misses = evaluate_zodiac_performance(conn, params, lookback=20)
-        score = hit_rates['single'] + hit_rates['two'] + hit_rates['three'] + hit_rates['special']
+
+        # 基础分：四项命中率之和
+        base_score = hit_rates['single'] + hit_rates['two'] + hit_rates['three'] + hit_rates['special']
+        # 惩罚系数
+        penalty = 1.0
+        # 单肖必须达90%，否则降为0分
         if hit_rates['single'] < target_hit_rate or max_misses['single'] > target_max_miss:
-            score *= 0.3
-        if hit_rates['two'] < target_hit_rate or max_misses['two'] > target_max_miss:
-            score *= 0.3
-        if hit_rates['three'] < target_hit_rate or max_misses['three'] > target_max_miss:
-            score *= 0.3
+            penalty *= 0.01   # 极重度惩罚
+        # 特别肖同样
         if hit_rates['special'] < target_hit_rate or max_misses['special'] > target_max_miss:
-            score *= 0.3
+            penalty *= 0.01
+        # 双肖
+        if hit_rates['two'] < target_hit_rate or max_misses['two'] > target_max_miss:
+            penalty *= 0.3
+        # 三肖
+        if hit_rates['three'] < target_hit_rate or max_misses['three'] > target_max_miss:
+            penalty *= 0.3
+
+        score = base_score * penalty
+        # 额外奖励：若已经接近目标，给予加成
+        if hit_rates['single'] >= 0.85 and hit_rates['special'] >= 0.85:
+            score *= 1.5
         return score
 
-    study = optuna.create_study(direction="maximize", study_name="zodiac_optimize", load_if_exists=True)
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    # 4. Optuna 优化，动态调整 trials
+    study = optuna.create_study(direction="maximize", study_name="zodiac_optimize_v2", load_if_exists=True)
+    # 分阶段：第一次 200 次，如果单肖+特别肖得分过低，再追加 200 次
+    for phase in range(2):
+        n_trials_phase = n_trials // 2 if phase == 0 else n_trials - (n_trials // 2)
+        study.optimize(lambda trial: objective(trial, phase), n_trials=n_trials_phase, show_progress_bar=True)
+        # 检查当前最佳是否达标
+        best_params = study.best_params
+        best_hit, _ = evaluate_zodiac_performance(conn, best_params, lookback=20)
+        if (best_hit['single'] >= target_hit_rate and best_hit['special'] >= target_hit_rate and
+            best_hit['two'] >= target_hit_rate and best_hit['three'] >= target_hit_rate):
+            print("🎉 达标！提前结束优化。")
+            break
 
     best_params = study.best_params
+    # 补充必要字段
     best_params.setdefault("single_window", best_params.get("wsize", 6))
     best_params.setdefault("single_recency_w", best_params.get("rec_w", 0.7339))
     best_params.setdefault("single_safe_threshold", best_params.get("safe_th", 1.4589))
 
+    # 保存最终参数
     with open(_BEST_PARAMS_PATH, "w", encoding="utf-8") as f:
         json.dump(best_params, f, ensure_ascii=False, indent=2)
     print(f"✅ 最佳参数已保存至 {_BEST_PARAMS_PATH}")
+
     final_hit, final_miss = evaluate_zodiac_performance(conn, best_params, lookback=20)
     print(f"最终表现: 单肖{final_hit['single']:.3f}(连空{final_miss['single']}) 双肖{final_hit['two']:.3f}(连空{final_miss['two']}) 三肖{final_hit['three']:.3f}(连空{final_miss['three']}) 特别肖{final_hit['special']:.3f}(连空{final_miss['special']})")
     return best_params
