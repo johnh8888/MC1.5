@@ -6,4 +6,4 @@ lightgbm>=4.0
 xgboost>=2.0
 scikit-learn>=1.8,<1.9
 hmmlearn>=0.3.0
-# tensorflow>=2.15   # 可选，如果需要 LSTM 则取消注释
+# tensorflow>=2.15   # 不需要可以注释，LSTM 将被跳过
