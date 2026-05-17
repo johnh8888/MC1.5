@@ -1,47 +1,31 @@
-name: 新澳门彩每日自动更新与推送
+- name: 同步最新开奖（强制删除旧库）
+  run: |
+    rm -f newmacau_marksix.db
+    python newmacau_marksix.py sync --with-backtest
 
-on:
-  schedule:
-    - cron: '0 14 * * *'      # 北京时间 22:00
-  workflow_dispatch:
+- name: 查看最新期号
+  run: sqlite3 newmacau_marksix.db "SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 1"
 
-jobs:
-  update-predict:
-    runs-on: ubuntu-latest
-    env:
-      PREDICT_LAG: 1
-      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+- name: 回溯精选特别号（确保填充）
+  run: python newmacau_marksix.py backfill-special
 
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+- name: 输出最近20期命中表
+  run: |
+    python -c "
+    import sqlite3, json
+    from newmacau_marksix import connect_db, get_zodiac_by_number
+    conn = connect_db('newmacau_marksix.db')
+    recent = conn.execute('SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 20').fetchall()
+    print('期号 | 特号(生肖) | 精选号 | 命中')
+    for r in recent:
+        issue = r['issue_no']
+        actual = conn.execute('SELECT special_number FROM draws WHERE issue_no=?', (issue,)).fetchone()['special_number']
+        row = conn.execute('SELECT picks_json FROM special_picks_log WHERE issue_no=?', (issue,)).fetchone()
+        picks = json.loads(row['picks_json']) if row else []
+        hit = 'Yes' if actual in picks else 'No'
+        print(f'{issue} | {actual}({get_zodiac_by_number(actual)}) | {picks} | {hit}')
+    conn.close()
+    "
 
-      - name: 设置 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: 删除旧数据库（强制全新同步）
-        run: rm -f newmacau_marksix.db
-        continue-on-error: true
-
-      - name: 同步最新开奖（拉取最近200期）
-        run: python newmacau_marksix.py sync --with-backtest
-
-      - name: 回溯精选特别号历史日志
-        run: python newmacau_marksix.py backfill-special
-
-      - name: 显示最终推荐并推送
-        run: python newmacau_marksix.py show
-
-      - name: 上传数据库
-        uses: actions/upload-artifact@v4
-        with:
-          name: newmacau-db
-          path: newmacau_marksix.db
-          retention-days: 7
+- name: 显示最终推荐
+  run: python newmacau_marksix.py show
