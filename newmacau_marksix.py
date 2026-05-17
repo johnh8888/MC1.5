@@ -66,8 +66,7 @@ except ImportError:
 # 安全包装 HMM 预测，避免缺少 hmmlearn 时崩溃
 def safe_get_hmm_state_proba(conn):
     try:
-        from hmm_features import get_hmm_state_proba  # 澳门用这个
-        # from hmm_features_hk import get_hmm_state_proba  # 香港用这个
+        from hmm_features import get_hmm_state_proba
         return get_hmm_state_proba(conn)
     except Exception:
         return None
@@ -107,7 +106,6 @@ class SpecialLGBModel:
         self.model = model
 
     def build_features(self, conn, issue_no, candidate_num):
-        # 特征提取（严格基于 issue_no 之前的数据）
         rows = conn.execute("""
             SELECT numbers_json, special_number FROM draws
             WHERE issue_no < ? ORDER BY draw_date DESC LIMIT 20
@@ -118,16 +116,13 @@ class SpecialLGBModel:
         draws_set = [json.loads(r["numbers_json"]) for r in rows]
         specials = [int(r["special_number"]) for r in rows]
 
-        # 遗漏值
         omit = 0
         for d in draws_set:
             if candidate_num in d: break
             omit += 1
 
-        # 近5期出现次数
         last5_cnt = sum(1 for d in draws_set[:5] if candidate_num in d)
 
-        # 生肖转移
         zodiac = None
         for z, nums in ZODIAC_MAP.items():
             if candidate_num in nums: zodiac = z; break
@@ -138,11 +133,9 @@ class SpecialLGBModel:
                 if sp_prev in nums: zodiac_prev = z; break
         zodiac_transfer = 1.0 if zodiac and zodiac_prev and zodiac == zodiac_prev else 0.0
 
-        # 尾数转移
         tail_prev = specials[0] % 10 if specials else -1
         tail_transfer = 1.0 if candidate_num % 10 == tail_prev else 0.0
 
-        # 与最近一期主号的邻接度
         adjacency = 0.0
         for num in draws_set[0]:
             if abs(candidate_num - num) == 1: adjacency += 1.0
@@ -192,7 +185,6 @@ class SpecialLGBModel:
         return dict(zip(valid, probs))
 
 # 全局常量
-SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 API_TIMEOUT_DEFAULT = 20
@@ -316,7 +308,6 @@ def _strategy_single_last_special(rows, wsize, rec_w, safe_th):
         return get_zodiac_by_number(sp)
     return "马"
 
-
 def _strategy_single_cold_hot_mix(rows, wsize, rec_w, safe_th):
     hot_scores = {z: 0.0 for z in ZODIAC_MAP}
     cold_scores = {z: 0.0 for z in ZODIAC_MAP}
@@ -363,14 +354,11 @@ def _strategy_two_double_cold(rows):
     sorted_cold = sorted(omission.items(), key=lambda x: -x[1])
     return [sorted_cold[0][0], sorted_cold[1][0]]
 
-# ===== 补充的缺失策略函数 =====
 def _strategy_two_last2_specials(rows):
-    """取最近两期的特别号生肖作为二生肖推荐"""
-    specials = [_row_special(r) for r in rows[:2]]  # rows已按时间倒序，前两条是最近两期
+    specials = [_row_special(r) for r in rows[:2]]
     zodiacs = [get_zodiac_by_number(sp) for sp in specials if sp is not None]
     if len(zodiacs) >= 2:
         return zodiacs[:2]
-    # 不足则补齐默认
     default = ["马", "蛇"]
     while len(zodiacs) < 2:
         for z in default:
@@ -379,15 +367,10 @@ def _strategy_two_last2_specials(rows):
                 break
     return zodiacs[:2]
 
-
 def _strategy_two_hot_special_cold_main(rows):
-    """热特别生肖 + 冷主号生肖"""
-    # 热特别生肖：最近8期特别号中出现最多的生肖
     recent_specials = [_row_special(r) for r in rows[:8]]
     special_zodiacs = [get_zodiac_by_number(sp) for sp in recent_specials]
     hot_special = Counter(special_zodiacs).most_common(1)[0][0] if special_zodiacs else "马"
-
-    # 冷主号生肖：最近12期主号中出现最少的生肖
     main_zodiacs = []
     for r in rows[:12]:
         for n in json.loads(r["numbers_json"]):
@@ -396,29 +379,20 @@ def _strategy_two_hot_special_cold_main(rows):
         cold_main = Counter(main_zodiacs).most_common()[-1][0]
     else:
         cold_main = "龙"
-
-    # 去重后返回
     picks = [hot_special, cold_main]
     if picks[0] == picks[1]:
-        # 如果相同，取次热特别生肖或次冷主号
         if len(special_zodiacs) > 1:
             picks[1] = Counter(special_zodiacs).most_common(2)[1][0]
         else:
             picks[1] = "蛇" if picks[0] != "蛇" else "牛"
     return picks[:2]
 
-
 def _strategy_two_neighbor_pair(rows):
-    """基于最近特别号生肖及其相冲（六冲）生肖作为二推荐"""
     if not rows:
         return ["马", "蛇"]
     latest_sp = _row_special(rows[0])
     latest_z = get_zodiac_by_number(latest_sp)
-    # 从 ZODIAC_PAIR 获取相冲生肖（如鼠-牛相冲？实际 ZODIAC_PAIR 存储的是六合？代码中定义的是"鼠":"牛"...，但通常六冲是鼠马、牛羊等。
-    # 为简单起见，使用定义的 ZODIAC_PAIR 映射（它可能是自反的，如鼠牛互为六合？但这里我们取配偶对）。
-    # 更稳妥：取 ZODIAC_PAIR 中 latest_z 的值，若不存在则取蛇。
     pair = ZODIAC_PAIR.get(latest_z, "蛇")
-    # 如果相冲生肖与自身相同（理论上不会），或需要两个不同，则取另一个常见生肖
     if pair == latest_z:
         pair = "蛇"
     return [latest_z, pair]
@@ -832,7 +806,8 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     history_list = macau_data.get("history", [])
     if history_list and isinstance(history_list, list):
         for line in history_list:
-            match = re.match(r"(\d{7})\s*期[：:]\s*([\d,]+)", line)
+            # 兼容 2026136期: 号码 或 260136期: 号码
+            match = re.match(r"(\d{6,7})\s*期[：:]\s*([\d,]+)", line)
             if not match:
                 continue
             expect_raw = match.group(1)
@@ -843,12 +818,16 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
             main_numbers = num_list[:6]
             special = num_list[6]
 
-            if len(expect_raw) >= 7:
-                year = expect_raw[2:4]
-                seq = str(int(expect_raw[4:]))
-                issue_no = f"{year}/{seq.zfill(3)}"
+            # 增强期号解析：支持7位(2026136)和6位(260136)
+            if len(expect_raw) == 7:
+                year = expect_raw[2:4]   # "26"
+                seq = str(int(expect_raw[4:]))  # "136"
+            elif len(expect_raw) == 6:
+                year = expect_raw[:2]    # "26"
+                seq = str(int(expect_raw[2:]))  # "0136" -> 136
             else:
-                issue_no = expect_raw
+                continue
+            issue_no = f"{year}/{seq.zfill(3)}"
 
             draw_date = _parse_date(macau_data.get("openTime", "").split()[0]) if macau_data.get("openTime") else None
             if not draw_date:
@@ -872,12 +851,16 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
             if len(num_list) >= 7:
                 main_numbers = num_list[:6]
                 special = num_list[6]
-                if len(expect_raw) >= 7:
+                if len(expect_raw) == 7:
                     year = expect_raw[2:4]
                     seq = str(int(expect_raw[4:]))
-                    issue_no = f"{year}/{seq.zfill(3)}"
+                elif len(expect_raw) == 6:
+                    year = expect_raw[:2]
+                    seq = str(int(expect_raw[2:]))
                 else:
-                    issue_no = expect_raw
+                    year = "26"
+                    seq = "001"
+                issue_no = f"{year}/{seq.zfill(3)}"
                 draw_date = _parse_date(macau_data.get("openTime", "").split()[0]) if macau_data.get("openTime") else None
                 if draw_date:
                     records.append(DrawRecord(
@@ -935,7 +918,7 @@ def fetch_macau_records(
 
 
 def fetch_macau_recent_records(
-    limit: int = 120,
+    limit: int = 200,   # 默认获取200期，确保覆盖最新期号
     timeout: int = API_TIMEOUT_DEFAULT,
     retries: int = API_RETRIES_DEFAULT,
     backoff_seconds: float = API_RETRY_BACKOFF_SECONDS,
@@ -1155,7 +1138,6 @@ def _zone_heat_map(draws: List[List[int]], window: int = 3) -> Dict[int, float]:
 
 
 def _adjacency_compensation_map(draws: List[List[int]], window: int = 5) -> Dict[int, float]:
-    """基于最近开奖的邻近补偿：强化与历史开奖号相差1/2的号码"""
     adjacency = {n: 0.0 for n in ALL_NUMBERS}
     w = draws[:window]
     if not w:
@@ -1437,7 +1419,6 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     recent_avg = float(h.get("recent_avg_hit", 0.65))
     cold_streak = int(h.get("cold_streak", 0))
 
-    # 冷号回补特殊处理：统计长期遗漏号码数量
     if strategy == "cold_rebound_v1":
         rows = conn.execute(
             "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 60"
@@ -1447,8 +1428,8 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
             all_nums.extend(json.loads(r["numbers_json"]))
         freq = Counter(all_nums)
         cold_count = sum(1 for n in ALL_NUMBERS if freq.get(n, 0) == 0)
-        if cold_count >= 5:   # 遗漏≥60期的号码超过5个
-            return min(20, base + 8)   # 大幅扩大窗口
+        if cold_count >= 5:
+            return min(20, base + 8)
 
     if recent_avg >= 0.95:
         return max(5, base - 2)
@@ -1463,7 +1444,6 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
 
 # ========== 偏态检测函数（强制偏态模式） ==========
 def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
-    """强制偏态模式：固定偏态系数 0.75"""
     return 0.75, {
         "forced": True,
         "zone_bias": 0.75,
@@ -1550,7 +1530,6 @@ def _generate_special_number_v4(
     return best, round(confidence, 3), defenses
 
 
-# ========== 三中三相关逻辑已移除（此为注释，函数保留） ==========
 def _ensemble_strategy_v3_1(draws, mined_config, strategy_weights, conn, issue_no):
     sub_scores = {}
     for sub in ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]:
@@ -2339,9 +2318,6 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
 
 # ========== 生肖相关函数（优化版） ==========
 def get_consecutive_miss_for_pair(z1: str, z2: str) -> int:
-    """返回 (z1, z2) 这一对生肖组合在历史上连续未中的期数。
-       当前版本留作占位，始终返回0，不干扰现有评分。
-       """
     return 0
 
 
@@ -2353,7 +2329,6 @@ def get_zodiac_by_number(number: int) -> str:
 
 
 def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optional[str]:
-    """获取当前期号的上一期"""
     row = conn.execute(
         """
            SELECT issue_no FROM draws 
@@ -2368,7 +2343,6 @@ def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optiona
 
 
 def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
-    """检查指定期号的双生肖推荐是否命中"""
     draw = conn.execute(
         "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
         (issue_no,)
@@ -2381,7 +2355,6 @@ def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
     winning_zodiacs = {get_zodiac_by_number(n) for n in winning_main}
     winning_zodiacs.add(get_zodiac_by_number(winning_special))
 
-    # 重新生成该期的双生肖推荐（与当前逻辑一致，但不包含上期补偿以避免递归）
     rows = conn.execute(
         """
            SELECT numbers_json, special_number FROM draws 
@@ -2403,7 +2376,6 @@ def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
 
 
 def _zodiac_omission_map(rows: Sequence[sqlite3.Row]) -> Dict[str, int]:
-    """计算每个生肖最近一次出现的期数距离（遗漏值）"""
     zodiac_omission = {z: len(rows) + 1 for z in ZODIAC_MAP.keys()}
     for i, row in enumerate(rows):
         numbers = json.loads(row["numbers_json"])
@@ -2664,7 +2636,6 @@ def get_recent_texiao5_report(conn, lookback=10):
     return {"samples":samples, "hit_rate":rate, "max_miss_streak":max_miss}
 
 
-# 兼容旧调用：特别生肖统计暂时复用四生肖核心逻辑
 _get_five_zodiac_from_history_rows = _get_four_zodiac_from_history_rows
 
 
@@ -2686,7 +2657,6 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None)
             scores[get_zodiac_by_number(int(n))] += w * 0.75
         scores[get_zodiac_by_number(int(r["special_number"]))] += w * 2.35
 
-    # 强化“上期特别号生肖”与“长期遗漏生肖”的协同
     latest_special_z = get_zodiac_by_number(int(rows[0]["special_number"]))
     scores[latest_special_z] += 0.65
     omission = _zodiac_omission_map(rows)
@@ -2712,7 +2682,6 @@ def get_recent_single_zodiac_report(conn: sqlite3.Connection, lookback: int = 20
     miss_streak = 0
     max_streak = 0
     for i in range(start, len(rows)):
-        # 使用第1期到 i-1 期作为历史（同优化器）
         hist_rows = rows[:i]
         pick = _get_single_zodiac_from_history_rows(hist_rows, conn=conn)
         win_main = json.loads(rows[i]["numbers_json"])
@@ -2747,7 +2716,7 @@ def get_recent_two_zodiac_report(conn: sqlite3.Connection, lookback: int = 20) -
         win_sp = int(rows[i]["special_number"])
         win_zod = {get_zodiac_by_number(n) for n in win_main}
         win_zod.add(get_zodiac_by_number(win_sp))
-        hit = 1 if any(z in win_zod for z in picks) else 0   # 修改为二中一标准，与优化器一致
+        hit = 1 if any(z in win_zod for z in picks) else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -2909,7 +2878,6 @@ def get_dynamic_weights(conn: sqlite3.Connection, window: int = 50) -> Dict[str,
 
 
 def get_precise_specials(conn, zodiac_pool, top_n=3):
-    """废弃兼容壳，保留调用但避免直接穿越。"""
     row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if not row:
         return []
@@ -3040,6 +3008,7 @@ def get_trio_from_merged_pool20_v2(conn, issue_no):
                 odd_cnt = sum(1 for x in tri if x % 2 == 1)
                 if 1 <= odd_cnt <= 2: return list(tri)
     return candidates[:3] if len(candidates) >= 3 else pool20[:3]
+
 def get_final_recommendation(conn):
     row = conn.execute("SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1").fetchone()
     if not row: return None
@@ -3210,7 +3179,6 @@ def get_recent_special_picks_report(conn: sqlite3.Connection, lookback: int = 20
 
 # ========== 历史回溯命令 ==========
 def backfill_special_picks_log(conn, max_issues=100):
-    """回溯历史期数，生成精选特别号并写入 special_picks_log"""
     draws = conn.execute(
         "SELECT issue_no, draw_date, special_number FROM draws ORDER BY draw_date ASC"
     ).fetchall()
@@ -3223,14 +3191,12 @@ def backfill_special_picks_log(conn, max_issues=100):
         target_issue = draws[i]['issue_no']
         target_date = draws[i]['draw_date']
 
-        # 跳过已有记录
         existing = conn.execute(
             "SELECT 1 FROM special_picks_log WHERE issue_no = ?", (target_issue,)
         ).fetchone()
         if existing:
             continue
 
-        # 获取目标期之前的历史记录
         history = conn.execute(
             """SELECT numbers_json, special_number FROM draws 
                WHERE draw_date < ? OR (draw_date = ? AND issue_no < ?)
@@ -3306,7 +3272,6 @@ class KellyManager:
             self.bankroll = 0.0
 
     def kelly_stake(self, win_rate: float, odds: float, fraction: float = 0.5) -> float:
-        """ odds 为含本总回报倍数 """
         b = odds - 1.0
         if win_rate <= 0 or b <= 0:
             return 0.0
@@ -3319,7 +3284,6 @@ class KellyManager:
 
 
 def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int], zodiac_two: Optional[Sequence[str]] = None) -> Tuple[Optional[int], List[int], bool]:
-    """特别号独立推荐：以特别号序列为主，主号仅作冲突过滤。"""
     top_votes = get_top_special_votes(conn, issue_no, top_n=8)
     if not top_votes:
         return None, [], False
@@ -3479,9 +3443,6 @@ def get_strong_special_from_strategies(
     return specials, top_zodiacs, best, get_zodiac_by_number(best)
 
 
-
-
-# ========== 特别号投票 ==========
 def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 3) -> List[int]:
     all_specials = []
     for strategy in STRATEGY_IDS:
@@ -3757,7 +3718,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries)
+        records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)  # 增加到200期
         if args.require_continuity:
             missing = missing_issues_since_latest(conn, records)
             if missing:
@@ -3772,6 +3733,11 @@ def cmd_sync(args: argparse.Namespace) -> None:
             bt_issues, bt_runs = run_historical_backtest(conn, rebuild=False, max_issues=BACKTEST_ISSUES_DEFAULT)
         issue = generate_predictions(conn)
         patched = backfill_missing_special_picks(conn)
+        # 自动补充历史精选特别号记录（仅当special_picks_log为空时）
+        cnt = conn.execute("SELECT COUNT(*) FROM special_picks_log").fetchone()[0]
+        if cnt == 0 and total > 30:
+            print("[自动] 检测到 special_picks_log 为空，开始回溯历史精选特别号...")
+            backfill_special_picks_log(conn, max_issues=100)
         print(f"Sync done. total={total}, inserted={inserted}, updated={updated}, reviewed={reviewed}, next_prediction={issue}")
         print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
         if bt_issues > 0:
@@ -3786,7 +3752,6 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        # 清空预测相关表
         conn.execute("DELETE FROM prediction_picks")
         conn.execute("DELETE FROM prediction_pools")
         conn.execute("DELETE FROM prediction_runs")
@@ -3795,18 +3760,15 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
         conn.execute("DELETE FROM model_state WHERE key = ?", (MINED_CONFIG_KEY,))
         conn.commit()
 
-        # 删除 Optuna 历史库（全新搜索）
         optuna_path = SCRIPT_DIR / "optuna_macau_stable.db"
         if optuna_path.exists():
             os.remove(optuna_path)
             print(f"[重置] 已删除 {optuna_path}")
 
-        # 获取最新 120 期数据
-        records = fetch_macau_recent_records(limit=120, timeout=args.api_timeout, retries=args.api_retries)
-        total, inserted, updated = sync_from_records(conn, records, source="macau_api_recent_120")
+        records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
+        total, inserted, updated = sync_from_records(conn, records, source="macau_api_recent_200")
         mined_cfg = ensure_mined_pattern_config(conn, force=True)
 
-        # 自动循环优化
         max_retries = 5
         trials = getattr(args, "trials", 1000)
         optimize_script = SCRIPT_DIR / "hyper_optimize_ultimate_target.py"
@@ -3828,7 +3790,6 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
                 print(f"第 {attempt} 次优化未达标（退出码 {ret.returncode}），继续下一轮...")
                 trials = int(trials * 1.3)
 
-        # 重建回测并生成最终预测
         run_historical_backtest(conn, rebuild=True, max_issues=120)
         generate_predictions(conn)
         print(f"Reset+auto done. total={total}, inserted={inserted}, updated={updated}")
@@ -3881,13 +3842,12 @@ def cmd_show(args: argparse.Namespace) -> None:
         init_db(conn)
         backfill_missing_special_picks(conn)
 
-        # 自动检测并补齐复盘数据
         reviewed_count = conn.execute(
             "SELECT COUNT(*) FROM prediction_runs WHERE status='REVIEWED'"
         ).fetchone()[0]
         if reviewed_count < 10:
             print("检测到复盘数据不足，自动执行 sync --with-backtest ...")
-            records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries)
+            records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
             sync_from_records(conn, records, source="macau_api")
             run_historical_backtest(conn, rebuild=False, max_issues=20)
             generate_predictions(conn)
@@ -3911,7 +3871,6 @@ def cmd_show(args: argparse.Namespace) -> None:
             print("[XGB] 模型未训练（运行 train-xgb 可训练），使用原策略融合主号池。")
 
         model_path_lgb = SCRIPT_DIR / 'lgb_model.pkl'
-        lgb_pool20 = None
         if model_path_lgb.exists():
             import pickle
             try:
@@ -3951,6 +3910,12 @@ def cmd_show(args: argparse.Namespace) -> None:
             merged_zodiacs = [get_zodiac_by_number(n) for n in merged_pool20]
             print(f"[融合] LGB 主号池 Top20: {merged_pool20}")
             print(f"       生肖对应: {' '.join(merged_zodiacs)}")
+
+        # 自动检查并回溯缺失的精选特别号记录
+        cnt = conn.execute("SELECT COUNT(*) FROM special_picks_log").fetchone()[0]
+        if cnt == 0:
+            print("[自动] 发现 special_picks_log 为空，开始回溯历史精选特别号...")
+            backfill_special_picks_log(conn, max_issues=100)
 
         print_dashboard(conn, xgb_pool20=merged_pool20)
     finally:
@@ -3996,7 +3961,6 @@ def cmd_backfill_special(args: argparse.Namespace) -> None:
 
 # ========== 新增全自动优化命令 ==========
 def evaluate_zodiac_performance(conn, params: dict, lookback: int = 20):
-    """使用指定参数评估生肖命中率和最大连空"""
     import shutil
     backup_path = _BEST_PARAMS_PATH.with_suffix(".backup")
     if _BEST_PARAMS_PATH.exists():
@@ -4029,11 +3993,6 @@ def evaluate_zodiac_performance(conn, params: dict, lookback: int = 20):
 
 def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1, 
                        timeout_hours=5, base_trials=200):
-    """
-    持续优化直到达标或超时
-    :param timeout_hours: 最大运行小时数（默认5）
-    :param base_trials: 第一轮试验次数，之后每轮增加200
-    """
     try:
         import optuna
     except ImportError:
@@ -4043,9 +4002,8 @@ def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1,
     start_time = time.time()
     timeout_seconds = timeout_hours * 3600
 
-    # 确保数据充足（至少150期）
-    print(f"📥 同步最新150期开奖数据（超时限制：{timeout_hours}小时）...")
-    records = fetch_macau_recent_records(limit=150)
+    print(f"📥 同步最新200期开奖数据（超时限制：{timeout_hours}小时）...")
+    records = fetch_macau_recent_records(limit=200)
     sync_from_records(conn, records, source="auto_optimize")
     total_rows = conn.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
     print(f"✅ 当前数据库共 {total_rows} 期开奖记录")
@@ -4055,7 +4013,6 @@ def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1,
     round_num = 1
     n_trials = base_trials
 
-    # 可持续扩展的搜索空间函数
     def get_params(trial, round_num):
         dynamic_max = lambda base, inc: min(base + inc * (round_num-1), base*2)
         params = {
@@ -4085,7 +4042,6 @@ def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1,
         params = get_params(trial, round_num)
         hit_rates, max_misses = evaluate_zodiac_performance(conn, params, lookback=20)
         score = hit_rates['single'] + hit_rates['two'] + hit_rates['three'] + hit_rates['special']
-        # 未达标严重惩罚
         if hit_rates['single'] < target_hit_rate or max_misses['single'] > target_max_miss:
             score *= 0.1
         if hit_rates['special'] < target_hit_rate or max_misses['special'] > target_max_miss:
@@ -4094,18 +4050,15 @@ def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1,
             score *= 0.4
         if hit_rates['three'] < target_hit_rate or max_misses['three'] > target_max_miss:
             score *= 0.4
-        # 接近目标给予加成
         if hit_rates['single'] >= 0.85 and hit_rates['special'] >= 0.85:
             score *= 1.5
         return score
 
-    # 主循环：一轮接一轮，直到超时或达标
     while (time.time() - start_time) < timeout_seconds:
         remaining_hours = (timeout_seconds - (time.time() - start_time)) / 3600
         print(f"\n{'='*50}\n第 {round_num} 轮优化 | 剩余时间: {remaining_hours:.1f}小时 | 本轮试验数: {n_trials}\n{'='*50}")
 
         study = optuna.create_study(direction="maximize", study_name=f"zodiac_opt_round{round_num}", load_if_exists=False)
-        # 限制每轮最大耗时（至少留出10分钟最后保存）
         time_for_this_round = max(120, remaining_hours * 3600 - 600)
         study.optimize(lambda trial: objective(trial, round_num), 
                        n_trials=n_trials, 
@@ -4129,7 +4082,6 @@ def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1,
         print(f"  三肖: {hit_rates['three']:.3f} (连空 {max_misses['three']})")
         print(f"  特别肖: {hit_rates['special']:.3f} (连空 {max_misses['special']})")
 
-        # 达标检查
         if (hit_rates['single'] >= target_hit_rate and max_misses['single'] <= target_max_miss and
             hit_rates['two'] >= target_hit_rate and max_misses['two'] <= target_max_miss and
             hit_rates['three'] >= target_hit_rate and max_misses['three'] <= target_max_miss and
@@ -4139,16 +4091,13 @@ def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1,
                 json.dump(best_params, f, ensure_ascii=False, indent=2)
             return best_params
 
-        # 未达标：增加试验次数，继续下一轮（但不超过时间限制）
         n_trials += 200
         round_num += 1
 
-        # 额外时间检查：如果剩余时间不足1小时，放宽要求保存最佳
         if remaining_hours < 1:
             print("⚠️ 剩余时间不足1小时，停止新试验，保存当前最佳参数。")
             break
 
-    # 循环结束（超时或手动退出）
     print(f"\n⏰ 优化时间达到 {timeout_hours} 小时限制，保存当前最佳参数。")
     with open(_BEST_PARAMS_PATH, "w", encoding="utf-8") as f:
         json.dump(best_overall_params, f, ensure_ascii=False, indent=2)
@@ -4260,7 +4209,7 @@ def cmd_check_data(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - v4全面优化版")
+    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - v5 稳定版（自动补全历史精选号）")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
@@ -4281,18 +4230,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.set_defaults(func=cmd_sync)
 
     p_recent = sub.add_parser("recent", help="Fetch and store only the latest N draws from API")
-    p_recent.add_argument("--limit", type=int, default=120, help="Number of recent issues to fetch")
+    p_recent.add_argument("--limit", type=int, default=200, help="Number of recent issues to fetch")
     p_recent.set_defaults(func=cmd_sync_recent)
 
     p_predict = sub.add_parser("predict", help="Generate predictions for next or specified issue")
-    p_predict.add_argument("--issue", help="Target issue, e.g. 26/023")
+    p_predict.add_argument("--issue", help="Target issue, e.g. 26/136")
     p_predict.set_defaults(func=cmd_predict)
 
     p_review = sub.add_parser("review", help="Review pending runs for latest or specified issue")
-    p_review.add_argument("--issue", help="Issue to review, e.g. 26/022")
+    p_review.add_argument("--issue", help="Issue to review, e.g. 26/136")
     p_review.set_defaults(func=cmd_review)
 
-    p_show = sub.add_parser("show", help="Show local dashboard summary")
+    p_show = sub.add_parser("show", help="Show local dashboard summary (auto-backfill missing special picks)")
     p_show.set_defaults(func=cmd_show)
 
     p_backtest = sub.add_parser("backtest", help="Run historical backtest for all draw issues")
@@ -4322,7 +4271,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_auto.add_argument("--base-trials", type=int, default=200, help="首轮试验次数")
     p_auto.set_defaults(func=cmd_auto_optimize)
 
-    p_reset = sub.add_parser("reset-and-auto", help="全自动重置→获取120期→优化近10期→预测")
+    p_reset = sub.add_parser("reset-and-auto", help="全自动重置→获取200期→优化近10期→预测")
     p_reset.add_argument("--trials", type=int, default=1000, help="Optuna trials count")
     p_reset.add_argument("--debug", action="store_true", help="打印每期调试信息")
     p_reset.set_defaults(func=cmd_reset_and_auto)
