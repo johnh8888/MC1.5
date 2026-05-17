@@ -2,14 +2,14 @@ name: 新澳门彩每日自动更新与推送
 
 on:
   schedule:
-    - cron: '0 14 * * *'      # 北京时间 22:00
+    - cron: '0 14 * * *'
   workflow_dispatch:
 
 jobs:
   update-predict:
     runs-on: ubuntu-latest
     env:
-      PREDICT_LAG: 1           # 全局预测前移一期
+      PREDICT_LAG: 1
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
 
     steps:
@@ -26,55 +26,50 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 下载上次运行的数据库
-        uses: dawidd6/action-download-artifact@v2
-        with:
-          workflow: push.yml        # 需与上传的工作流名称一致
-          name: newmacau-db
-          path: .
-          if_no_artifact_found: ignore
+      # 可选：删除旧的数据库，强制全新同步（避免旧数据干扰）
+      - name: 删除旧数据库（调试用）
+        run: rm -f newmacau_marksix.db
         continue-on-error: true
 
-      - name: 初始化数据库（如不存在，拉取最近100期）
+      - name: 同步最新开奖（拉取最近 200 期）
         run: |
-          if [ ! -f "newmacau_marksix.db" ]; then
-            echo "数据库不存在，拉取最近100期数据..."
-            python newmacau_marksix.py recent --limit 100
-          fi
+          python newmacau_marksix.py sync --with-backtest --api-timeout 30 --api-retries 6
 
-      - name: 同步最新开奖并生成预测
-        run: python newmacau_marksix.py sync --with-backtest
+      - name: 显示数据库中的最新期号（验证同步是否成功）
+        run: |
+          sqlite3 newmacau_marksix.db "SELECT issue_no, draw_date FROM draws ORDER BY draw_date DESC LIMIT 5"
 
-      - name: 回溯精选特别号历史日志
-        run: python newmacau_marksix.py backfill-special
+      - name: 手动强制回溯精选特别号（确保填充分）
+        run: |
+          python newmacau_marksix.py backfill-special --max-issues 200
 
-      - name: 临时诊断：查看精选特别号命中详情
+      - name: 验证 special_picks_log 是否已填充
+        run: |
+          sqlite3 newmacau_marksix.db "SELECT COUNT(*) FROM special_picks_log"
+
+      - name: 输出最近20期精选特别号命中情况
         run: |
           python -c "
           import sqlite3, json
-          from newmacau_marksix import *
-
+          from newmacau_marksix import connect_db, get_zodiac_by_number
           conn = connect_db('newmacau_marksix.db')
-          init_db(conn)
-
-          recent = [r['issue_no'] for r in conn.execute('SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 20').fetchall()]
+          recent = conn.execute('SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 20').fetchall()
           print('期号 | 实际特号(生肖) | 精选号 | 命中')
           print('-'*80)
-          for issue in recent:
-              row = conn.execute('SELECT special_number FROM draws WHERE issue_no=?', (issue,)).fetchone()
-              actual = row['special_number']
-              picks = conn.execute('SELECT picks_json FROM special_picks_log WHERE issue_no=?', (issue,)).fetchone()
-              picks_list = json.loads(picks['picks_json']) if picks else []
-              hit = 'Yes' if actual in picks_list else 'No'
-              zodiac = get_zodiac_by_number(actual)
-              print(f'{issue} | {actual}({zodiac}) | {picks_list} | {hit}')
+          for r in recent:
+              issue = r['issue_no']
+              actual = conn.execute('SELECT special_number FROM draws WHERE issue_no=?', (issue,)).fetchone()['special_number']
+              row = conn.execute('SELECT picks_json FROM special_picks_log WHERE issue_no=?', (issue,)).fetchone()
+              picks = json.loads(row['picks_json']) if row else []
+              hit = 'Yes' if actual in picks else 'No'
+              print(f'{issue} | {actual}({get_zodiac_by_number(actual)}) | {picks} | {hit}')
           conn.close()
           "
 
-      - name: 显示最终推荐并自动推送
+      - name: 显示最终推荐并推送
         run: python newmacau_marksix.py show
 
-      - name: 上传数据库
+      - name: 上传数据库（保留7天）
         uses: actions/upload-artifact@v4
         with:
           name: newmacau-db
