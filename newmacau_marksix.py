@@ -875,11 +875,9 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
 
 # ========== 新增：从 weekendhk.com 抓取最新开奖数据 ==========
 def fetch_recent_from_html() -> List[DrawRecord]:
-    """
-    从 weekendhk.com 抓取最新10期的开奖记录
-    """
     try:
-        url = "https://www.weekendhk.com/六合彩結果/"
+        from urllib.parse import quote
+        url = "https://www.weekendhk.com/" + quote("六合彩結果/")
         print(f"[抓取] 正在从 {url} 获取数据...")
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=20) as resp:
