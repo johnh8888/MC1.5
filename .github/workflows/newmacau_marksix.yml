@@ -2,7 +2,7 @@ name: 新澳门彩每日自动更新与推送
 
 on:
   schedule:
-    - cron: '0 14 * * *'      # 每天 UTC 14:00（北京时间 22:00）
+    - cron: '0 14 * * *'      # 北京时间 22:00
   workflow_dispatch:
 
 jobs:
@@ -26,92 +26,10 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 删除旧数据库，确保全新开始（可选）
-      - name: 删除旧数据库
-        run: rm -f newmacau_marksix.db
-        continue-on-error: true
-
-      # 核心：从 CSV 导入 2026 年开奖数据（如果 CSV 存在）
-      - name: 从 CSV 导入 2026 年数据
-        run: |
-          python -c "
-          import csv, sqlite3, json
-          from datetime import datetime
-          from newmacau_marksix import connect_db, init_db
-          conn = connect_db('newmacau_marksix.db')
-          init_db(conn)
-          
-          csv_file = 'newmacau_2026.csv'
-          import os
-          if not os.path.exists(csv_file):
-              print('⚠️ 未找到 newmacau_2026.csv，跳过导入')
-              exit(0)
-          
-          with open(csv_file, 'r', encoding='utf-8') as f:
-              reader = csv.DictReader(f)
-              inserted = 0
-              for row in reader:
-                  issue_no = row['issue_no']
-                  draw_date = row['draw_date']
-                  numbers = [int(x.strip()) for x in row['numbers'].split(',')]
-                  special = int(row['special_number'])
-                  existing = conn.execute('SELECT 1 FROM draws WHERE issue_no=?', (issue_no,)).fetchone()
-                  if existing:
-                      continue
-                  conn.execute('''
-                      INSERT INTO draws(issue_no, draw_date, numbers_json, special_number, source, created_at, updated_at)
-                      VALUES (?, ?, ?, ?, ?, ?, ?)
-                  ''', (issue_no, draw_date, json.dumps(numbers), special, 'csv_import',
-                        datetime.now().isoformat(), datetime.now().isoformat()))
-                  inserted += 1
-              conn.commit()
-              print(f'✅ 从 CSV 成功导入 {inserted} 期数据')
-          "
-        continue-on-error: true
-
-      # 如果没有 CSV，尝试从旧 API 同步（但旧 API 可能无 2026 年数据）
-      - name: 备选：从旧 API 同步（仅当 CSV 缺失时）
-        if: always()
-        run: |
-          if [ ! -f "newmacau_2026.csv" ]; then
-            echo "CSV 文件不存在，回退使用旧 API 同步（可能无法获取 2026 年数据）"
-            python newmacau_marksix.py sync --with-backtest || echo "API 同步失败"
-          fi
-
-      # 显示数据库中的最新期号（验证是否成功获得 2026 年数据）
-      - name: 查看最新期号
-        run: sqlite3 newmacau_marksix.db "SELECT issue_no, draw_date FROM draws ORDER BY draw_date DESC LIMIT 1"
-
-      # 回溯精选特别号历史记录（自动填充 special_picks_log）
-      - name: 回溯精选特别号
-        run: python newmacau_marksix.py backfill-special
-
-      # 输出最近 20 期的精选特别号命中情况（验证 backfill 是否生效）
-      - name: 输出命中表格
-        run: |
-          python -c "
-          import sqlite3, json
-          from newmacau_marksix import connect_db, get_zodiac_by_number
-          conn = connect_db('newmacau_marksix.db')
-          recent = conn.execute('SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 20').fetchall()
-          print('期号 | 实际特号(生肖) | 精选号 | 命中')
-          print('-'*80)
-          for r in recent:
-              issue = r['issue_no']
-              actual = conn.execute('SELECT special_number FROM draws WHERE issue_no=?', (issue,)).fetchone()['special_number']
-              row = conn.execute('SELECT picks_json FROM special_picks_log WHERE issue_no=?', (issue,)).fetchone()
-              picks = json.loads(row['picks_json']) if row else []
-              hit = 'Yes' if actual in picks else 'No'
-              print(f'{issue} | {actual}({get_zodiac_by_number(actual)}) | {picks} | {hit}')
-          conn.close()
-          "
-
-      # 生成最终推荐并推送微信通知
-      - name: 显示最终推荐并推送
+      - name: 运行完整预测（自动同步、回溯、推荐、推送）
         run: python newmacau_marksix.py show
 
-      # 上传数据库作为 artifact（便于下次运行恢复）
-      - name: 上传数据库
+      - name: 上传数据库（可选）
         uses: actions/upload-artifact@v4
         with:
           name: newmacau-db
