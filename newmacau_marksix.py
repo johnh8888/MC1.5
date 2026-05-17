@@ -875,65 +875,58 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
 
 # ========== 新增：从 weekendhk.com 抓取最新开奖数据 ==========
 def fetch_recent_from_html() -> List[DrawRecord]:
+    """
+    从 weekendhk.com 抓取最新10期的开奖记录
+    """
     try:
         from urllib.parse import quote
+        # 对 URL 中的中文字符进行编码
         url = "https://www.weekendhk.com/" + quote("六合彩結果/")
         print(f"[抓取] 正在从 {url} 获取数据...")
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=20) as resp:
             html = resp.read().decode('utf-8')
         
-        # 提取包含开奖结果的script变量
+        # 原有的解析代码（保持不变）
         matches = re.findall(r'var drawData = (\[.*?\]);', html, re.DOTALL)
         if not matches:
             print("[抓取] 未找到 drawData 变量")
             return []
         
         draw_data = json.loads(matches[0])
-        
         records = []
         for item in draw_data:
-            # 期号格式转换
             issue_raw = item.get('expect', '')
             if not issue_raw:
                 continue
-            # 处理可能包含 "期" 字的情况
             issue_raw = re.sub(r'期$', '', issue_raw)
             if len(issue_raw) >= 7:
-                # 例如 "2026136" -> "26/136"
                 year = issue_raw[2:4]
                 seq = str(int(issue_raw[4:]))
                 issue_no = f"{year}/{seq.zfill(3)}"
             elif len(issue_raw) == 6:
-                # 例如 "260136" -> "26/136"
                 year = issue_raw[:2]
                 seq = str(int(issue_raw[2:]))
                 issue_no = f"{year}/{seq.zfill(3)}"
             else:
                 continue
             
-            # 提取号码
             open_code = item.get('openCode', '')
             numbers_raw = re.findall(r'\d+', open_code)
             if len(numbers_raw) >= 7:
                 main_numbers = [int(n) for n in numbers_raw[:6]]
                 special_number = int(numbers_raw[6])
-                
-                # 日期处理
                 draw_date = item.get('drawDate', '')
                 if not draw_date:
                     draw_date = datetime.now().strftime("%Y-%m-%d")
                 else:
                     draw_date = _parse_date(draw_date) or draw_date
-                
-                record = DrawRecord(
+                records.append(DrawRecord(
                     issue_no=issue_no,
                     draw_date=draw_date,
                     numbers=main_numbers,
                     special_number=special_number,
-                )
-                records.append(record)
-        
+                ))
         print(f"[抓取] 成功获取 {len(records)} 期数据")
         return records
     except Exception as e:
