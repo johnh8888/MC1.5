@@ -2,7 +2,7 @@ name: 新澳门彩每日自动更新与推送
 
 on:
   schedule:
-    - cron: '0 14 * * *'
+    - cron: '0 14 * * *'      # 北京时间 22:00
   workflow_dispatch:
 
 jobs:
@@ -26,50 +26,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 可选：删除旧的数据库，强制全新同步（避免旧数据干扰）
-      - name: 删除旧数据库（调试用）
+      - name: 删除旧数据库（强制全新同步）
         run: rm -f newmacau_marksix.db
         continue-on-error: true
 
-      - name: 同步最新开奖（拉取最近 200 期）
-        run: |
-          python newmacau_marksix.py sync --with-backtest --api-timeout 30 --api-retries 6
+      - name: 同步最新开奖（拉取最近200期）
+        run: python newmacau_marksix.py sync --with-backtest
 
-      - name: 显示数据库中的最新期号（验证同步是否成功）
-        run: |
-          sqlite3 newmacau_marksix.db "SELECT issue_no, draw_date FROM draws ORDER BY draw_date DESC LIMIT 5"
-
-      - name: 手动强制回溯精选特别号（确保填充分）
-        run: |
-          python newmacau_marksix.py backfill-special --max-issues 200
-
-      - name: 验证 special_picks_log 是否已填充
-        run: |
-          sqlite3 newmacau_marksix.db "SELECT COUNT(*) FROM special_picks_log"
-
-      - name: 输出最近20期精选特别号命中情况
-        run: |
-          python -c "
-          import sqlite3, json
-          from newmacau_marksix import connect_db, get_zodiac_by_number
-          conn = connect_db('newmacau_marksix.db')
-          recent = conn.execute('SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 20').fetchall()
-          print('期号 | 实际特号(生肖) | 精选号 | 命中')
-          print('-'*80)
-          for r in recent:
-              issue = r['issue_no']
-              actual = conn.execute('SELECT special_number FROM draws WHERE issue_no=?', (issue,)).fetchone()['special_number']
-              row = conn.execute('SELECT picks_json FROM special_picks_log WHERE issue_no=?', (issue,)).fetchone()
-              picks = json.loads(row['picks_json']) if row else []
-              hit = 'Yes' if actual in picks else 'No'
-              print(f'{issue} | {actual}({get_zodiac_by_number(actual)}) | {picks} | {hit}')
-          conn.close()
-          "
+      - name: 回溯精选特别号历史日志
+        run: python newmacau_marksix.py backfill-special
 
       - name: 显示最终推荐并推送
         run: python newmacau_marksix.py show
 
-      - name: 上传数据库（保留7天）
+      - name: 上传数据库
         uses: actions/upload-artifact@v4
         with:
           name: newmacau-db
