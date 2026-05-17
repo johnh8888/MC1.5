@@ -806,7 +806,6 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     history_list = macau_data.get("history", [])
     if history_list and isinstance(history_list, list):
         for line in history_list:
-            # 兼容 2026136期: 号码 或 260136期: 号码
             match = re.match(r"(\d{6,7})\s*期[：:]\s*([\d,]+)", line)
             if not match:
                 continue
@@ -818,13 +817,12 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
             main_numbers = num_list[:6]
             special = num_list[6]
 
-            # 增强期号解析：支持7位(2026136)和6位(260136)
             if len(expect_raw) == 7:
-                year = expect_raw[2:4]   # "26"
-                seq = str(int(expect_raw[4:]))  # "136"
+                year = expect_raw[2:4]
+                seq = str(int(expect_raw[4:]))
             elif len(expect_raw) == 6:
-                year = expect_raw[:2]    # "26"
-                seq = str(int(expect_raw[2:]))  # "0136" -> 136
+                year = expect_raw[:2]
+                seq = str(int(expect_raw[2:]))
             else:
                 continue
             issue_no = f"{year}/{seq.zfill(3)}"
@@ -875,6 +873,75 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
         dedup[r.issue_no] = r
     return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
 
+# ========== 新增：从 weekendhk.com 抓取最新开奖数据 ==========
+def fetch_recent_from_html() -> List[DrawRecord]:
+    """
+    从 weekendhk.com 抓取最新10期的开奖记录
+    """
+    try:
+        url = "https://www.weekendhk.com/六合彩結果/"
+        print(f"[抓取] 正在从 {url} 获取数据...")
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=20) as resp:
+            html = resp.read().decode('utf-8')
+        
+        # 提取包含开奖结果的script变量
+        matches = re.findall(r'var drawData = (\[.*?\]);', html, re.DOTALL)
+        if not matches:
+            print("[抓取] 未找到 drawData 变量")
+            return []
+        
+        draw_data = json.loads(matches[0])
+        
+        records = []
+        for item in draw_data:
+            # 期号格式转换
+            issue_raw = item.get('expect', '')
+            if not issue_raw:
+                continue
+            # 处理可能包含 "期" 字的情况
+            issue_raw = re.sub(r'期$', '', issue_raw)
+            if len(issue_raw) >= 7:
+                # 例如 "2026136" -> "26/136"
+                year = issue_raw[2:4]
+                seq = str(int(issue_raw[4:]))
+                issue_no = f"{year}/{seq.zfill(3)}"
+            elif len(issue_raw) == 6:
+                # 例如 "260136" -> "26/136"
+                year = issue_raw[:2]
+                seq = str(int(issue_raw[2:]))
+                issue_no = f"{year}/{seq.zfill(3)}"
+            else:
+                continue
+            
+            # 提取号码
+            open_code = item.get('openCode', '')
+            numbers_raw = re.findall(r'\d+', open_code)
+            if len(numbers_raw) >= 7:
+                main_numbers = [int(n) for n in numbers_raw[:6]]
+                special_number = int(numbers_raw[6])
+                
+                # 日期处理
+                draw_date = item.get('drawDate', '')
+                if not draw_date:
+                    draw_date = datetime.now().strftime("%Y-%m-%d")
+                else:
+                    draw_date = _parse_date(draw_date) or draw_date
+                
+                record = DrawRecord(
+                    issue_no=issue_no,
+                    draw_date=draw_date,
+                    numbers=main_numbers,
+                    special_number=special_number,
+                )
+                records.append(record)
+        
+        print(f"[抓取] 成功获取 {len(records)} 期数据")
+        return records
+    except Exception as e:
+        print(f"[抓取] 失败: {e}")
+        return []
+
 
 def fetch_macau_records(
     timeout: int = API_TIMEOUT_DEFAULT,
@@ -918,7 +985,7 @@ def fetch_macau_records(
 
 
 def fetch_macau_recent_records(
-    limit: int = 200,   # 默认获取200期，确保覆盖最新期号
+    limit: int = 200,
     timeout: int = API_TIMEOUT_DEFAULT,
     retries: int = API_RETRIES_DEFAULT,
     backoff_seconds: float = API_RETRY_BACKOFF_SECONDS,
@@ -3718,26 +3785,34 @@ def cmd_sync(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)  # 增加到200期
-        if args.require_continuity:
-            missing = missing_issues_since_latest(conn, records)
-            if missing:
-                raise RuntimeError(
-                    f"Continuity check failed. Missing {len(missing)} issues, sample={','.join(missing[:10])}"
-                )
+        
+        # 优先使用HTML抓取（weekendhk.com）
+        records = fetch_recent_from_html()
+        if not records:
+            print("[同步] HTML抓取无数据，尝试使用原有API...")
+            records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
+        
+        if not records:
+            print("[错误] 所有数据源均失败，请稍后重试")
+            return
+        
         total, inserted, updated = sync_from_records(conn, records, source="macau_api")
         mined_cfg = ensure_mined_pattern_config(conn, force=args.remine)
         reviewed = review_latest(conn)
         bt_issues, bt_runs = 0, 0
+        
         if args.with_backtest:
             bt_issues, bt_runs = run_historical_backtest(conn, rebuild=False, max_issues=BACKTEST_ISSUES_DEFAULT)
+        
         issue = generate_predictions(conn)
         patched = backfill_missing_special_picks(conn)
+        
         # 自动补充历史精选特别号记录（仅当special_picks_log为空时）
         cnt = conn.execute("SELECT COUNT(*) FROM special_picks_log").fetchone()[0]
         if cnt == 0 and total > 30:
             print("[自动] 检测到 special_picks_log 为空，开始回溯历史精选特别号...")
             backfill_special_picks_log(conn, max_issues=100)
+        
         print(f"Sync done. total={total}, inserted={inserted}, updated={updated}, reviewed={reviewed}, next_prediction={issue}")
         print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
         if bt_issues > 0:
@@ -3765,8 +3840,8 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
             os.remove(optuna_path)
             print(f"[重置] 已删除 {optuna_path}")
 
-        records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
-        total, inserted, updated = sync_from_records(conn, records, source="macau_api_recent_200")
+        records = fetch_recent_from_html() or fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
+        total, inserted, updated = sync_from_records(conn, records, source="auto_reset")
         mined_cfg = ensure_mined_pattern_config(conn, force=True)
 
         max_retries = 5
@@ -3802,11 +3877,13 @@ def cmd_sync_recent(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_macau_recent_records(
-            limit=args.limit,
-            timeout=args.api_timeout,
-            retries=args.api_retries,
-        )
+        records = fetch_recent_from_html()
+        if not records:
+            records = fetch_macau_recent_records(
+                limit=args.limit,
+                timeout=args.api_timeout,
+                retries=args.api_retries,
+            )
         total, inserted, updated = sync_from_records(conn, records, source="macau_api_recent")
         print(f"Recent sync done. limit={args.limit}, total={total}, inserted={inserted}, updated={updated}")
     finally:
@@ -3847,7 +3924,9 @@ def cmd_show(args: argparse.Namespace) -> None:
         ).fetchone()[0]
         if reviewed_count < 10:
             print("检测到复盘数据不足，自动执行 sync --with-backtest ...")
-            records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
+            records = fetch_recent_from_html()
+            if not records:
+                records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
             sync_from_records(conn, records, source="macau_api")
             run_historical_backtest(conn, rebuild=False, max_issues=20)
             generate_predictions(conn)
@@ -3959,7 +4038,7 @@ def cmd_backfill_special(args: argparse.Namespace) -> None:
         conn.close()
 
 
-# ========== 新增全自动优化命令 ==========
+# ========== 全自动优化命令 ==========
 def evaluate_zodiac_performance(conn, params: dict, lookback: int = 20):
     import shutil
     backup_path = _BEST_PARAMS_PATH.with_suffix(".backup")
@@ -4003,7 +4082,7 @@ def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1,
     timeout_seconds = timeout_hours * 3600
 
     print(f"📥 同步最新200期开奖数据（超时限制：{timeout_hours}小时）...")
-    records = fetch_macau_recent_records(limit=200)
+    records = fetch_recent_from_html() or fetch_macau_recent_records(limit=200)
     sync_from_records(conn, records, source="auto_optimize")
     total_rows = conn.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
     print(f"✅ 当前数据库共 {total_rows} 期开奖记录")
@@ -4209,7 +4288,7 @@ def cmd_check_data(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - v5 稳定版（自动补全历史精选号）")
+    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - v5 稳定版（支持HTML抓取）")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
