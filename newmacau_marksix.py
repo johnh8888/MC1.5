@@ -845,7 +845,7 @@ def fetch_recent_from_html() -> List[DrawRecord]:
         return []
 
 
-def fetch_records_with_fallback(limit: int = 200, timeout: int = API_TIMEOUT_DEFAULT, retries: int = API_RETRIES_DEFAULT) -> List[DrawRecord]:
+def fetch_records_with_fallback(limit: int = 100, timeout: int = API_TIMEOUT_DEFAULT, retries: int = API_RETRIES_DEFAULT) -> List[DrawRecord]:
     records = fetch_recent_from_html()
     if records:
         return records
@@ -895,7 +895,7 @@ def fetch_macau_records(
 
 
 def fetch_macau_recent_records(
-    limit: int = 200,
+    limit: int = 100,
     timeout: int = API_TIMEOUT_DEFAULT,
     retries: int = API_RETRIES_DEFAULT,
     backoff_seconds: float = API_RETRY_BACKOFF_SECONDS,
@@ -2197,27 +2197,26 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 # ========== 动态权重相关函数 ==========
 def get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT):
     rows = conn.execute("""
-        SELECT strategy,
-               AVG(main_hit_count) as avg_hit,
-               AVG(COALESCE(main_hit_count, 0) / 6.0) as avg_rate,
-               AVG(CASE WHEN main_hit_count >= 1 THEN 1.0 ELSE 0.0 END) AS hit1_rate,
-               AVG(CASE WHEN main_hit_count >= 2 THEN 1.0 ELSE 0.0 END) AS hit2_rate
-        FROM strategy_performance
-        WHERE issue_no IN (
-            SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT ?
-        )
-        GROUP BY strategy
+        SELECT sp.strategy, sp.main_hit_count, dr.draw_date
+        FROM strategy_performance sp
+        JOIN draws dr ON dr.issue_no = sp.issue_no
+        ORDER BY dr.draw_date DESC, dr.issue_no DESC
+        LIMIT ?
     """, (window,)).fetchall()
 
     baseline = 0.6
     weights = {s: baseline for s in STRATEGY_IDS}
     protection_msgs = []
 
-    for r in rows:
-        strategy = str(r["strategy"])
-        avg_hit = float(r["avg_hit"] or 0.0)
-        if strategy in weights:
-            weights[strategy] = max(avg_hit, baseline)
+    if rows:
+        # 近期更高权重，避免长期历史稀释当前状态
+        for idx, r in enumerate(rows):
+            strategy = str(r["strategy"])
+            if strategy not in weights:
+                continue
+            hit = float(r["main_hit_count"] or 0.0)
+            recency_w = 1.0 / (1.0 + idx * 0.12)
+            weights[strategy] += (hit / 6.0) * recency_w
 
     health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
     for strategy, h in health.items():
@@ -2225,47 +2224,28 @@ def get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT):
             continue
         hit1_rate = float(h.get("hit1_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
-        shrink = 1.0
-        if strategy == "cold_rebound_v1":
-            if cold_streak >= 2:
-                shrink *= 0.85
         if strategy == "pattern_mined_v1":
             if cold_streak >= 5:
-                shrink *= 0.65
-            elif cold_streak >= 1:
-                shrink *= 0.82
-            weights[strategy] = max(0.12, weights[strategy] * shrink)
+                weights[strategy] *= 0.72
+            elif cold_streak >= 2:
+                weights[strategy] *= 0.85
             if cold_streak >= 1:
                 protection_msgs.append(f"[保护] 规律挖掘连挂 {cold_streak}，权重已平滑下调")
+        elif strategy == "momentum_v1":
+            if hit1_rate < 0.5:
+                weights[strategy] *= 0.86
+            if cold_streak >= 2:
+                weights[strategy] *= 0.80
+        elif strategy == "cold_rebound_v1":
+            if cold_streak >= 2:
+                weights[strategy] *= 0.88
         else:
             if hit1_rate < 0.52:
-                shrink *= 0.90
+                weights[strategy] *= 0.92
             if cold_streak >= 2:
-                shrink *= 0.78
-            if strategy == "momentum_v1":
-                avg_rate_6 = float(h.get("recent_avg_hit", 0.0))
-                if avg_rate_6 < 0.15:
-                    shrink *= 0.80
-                    protection_msgs.append(f"[保护] 动量策略6码命中率过低({avg_rate_6*100:.1f}%)，下调权重")
-            weights[strategy] = max(0.10, weights[strategy] * shrink)
+                weights[strategy] *= 0.84
 
-    long_rows = conn.execute("""
-        SELECT strategy, AVG(main_hit_count) as avg_hit_long
-        FROM strategy_performance
-        WHERE issue_no IN (
-            SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 50
-        )
-        GROUP BY strategy
-    """).fetchall()
-    long_dict = {r["strategy"]: r["avg_hit_long"] for r in long_rows}
-
-    for strategy in STRATEGY_IDS:
-        short_avg = weights[strategy]
-        long_avg = float(long_dict.get(strategy, short_avg) or short_avg)
-        combined = 0.6 * short_avg + 0.4 * max(long_avg, baseline)
-        weights[strategy] = combined
-
-    total = sum(weights.values())
+    total = sum(weights.values()) or 1.0
     for msg in protection_msgs:
         print(msg, flush=True)
     return {k: round(v / total, 4) for k, v in weights.items()}
@@ -2470,8 +2450,15 @@ def get_single_zodiac_pick(conn, issue_no, window=6):
     rec_w = float(params.get("rec_w", 0.7339))
     safe_th = float(params.get("safe_th", 1.4589))
 
+    target_row = conn.execute(
+        "SELECT draw_date FROM draws WHERE issue_no = ?",
+        (issue_no,),
+    ).fetchone()
+    if not target_row:
+        return ""
     rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 16"
+        "SELECT numbers_json, special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT 16",
+        (issue_no, issue_no, issue_no),
     ).fetchall()
     if not rows:
         return ""
@@ -2941,26 +2928,28 @@ def _weighted_consensus_pools(conn, issue_no):
     strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
     number_scores = {}
     special_scores = {}
-    for strategy in STRATEGY_IDS:
-        run = conn.execute(
-            "SELECT id FROM prediction_runs WHERE issue_no=? AND strategy=? AND status='PENDING'",
-            (issue_no, strategy)
-        ).fetchone()
-        if not run: continue
+    run_rows = conn.execute(
+        "SELECT id, strategy FROM prediction_runs WHERE issue_no=? AND status='PENDING'",
+        (issue_no,)
+    ).fetchall()
+    for idx, run in enumerate(run_rows):
         run_id = int(run["id"])
-        w = float(strategy_weights.get(strategy, 1.0 / len(STRATEGY_IDS)))
+        strategy = str(run["strategy"])
+        w = float(strategy_weights.get(strategy, 1.0 / max(len(STRATEGY_IDS), 1)))
+        recency_w = 1.0 / (1.0 + idx * 0.15)
         pool20 = get_pool_numbers_for_run(conn, run_id, 20)
-        for idx, n in enumerate(pool20):
-            if not (1 <= int(n) <= 49): continue
-            rank_boost = (20 - idx) / 20.0
-            number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * rank_boost
+        for rank_idx, n in enumerate(pool20):
+            if not (1 <= int(n) <= 49):
+                continue
+            rank_boost = (20 - rank_idx) / 20.0
+            number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * recency_w * rank_boost
         main6 = get_pool_numbers_for_run(conn, run_id, 6)
         for n in main6:
             if 1 <= int(n) <= 49:
-                number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * 0.35
+                number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * recency_w * 0.45
         _, special = get_picks_for_run(conn, run_id)
         if special is not None and 1 <= int(special) <= 49:
-            special_scores[int(special)] = special_scores.get(int(special), 0.0) + w
+            special_scores[int(special)] = special_scores.get(int(special), 0.0) + w * recency_w
 
     if not number_scores: return [], [], [], [], None
 
@@ -3387,7 +3376,7 @@ def get_strong_special_from_strategies(
         weighted_scores[n] = weighted_scores.get(n, 0.0) + w
 
     recent_specials = [int(r["special_number"]) for r in conn.execute(
-        "SELECT special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 30"
+        "SELECT special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 20"
     ).fetchall()]
     omission = {n: 31 for n in ALL_NUMBERS}
     for idx, n in enumerate(recent_specials):
@@ -3403,22 +3392,24 @@ def get_strong_special_from_strategies(
 
     model_score: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
     for z, cnt in zodiac_counter.items():
-        model_score[z] += cnt * 2.8
-    for z, cnt in recent_zodiac_counter.items():
-        model_score[z] += cnt * 0.25
+        model_score[z] += cnt * 2.2
+    for idx, z in enumerate(recent_special_zodiacs[:8]):
+        model_score[z] += max(0.7, 2.2 - idx * 0.25)
+    for idx, z in enumerate(recent_main_zodiacs[:36]):
+        model_score[z] += max(0.12, 0.8 - idx * 0.02)
     hot_special = [z for z, _ in Counter(recent_special_zodiacs).most_common(1)]
     for z in hot_special:
-        model_score[z] += 2.0
+        model_score[z] += 1.6
     omission_zodiac: Dict[str, int] = {z: 0 for z in ZODIAC_MAP.keys()}
     for idx, sp in enumerate(recent_specials):
         oz = get_zodiac_by_number(sp)
-        omission_zodiac[oz] = max(omission_zodiac.get(oz, 0), 30 - idx)
+        omission_zodiac[oz] = max(omission_zodiac.get(oz, 0), 24 - idx)
     cold_zodiacs = [z for z, _ in sorted(omission_zodiac.items(), key=lambda x: (-x[1], x[0]))[:2]]
     for z in cold_zodiacs:
-        model_score[z] += 4.2
+        model_score[z] += 3.4
     for z in ZODIAC_MAP.keys():
         if omission_zodiac.get(z, 0) >= 5:
-            model_score[z] += 2.2
+            model_score[z] += 1.6
     ranked_zodiacs = sorted(model_score.items(), key=lambda x: (-x[1], x[0]))
     top_zodiacs = [z for z, _ in ranked_zodiacs[:4]]
     if len(top_zodiacs) < 4:
@@ -3545,17 +3536,33 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
-def print_dashboard(conn: sqlite3.Connection) -> None:
-    latest = get_latest_draw(conn)
-    if latest:
-        nums = " ".join(_fmt_num(n) for n in json.loads(latest["numbers_json"]))
-        print(f"最新开奖: {latest['issue_no']} {latest['draw_date']} | 主号: {nums} | 特别号: {_fmt_num(int(latest['special_number']))}")
+def print_dashboard(conn: sqlite3.Connection, recent_online: Optional[List[DrawRecord]] = None) -> None:
+    print("\n========== 线上最新开奖 ==========")
+    if recent_online:
+        latest_online = recent_online[-1]
+        print(
+            f"最新开奖(线上): {latest_online.issue_no} {latest_online.draw_date} | "
+            f"主号: {' '.join(_fmt_num(n) for n in latest_online.numbers)} | 特别号: {_fmt_num(latest_online.special_number)}"
+        )
+        print("最近10期(线上):")
+        for r in recent_online[-10:][::-1]:
+            print(
+                f"  {r.issue_no} {r.draw_date} | 主号: {' '.join(_fmt_num(n) for n in r.numbers)} | 特别号: {_fmt_num(r.special_number)}"
+            )
     else:
-        print("暂无开奖数据。")
+        latest = get_latest_draw(conn)
+        if latest:
+            nums = " ".join(_fmt_num(n) for n in json.loads(latest["numbers_json"]))
+            print(f"最新开奖: {latest['issue_no']} {latest['draw_date']} | 主号: {nums} | 特别号: {_fmt_num(int(latest['special_number']))}")
+        else:
+            print("暂无开奖数据。")
 
+    print("\n========== 当前推荐 ==========")
     print_recommendation_sheet(conn, limit=8)
+    print_final_recommendation(conn)
 
-    print("\n策略最近10期平均命中率:")
+    print("\n========== 复盘与健康度 ==========")
+    print("策略最近10期平均命中率:")
     stats_10 = get_review_stats(conn, window=10)
     if not stats_10:
         print("  (近期暂无复盘数据，请先运行 sync)")
@@ -3613,9 +3620,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     if one_rep['hit_rate'] >= 0.9 and two_rep['hit_rate'] >= 0.8 and four_rep['hit_rate'] >= 1.0:
         print("🎉 达标！")
 
-    print_final_recommendation(conn)
-
-    print("\n" + review_latest_prediction(conn))
+    print("\n========== 复盘记录 ==========")
+    print(review_latest_prediction(conn))
 
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
@@ -3707,7 +3713,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         init_db(conn)
 
         records = fetch_records_with_fallback(
-            limit=200,
+            limit=100,
             timeout=args.api_timeout,
             retries=args.api_retries,
         )
@@ -3758,7 +3764,7 @@ def cmd_reset_and_auto(args: argparse.Namespace) -> None:
             os.remove(optuna_path)
             print(f"[重置] 已删除 {optuna_path}")
 
-        records = fetch_recent_from_html() or fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
+        records = fetch_records_with_fallback(limit=100, timeout=args.api_timeout, retries=args.api_retries)
         total, inserted, updated = sync_from_records(conn, records, source="auto_reset")
         mined_cfg = ensure_mined_pattern_config(conn, force=True)
 
@@ -3842,7 +3848,7 @@ def cmd_show(args: argparse.Namespace) -> None:
         ).fetchone()[0]
         if reviewed_count < 10:
             print("检测到复盘数据不足，自动执行 sync --with-backtest ...")
-            records = fetch_records_with_fallback(limit=200, timeout=args.api_timeout, retries=args.api_retries)
+            records = fetch_records_with_fallback(limit=100, timeout=args.api_timeout, retries=args.api_retries)
             if records:
                 sync_from_records(conn, records, source="macau_api")
                 run_historical_backtest(conn, rebuild=False, max_issues=20)
@@ -3858,7 +3864,7 @@ def cmd_show(args: argparse.Namespace) -> None:
             print("[自动] 发现 special_picks_log 为空，开始回溯历史精选特别号...")
             backfill_special_picks_log(conn, max_issues=100)
 
-        print_dashboard(conn)
+        print_dashboard(conn, recent_online=records[:10] if records else None)
     finally:
         conn.close()
 
@@ -3943,8 +3949,8 @@ def auto_optimize_loop(conn, target_hit_rate=0.90, target_max_miss=1,
     start_time = time.time()
     timeout_seconds = timeout_hours * 3600
 
-    print(f"📥 同步最新200期开奖数据（超时限制：{timeout_hours}小时）...")
-    records = fetch_recent_from_html() or fetch_macau_recent_records(limit=200)
+    print(f"📥 同步最新100期开奖数据（超时限制：{timeout_hours}小时）...")
+    records = fetch_records_with_fallback(limit=100)
     sync_from_records(conn, records, source="auto_optimize")
     total_rows = conn.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
     print(f"✅ 当前数据库共 {total_rows} 期开奖记录")
