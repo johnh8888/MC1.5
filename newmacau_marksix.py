@@ -53,10 +53,8 @@ except Exception:
     def get_best_tail(*args, **kwargs): return []
     def backtest_tail(*args, **kwargs): return 0.0, 0, 0
 
-try:
-    from zodiac_strict import get_three_zodiac_picks
-except Exception:
-    def get_three_zodiac_picks(*args, **kwargs): return ["马", "蛇", "龙"]
+def get_three_zodiac_picks_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) -> List[str]:
+    return _get_three_zodiac_from_history_rows(rows, conn=conn)
 
 try:
     from lstm_predictor import predict_lstm_proba
@@ -78,111 +76,6 @@ except Exception:
         def __init__(self, bankroll: float = 1000.0): self.bankroll = bankroll
         def get_bet_recommendation(self, *_args, **_kwargs): return {"suspended": False, "recommended_stake": 0.0}
 
-try:
-    from xgboost_predictor import XGBoostPredictor
-except Exception:
-    class XGBoostPredictor:
-        def train(self, conn): return None
-        def predict_pool(self, conn, top_k: int = 20): return []
-
-try:
-    from lightgbm_predictor import LightGBMPredictor
-except Exception:
-    class LightGBMPredictor:
-        def train(self, conn): return None
-        def predict_pool(self, conn, top_k: int = 20): return []
-
-# LightGBM 特别号分类器
-try:
-    import numpy as np
-    import lightgbm as lgb
-except ImportError:
-    lgb = None
-    np = None
-
-class SpecialLGBModel:
-    """LightGBM 二分类模型，用于特别号概率预测"""
-    def __init__(self, model=None):
-        self.model = model
-
-    def build_features(self, conn, issue_no, candidate_num):
-        rows = conn.execute("""
-            SELECT numbers_json, special_number FROM draws
-            WHERE issue_no < ? ORDER BY draw_date DESC LIMIT 20
-        """, (issue_no,)).fetchall()
-        if len(rows) < 5:
-            return None
-
-        draws_set = [json.loads(r["numbers_json"]) for r in rows]
-        specials = [int(r["special_number"]) for r in rows]
-
-        omit = 0
-        for d in draws_set:
-            if candidate_num in d: break
-            omit += 1
-
-        last5_cnt = sum(1 for d in draws_set[:5] if candidate_num in d)
-
-        zodiac = None
-        for z, nums in ZODIAC_MAP.items():
-            if candidate_num in nums: zodiac = z; break
-        zodiac_prev = None
-        if len(specials) >= 2:
-            sp_prev = specials[0]
-            for z, nums in ZODIAC_MAP.items():
-                if sp_prev in nums: zodiac_prev = z; break
-        zodiac_transfer = 1.0 if zodiac and zodiac_prev and zodiac == zodiac_prev else 0.0
-
-        tail_prev = specials[0] % 10 if specials else -1
-        tail_transfer = 1.0 if candidate_num % 10 == tail_prev else 0.0
-
-        adjacency = 0.0
-        for num in draws_set[0]:
-            if abs(candidate_num - num) == 1: adjacency += 1.0
-            elif abs(candidate_num - num) == 2: adjacency += 0.5
-
-        return [omit, last5_cnt, zodiac_transfer, tail_transfer, adjacency]
-
-    def train(self, conn, max_samples=5000):
-        if lgb is None:
-            print("[SpecialLGB] 未安装 lightgbm，跳过训练")
-            return
-        X, y = [], []
-        issues = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date ASC").fetchall()
-        if len(issues) < 50:
-            print("[SpecialLGB] 数据不足，跳过训练")
-            return
-        for idx in range(30, len(issues)):
-            target_issue = issues[idx]["issue_no"]
-            actual_sp = conn.execute("SELECT special_number FROM draws WHERE issue_no=?", (target_issue,)).fetchone()["special_number"]
-            main_nums = set(json.loads(conn.execute("SELECT numbers_json FROM draws WHERE issue_no=?", (target_issue,)).fetchone()["numbers_json"]))
-            candidates = [n for n in ALL_NUMBERS if n not in main_nums]
-            if not candidates: continue
-            for n in candidates[:20]:
-                feat = self.build_features(conn, target_issue, n)
-                if feat is None: continue
-                X.append(feat)
-                y.append(1 if n == actual_sp else 0)
-            if len(X) >= max_samples: break
-        if len(X) < 100: return
-        model = lgb.LGBMClassifier(n_estimators=150, max_depth=6, class_weight='balanced', verbose=-1)
-        model.fit(np.array(X), np.array(y))
-        self.model = model
-        print(f"[SpecialLGB] 训练完成，样本数={len(X)}")
-
-    def predict_proba(self, conn, issue_no, candidates):
-        if self.model is None or lgb is None:
-            return {n: 0.0 for n in candidates}
-        feats, valid = [], []
-        for n in candidates:
-            f = self.build_features(conn, issue_no, n)
-            if f is not None:
-                feats.append(f)
-                valid.append(n)
-        if not feats:
-            return {n: 0.0 for n in candidates}
-        probs = self.model.predict_proba(np.array(feats))[:, 1]
-        return dict(zip(valid, probs))
 
 # 全局常量
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
@@ -389,7 +282,7 @@ def _strategy_two_hot_special_cold_main(rows):
 
 def _strategy_two_neighbor_pair(rows):
     if not rows:
-        return ["马", "蛇"]
+        return []
     latest_sp = _row_special(rows[0])
     latest_z = get_zodiac_by_number(latest_sp)
     pair = ZODIAC_PAIR.get(latest_z, "蛇")
@@ -492,7 +385,7 @@ def _strategy_special_cold_neighbor(rows, zodiac_pool, params, top_n=3):
 
 def _strategy_special_tail_focus(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
-    if not recent_specials: return [1, 2, 3]
+    if not recent_specials: return []
     latest = recent_specials[0]
     tail_counter = Counter()
     for r in rows[-12:]:
@@ -502,7 +395,7 @@ def _strategy_special_tail_focus(rows, zodiac_pool, params, top_n=3):
         tail_counter[sp % 10] += 3
     hot_tails = [t for t, _ in tail_counter.most_common(6)]
     candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
-    if not candidates: return [1, 2, 3]
+    if not candidates: return []
     picks = []
     last_tail = latest % 10
     for t in [last_tail, (last_tail + 1) % 10, (last_tail - 1) % 10, *hot_tails]:
@@ -519,17 +412,17 @@ def _strategy_special_tail_focus(rows, zodiac_pool, params, top_n=3):
 
 def _strategy_special_omission_only(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
-    if not recent_specials: return [1, 2, 3]
+    if not recent_specials: return []
     omission = {}
     for i, sp in enumerate(recent_specials):
         if sp not in omission: omission[sp] = i + 1
     candidates = list(set(n for z in zodiac_pool for n in ZODIAC_MAP.get(z, [])))
-    if not candidates: return [1, 2, 3]
+    if not candidates: return []
     return sorted(candidates, key=lambda n: omission.get(n, 30), reverse=True)[:top_n]
 
 def _strategy_special_zone_bias(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
-    if not recent_specials: return [1, 2, 3]
+    if not recent_specials: return []
     zones = {"low": 0, "mid": 0, "high": 0}
     for sp in recent_specials:
         if sp <= 19: zones["low"] += 1
@@ -540,7 +433,7 @@ def _strategy_special_zone_bias(rows, zodiac_pool, params, top_n=3):
     if target_zone == "low": candidates = [n for n in candidates if n <= 19]
     elif target_zone == "mid": candidates = [n for n in candidates if 20 <= n <= 39]
     else: candidates = [n for n in candidates if n >= 40]
-    if not candidates: return [1, 2, 3]
+    if not candidates: return []
     omission = {}
     for i, sp in enumerate(recent_specials):
         if sp not in omission: omission[sp] = i + 1
@@ -548,7 +441,7 @@ def _strategy_special_zone_bias(rows, zodiac_pool, params, top_n=3):
 
 def _strategy_special_neighbor_tail(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
-    if not recent_specials: return [1, 2, 3]
+    if not recent_specials: return []
     latest = recent_specials[0]
     omission = {}
     for i, sp in enumerate(recent_specials):
@@ -567,7 +460,7 @@ def _strategy_special_neighbor_tail(rows, zodiac_pool, params, top_n=3):
 
 def _strategy_special_mixed_2cold1hot(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
-    if not recent_specials: return [1, 2, 3]
+    if not recent_specials: return []
     omission = {}
     for i, sp in enumerate(recent_specials):
         if sp not in omission: omission[sp] = i + 1
@@ -579,7 +472,7 @@ def _strategy_special_mixed_2cold1hot(rows, zodiac_pool, params, top_n=3):
 
 def _strategy_special_omit_break(rows, zodiac_pool, params, top_n=3):
     recent_specials = [_row_special(r) for r in rows[-12:][::-1]]
-    if not recent_specials: return [1, 2, 3]
+    if not recent_specials: return []
     latest = recent_specials[0]
     omission = {}
     for i, sp in enumerate(recent_specials):
@@ -875,31 +768,46 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
 
 # ========== 新增：从 weekendhk.com 抓取最新开奖数据 ==========
 def fetch_recent_from_html() -> List[DrawRecord]:
-    """
-    从 weekendhk.com 抓取最新10期的开奖记录
-    """
+    """尝试从 weekendhk.com 抓取最新开奖记录；失败时返回空列表。"""
     try:
         from urllib.parse import quote
-        # 对 URL 中的中文字符进行编码
         url = "https://www.weekendhk.com/" + quote("六合彩結果/")
         print(f"[抓取] 正在从 {url} 获取数据...")
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=20) as resp:
-            html = resp.read().decode('utf-8')
-        
-        # 原有的解析代码（保持不变）
-        matches = re.findall(r'var drawData = (\[.*?\]);', html, re.DOTALL)
-        if not matches:
-            print("[抓取] 未找到 drawData 变量")
+            html = resp.read().decode("utf-8", errors="replace")
+
+        records: List[DrawRecord] = []
+
+        # 1) 优先解析 drawData
+        draw_data = None
+        matches = re.findall(r"var\s+drawData\s*=\s*(\[.*?\]);", html, re.DOTALL)
+        if matches:
+            try:
+                draw_data = json.loads(matches[0])
+            except Exception:
+                draw_data = None
+
+        # 2) 兼容 next.js / 其他内嵌数据
+        if draw_data is None:
+            next_matches = re.findall(r'"drawData"\s*:\s*(\[.*?\])', html, re.DOTALL)
+            if next_matches:
+                try:
+                    draw_data = json.loads(next_matches[0])
+                except Exception:
+                    draw_data = None
+
+        if draw_data is None:
+            print("[抓取] 未找到可解析的数据块，HTML 抓取失败")
             return []
-        
-        draw_data = json.loads(matches[0])
-        records = []
+
         for item in draw_data:
-            issue_raw = item.get('expect', '')
+            if not isinstance(item, dict):
+                continue
+            issue_raw = str(item.get("expect", "")).strip()
             if not issue_raw:
                 continue
-            issue_raw = re.sub(r'期$', '', issue_raw)
+            issue_raw = re.sub(r"期$", "", issue_raw)
             if len(issue_raw) >= 7:
                 year = issue_raw[2:4]
                 seq = str(int(issue_raw[4:]))
@@ -910,28 +818,39 @@ def fetch_recent_from_html() -> List[DrawRecord]:
                 issue_no = f"{year}/{seq.zfill(3)}"
             else:
                 continue
-            
-            open_code = item.get('openCode', '')
-            numbers_raw = re.findall(r'\d+', open_code)
-            if len(numbers_raw) >= 7:
-                main_numbers = [int(n) for n in numbers_raw[:6]]
-                special_number = int(numbers_raw[6])
-                draw_date = item.get('drawDate', '')
-                if not draw_date:
-                    draw_date = datetime.now().strftime("%Y-%m-%d")
-                else:
-                    draw_date = _parse_date(draw_date) or draw_date
-                records.append(DrawRecord(
-                    issue_no=issue_no,
-                    draw_date=draw_date,
-                    numbers=main_numbers,
-                    special_number=special_number,
-                ))
+
+            open_code = str(item.get("openCode", ""))
+            numbers_raw = re.findall(r"\d+", open_code)
+            if len(numbers_raw) < 7:
+                continue
+
+            main_numbers = [int(n) for n in numbers_raw[:6]]
+            special_number = int(numbers_raw[6])
+            draw_date = str(item.get("drawDate", "")).strip()
+            draw_date = _parse_date(draw_date) if draw_date else None
+            if not draw_date:
+                draw_date = datetime.now().strftime("%Y-%m-%d")
+
+            records.append(DrawRecord(
+                issue_no=issue_no,
+                draw_date=draw_date,
+                numbers=main_numbers,
+                special_number=special_number,
+            ))
+
         print(f"[抓取] 成功获取 {len(records)} 期数据")
         return records
     except Exception as e:
         print(f"[抓取] 失败: {e}")
         return []
+
+
+def fetch_records_with_fallback(limit: int = 200, timeout: int = API_TIMEOUT_DEFAULT, retries: int = API_RETRIES_DEFAULT) -> List[DrawRecord]:
+    records = fetch_recent_from_html()
+    if records:
+        return records
+    print("[同步] HTML抓取无数据，切换到API...")
+    return fetch_macau_recent_records(limit=limit, timeout=timeout, retries=retries)
 
 
 def fetch_macau_records(
@@ -1502,13 +1421,52 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
 
 # ========== 偏态检测函数（强制偏态模式） ==========
 def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
-    return 0.75, {
-        "forced": True,
-        "zone_bias": 0.75,
-        "parity_bias": 0.70,
-        "hot_cold_bias": 0.70,
-        "zone_dist": [0]*5,
-        "odd_ratio": 0.5
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,),
+    ).fetchall()
+    if len(rows) < 3:
+        return 0.0, {
+            "forced": False,
+            "zone_bias": 0.0,
+            "parity_bias": 0.0,
+            "hot_cold_bias": 0.0,
+            "zone_dist": [0] * 5,
+            "odd_ratio": 0.0,
+        }
+
+    zone_dist = [0] * 5
+    odd_count = 0
+    total_count = 0
+    num_counter: Counter[int] = Counter()
+    for row in rows:
+        numbers = json.loads(row["numbers_json"])
+        special = int(row["special_number"])
+        for n in numbers:
+            total_count += 1
+            if int(n) % 2 == 1:
+                odd_count += 1
+            zone_dist[min(4, (int(n) - 1) // 10)] += 1
+            num_counter[int(n)] += 1
+        total_count += 1
+        if special % 2 == 1:
+            odd_count += 1
+        zone_dist[min(4, (special - 1) // 10)] += 1
+        num_counter[special] += 1
+
+    total_events = sum(zone_dist) or 1
+    expected = total_events / 5.0
+    zone_bias = sum(abs(c - expected) for c in zone_dist) / total_events
+    parity_bias = abs((odd_count / max(total_count, 1)) - 0.5) * 2.0
+    hot_cold_bias = (max(num_counter.values()) - min(num_counter.values())) / max(total_events, 1)
+    bias_score = min(1.0, (zone_bias + parity_bias + hot_cold_bias) / 3.0)
+    return bias_score, {
+        "forced": False,
+        "zone_bias": round(zone_bias, 4),
+        "parity_bias": round(parity_bias, 4),
+        "hot_cold_bias": round(hot_cold_bias, 4),
+        "zone_dist": zone_dist,
+        "odd_ratio": round(odd_count / max(total_count, 1), 4),
     }
 
 
@@ -2428,7 +2386,9 @@ def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
+    if len(ranked) < 3:
+        return []
+    picks = [ranked[0][0], ranked[1][0]]
 
     return any(z in winning_zodiacs for z in picks)
 
@@ -2481,13 +2441,13 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         (issue_no,),
     ).fetchone()
     if not target_row:
-        return ["马", "蛇"]
+        return []
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
         (issue_no, issue_no, issue_no, window),
     ).fetchall()
     if not rows:
-        return ["马", "蛇"]
+        return []
 
     if strat == "double_hot":
         return _strategy_two_double_hot(rows)
@@ -2514,7 +2474,7 @@ def get_single_zodiac_pick(conn, issue_no, window=6):
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 16"
     ).fetchall()
     if not rows:
-        return "马"
+        return ""
 
     if strat == "weighted":
         return _strategy_single_weighted(rows, wsize, rec_w, safe_th)
@@ -2539,8 +2499,7 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int 
         (window,)
     ).fetchall()
     if len(rows) < window:
-        default = ["马", "蛇", "龙", "兔", "虎", "牛"]
-        return default[:top_n], default[-top_n:]
+        return [], []
     score_counter: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
     for idx, row in enumerate(rows):
         recency_w = 1.0 / (1.0 + idx * 0.35)
@@ -2560,7 +2519,7 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int 
 
 def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) -> List[str]:
     if not rows:
-        return ["马", "蛇"]
+        return []
 
     params = load_best_zodiac_params()
     wsize = int(params.get("single_window", params.get("wsize", 6)))
@@ -2590,7 +2549,7 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) ->
 
 def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) -> List[str]:
     if not rows:
-        return ["马", "蛇", "龙"]
+        return []
 
     params = load_best_zodiac_params()
     lstm_seq_len = int(params.get("lstm_seq_len", 30))
@@ -2599,7 +2558,7 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
     hmm_weight = float(params.get("hmm_weight", 0.2))
 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.06)
-    recent = rows[:8]
+    recent = rows[-8:]
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in recent]
     recent_main_zodiacs = [get_zodiac_by_number(int(n)) for r in recent for n in json.loads(r["numbers_json"])]
     for z, cnt in Counter(recent_special_zodiacs).items():
@@ -2635,7 +2594,7 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
 
 def _get_four_zodiac_from_history_rows(rows, conn=None):
     if len(rows) < 3:
-        return ["马", "蛇", "龙", "兔"]
+        return []
     params = load_best_zodiac_params()
     strat = params.get("four_strategy", "boosted")
     if strat == "boosted":
@@ -2803,12 +2762,13 @@ def get_recent_three_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        picks = get_three_zodiac_picks(conn)
+        picks = _get_three_zodiac_from_history_rows(history_rows, conn=conn)
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
+        match_count = sum(1 for z in picks if z in winning_zodiacs)
+        hit = 1 if match_count >= 2 else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -3022,7 +2982,7 @@ def _weighted_consensus_pools(conn, issue_no):
 
 def get_trio_from_merged_pool20_v2(conn, issue_no):
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    if not pool20 or len(pool20) < 3: return [1, 2, 3]
+    if not pool20 or len(pool20) < 3: return []
     all_pools = []
     for strategy in STRATEGY_IDS:
         run = conn.execute(
@@ -3089,7 +3049,7 @@ def get_final_recommendation(conn):
             defs, conflict, zodiac_single, zodiac_two, special_zodiacs,
             strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac)
 
-def print_final_recommendation(conn, xgb_pool20=None):
+def print_final_recommendation(conn):
     rec = get_final_recommendation(conn)
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
@@ -3098,9 +3058,6 @@ def print_final_recommendation(conn, xgb_pool20=None):
      special_defenses, special_conflict, zodiac_single, zodiac_two,
      special_zodiacs, strategy_specials, strategy_special_zodiacs,
      strategy_strong_special, strategy_strong_zodiac) = rec
-    if xgb_pool20 and len(xgb_pool20) >= 20:
-        pool20 = xgb_pool20[:20]; pool14 = pool20[:14]; pool10 = pool20[:10]; main6 = pool20[:6]
-        print("[XGB] 主号池已升级为 XGBoost 预测池")
     p6 = " ".join(f"{n:02d}" for n in main6)
     p10 = " ".join(f"{n:02d}" for n in pool10)
     p14 = " ".join(f"{n:02d}" for n in pool14)
@@ -3110,7 +3067,9 @@ def print_final_recommendation(conn, xgb_pool20=None):
     print()
     print(f"一生肖推荐: {zodiac_single}")
     print(f"二生肖推荐: {'、'.join(zodiac_two)}")
-    print(f"三生肖推荐: {'、'.join(get_three_zodiac_picks(conn))}")
+    three_history_rows = _draws_ordered_asc(conn)
+    three_picks = _get_three_zodiac_from_history_rows(three_history_rows[:min(len(three_history_rows), 16)], conn=conn)
+    print(f"三生肖推荐: {'、'.join(three_picks)}")
     print(f"特别生肖推荐: {'、'.join(special_zodiacs)}")
     latest = get_latest_draw(conn)
     if latest:
@@ -3121,7 +3080,7 @@ def print_final_recommendation(conn, xgb_pool20=None):
     four_rep = get_recent_four_zodiac_report(conn, lookback=10)
     print(f"一生肖近10期命中率: {one_rep['hit_rate']*100:.1f}% 最大连空{int(one_rep['max_miss_streak'])}")
     print(f"二生肖近10期命中率: {two_rep['hit_rate']*100:.1f}% 最大连空{int(two_rep['max_miss_streak'])}")
-    print(f"三生肖近10期命中率: {three_rep['hit_rate']*100:.1f}% 最大连空{int(three_rep['max_miss_streak'])}")
+    print(f"三生肖近10期命中率(至少中2个): {three_rep['hit_rate']*100:.1f}% 最大连空{int(three_rep['max_miss_streak'])}")
     print(f"特别生肖近10期命中率: {four_rep['hit_rate']*100:.1f}% 最大连空{int(four_rep['max_miss_streak'])}")
     sp_report = get_recent_special_picks_report(conn, lookback=20)
     print(f"特别号精选回测（最近20期）: 命中率={sp_report['hit_rate']*100:.1f}% 最大连空={int(sp_report['max_miss_streak'])}")
@@ -3151,7 +3110,7 @@ def print_final_recommendation(conn, xgb_pool20=None):
     else:
         print(f"特别生肖建议仓位: <未达正期望>, 试探仓位 {km.bankroll*0.02:.2f} 元")
     rm = RiskManager()
-    z_rec = rm.get_bet_recommendation("zodiac_strict_two", 0.30, 5.0, rm.bankroll)
+    z_rec = rm.get_bet_recommendation("zodiac_three_history", 0.30, 5.0, rm.bankroll)
     s_rec = rm.get_bet_recommendation("special", 0.03, 45.0, rm.bankroll)
     print(f"风控: 生肖{'暂停' if z_rec['suspended'] else '继续'} | 特别号{'暂停' if s_rec['suspended'] else '继续'}")
     print("=" * 50)
@@ -3586,7 +3545,7 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
-def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = None) -> None:
+def print_dashboard(conn: sqlite3.Connection) -> None:
     latest = get_latest_draw(conn)
     if latest:
         nums = " ".join(_fmt_num(n) for n in json.loads(latest["numbers_json"]))
@@ -3654,7 +3613,7 @@ def print_dashboard(conn: sqlite3.Connection, xgb_pool20: Optional[List[int]] = 
     if one_rep['hit_rate'] >= 0.9 and two_rep['hit_rate'] >= 0.8 and four_rep['hit_rate'] >= 1.0:
         print("🎉 达标！")
 
-    print_final_recommendation(conn, xgb_pool20=xgb_pool20)
+    print_final_recommendation(conn)
 
     print("\n" + review_latest_prediction(conn))
 
@@ -3742,68 +3701,36 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         conn.close()
 
 
-def cmd_train_xgb(args: argparse.Namespace) -> None:
-    conn = connect_db(args.db)
-    try:
-        init_db(conn)
-        predictor = XGBoostPredictor()
-        predictor.train(conn)
-        model_path = SCRIPT_DIR / 'xgb_model.pkl'
-        import pickle
-        with open(model_path, 'wb') as f:
-            pickle.dump(predictor, f)
-        print(f"XGBoost 模型已训练并保存至 {model_path}")
-    finally:
-        conn.close()
-
-
-def cmd_train_lgb(args: argparse.Namespace) -> None:
-    conn = connect_db(args.db)
-    try:
-        init_db(conn)
-        predictor = LightGBMPredictor()
-        predictor.train(conn)
-        model_path = SCRIPT_DIR / 'lgb_model.pkl'
-        import pickle
-        with open(model_path, 'wb') as f:
-            pickle.dump(predictor, f)
-        print(f"LightGBM 模型已训练并保存至 {model_path}")
-    finally:
-        conn.close()
-
-
 def cmd_sync(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        
-        # 优先使用HTML抓取（weekendhk.com）
-        records = fetch_recent_from_html()
-        if not records:
-            print("[同步] HTML抓取无数据，尝试使用原有API...")
-            records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
-        
+
+        records = fetch_records_with_fallback(
+            limit=200,
+            timeout=args.api_timeout,
+            retries=args.api_retries,
+        )
         if not records:
             print("[错误] 所有数据源均失败，请稍后重试")
             return
-        
+
         total, inserted, updated = sync_from_records(conn, records, source="macau_api")
         mined_cfg = ensure_mined_pattern_config(conn, force=args.remine)
         reviewed = review_latest(conn)
         bt_issues, bt_runs = 0, 0
-        
+
         if args.with_backtest:
             bt_issues, bt_runs = run_historical_backtest(conn, rebuild=False, max_issues=BACKTEST_ISSUES_DEFAULT)
-        
+
         issue = generate_predictions(conn)
         patched = backfill_missing_special_picks(conn)
-        
-        # 自动补充历史精选特别号记录（仅当special_picks_log为空时）
+
         cnt = conn.execute("SELECT COUNT(*) FROM special_picks_log").fetchone()[0]
         if cnt == 0 and total > 30:
             print("[自动] 检测到 special_picks_log 为空，开始回溯历史精选特别号...")
             backfill_special_picks_log(conn, max_issues=100)
-        
+
         print(f"Sync done. total={total}, inserted={inserted}, updated={updated}, reviewed={reviewed}, next_prediction={issue}")
         print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
         if bt_issues > 0:
@@ -3915,71 +3842,15 @@ def cmd_show(args: argparse.Namespace) -> None:
         ).fetchone()[0]
         if reviewed_count < 10:
             print("检测到复盘数据不足，自动执行 sync --with-backtest ...")
-            records = fetch_recent_from_html()
-            if not records:
-                records = fetch_macau_recent_records(limit=200, timeout=args.api_timeout, retries=args.api_retries)
-            sync_from_records(conn, records, source="macau_api")
-            run_historical_backtest(conn, rebuild=False, max_issues=20)
-            generate_predictions(conn)
-            print("自动同步与回测完成。")
-
-        xgb_pool20 = None
-        lgb_pool20 = None
-
-        model_path_xgb = SCRIPT_DIR / 'xgb_model.pkl'
-        if model_path_xgb.exists():
-            import pickle
-            with open(model_path_xgb, 'rb') as f:
-                xgb_predictor = pickle.load(f)
-            try:
-                xgb_pool20 = xgb_predictor.predict_pool(conn, top_k=20)
-                print(f"[XGB] 已加载模型，预测主号池 Top20: {xgb_pool20}")
-            except Exception as e:
-                print(f"[XGB] 预测失败（将使用原策略融合）: {e}")
-                xgb_pool20 = None
-        else:
-            print("[XGB] 模型未训练（运行 train-xgb 可训练），使用原策略融合主号池。")
-
-        model_path_lgb = SCRIPT_DIR / 'lgb_model.pkl'
-        if model_path_lgb.exists():
-            import pickle
-            try:
-                with open(model_path_lgb, 'rb') as f:
-                    lgb_predictor = pickle.load(f)
-                lgb_pool20 = lgb_predictor.predict_pool(conn, top_k=20)
-                print(f"[LGB] 已加载模型，预测主号池 Top20: {lgb_pool20}")
-            except Exception as e:
-                print(f"[LGB] 加载或预测失败（将仅使用XGB）: {e}")
-                lgb_pool20 = None
-        else:
-            print("[LGB] 模型未训练（运行 train-lgb 可训练），当前跳过。")
-
-        merged_pool20 = None
-        if xgb_pool20 and lgb_pool20:
-            union = []
-            seen = set()
-            max_len = max(len(xgb_pool20), len(lgb_pool20))
-            for i in range(max_len):
-                if i < len(xgb_pool20) and xgb_pool20[i] not in seen:
-                    union.append(xgb_pool20[i])
-                    seen.add(xgb_pool20[i])
-                if i < len(lgb_pool20) and lgb_pool20[i] not in seen:
-                    union.append(lgb_pool20[i])
-                    seen.add(lgb_pool20[i])
-            merged_pool20 = union[:20]
-            merged_zodiacs = [get_zodiac_by_number(n) for n in merged_pool20]
-            print(f"[融合] 按双模型一致性加权 Top20: {merged_pool20}")
-            print(f"       生肖对应: {' '.join(merged_zodiacs)}")
-        elif xgb_pool20:
-            merged_pool20 = xgb_pool20
-            merged_zodiacs = [get_zodiac_by_number(n) for n in merged_pool20]
-            print(f"[融合] XGB 主号池 Top20: {merged_pool20}")
-            print(f"       生肖对应: {' '.join(merged_zodiacs)}")
-        elif lgb_pool20:
-            merged_pool20 = lgb_pool20
-            merged_zodiacs = [get_zodiac_by_number(n) for n in merged_pool20]
-            print(f"[融合] LGB 主号池 Top20: {merged_pool20}")
-            print(f"       生肖对应: {' '.join(merged_zodiacs)}")
+            records = fetch_records_with_fallback(limit=200, timeout=args.api_timeout, retries=args.api_retries)
+            if records:
+                sync_from_records(conn, records, source="macau_api")
+                run_historical_backtest(conn, rebuild=False, max_issues=20)
+                generate_predictions(conn)
+                print("自动同步与回测完成。")
+            else:
+                print("[错误] 自动同步失败，跳过回测与预测。")
+                return
 
         # 自动检查并回溯缺失的精选特别号记录
         cnt = conn.execute("SELECT COUNT(*) FROM special_picks_log").fetchone()[0]
@@ -3987,7 +3858,7 @@ def cmd_show(args: argparse.Namespace) -> None:
             print("[自动] 发现 special_picks_log 为空，开始回溯历史精选特别号...")
             backfill_special_picks_log(conn, max_issues=100)
 
-        print_dashboard(conn, xgb_pool20=merged_pool20)
+        print_dashboard(conn)
     finally:
         conn.close()
 
@@ -4283,7 +4154,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
-    p.add_argument("--retrain", action="store_true", help="Force retrain XGB model before running")
     p.add_argument("--tail-backtest", action="store_true", help="Run tail backtest and print report")
     p.add_argument("--api-timeout", type=int, default=API_TIMEOUT_DEFAULT, help="API timeout seconds per request")
     p.add_argument("--api-retries", type=int, default=API_RETRIES_DEFAULT, help="API retry attempts when network timeout/error occurs")
@@ -4325,12 +4195,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_mine = sub.add_parser("mine", help="Mine best pattern parameters from history")
     p_mine.set_defaults(func=cmd_mine)
 
-    p_train_xgb = sub.add_parser("train-xgb", help="Train XGBoost model for main numbers")
-    p_train_xgb.set_defaults(func=cmd_train_xgb)
-
-    p_train_lgb = sub.add_parser("train-lgb", help="Train LightGBM model for main numbers")
-    p_train_lgb.set_defaults(func=cmd_train_lgb)
-
     p_backfill_special = sub.add_parser("backfill-special", help="回溯历史精选特别号记录")
     p_backfill_special.set_defaults(func=cmd_backfill_special)
 
@@ -4355,11 +4219,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    if hasattr(args, 'retrain') and args.retrain:
-        model_path = SCRIPT_DIR / "xgb_ensemble_model.pkl"
-        if model_path.exists():
-            model_path.unlink()
-            print("[XGB] 旧模型已删除，将重新训练")
     if args.update:
         cmd_sync(args)
         return
