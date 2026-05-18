@@ -3851,7 +3851,7 @@ def cmd_show(args: argparse.Namespace) -> None:
             records = fetch_records_with_fallback(limit=100, timeout=args.api_timeout, retries=args.api_retries)
             if records:
                 sync_from_records(conn, records, source="macau_api")
-                run_historical_backtest(conn, rebuild=False, max_issues=20)
+                run_historical_backtest(conn, rebuild=False, max_issues=100)
                 generate_predictions(conn)
                 print("自动同步与回测完成。")
             else:
@@ -3864,7 +3864,10 @@ def cmd_show(args: argparse.Namespace) -> None:
             print("[自动] 发现 special_picks_log 为空，开始回溯历史精选特别号...")
             backfill_special_picks_log(conn, max_issues=100)
 
-        print_dashboard(conn, recent_online=records[:10] if records else None)
+        recent_online = None
+        if records:
+            recent_online = sorted(records, key=lambda r: (r.issue_no, r.draw_date))[-10:]
+        print_dashboard(conn, recent_online=recent_online)
     finally:
         conn.close()
 
