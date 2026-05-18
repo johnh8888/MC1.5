@@ -2204,46 +2204,46 @@ def get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT):
         LIMIT ?
     """, (window,)).fetchall()
 
-    baseline = 0.6
+    baseline = 0.4
     weights = {s: baseline for s in STRATEGY_IDS}
     protection_msgs = []
 
     if rows:
-        # 近期更高权重，避免长期历史稀释当前状态
         for idx, r in enumerate(rows):
             strategy = str(r["strategy"])
             if strategy not in weights:
                 continue
             hit = float(r["main_hit_count"] or 0.0)
-            recency_w = 1.0 / (1.0 + idx * 0.12)
+            recency_w = 1.0 / (1.0 + idx * 0.08)
             weights[strategy] += (hit / 6.0) * recency_w
 
-    health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
-    for strategy, h in health.items():
-        if strategy not in weights:
-            continue
-        hit1_rate = float(h.get("hit1_rate", 0.0))
-        cold_streak = int(h.get("cold_streak", 0))
-        if strategy == "pattern_mined_v1":
-            if cold_streak >= 5:
-                weights[strategy] *= 0.72
-            elif cold_streak >= 2:
-                weights[strategy] *= 0.85
-            if cold_streak >= 1:
-                protection_msgs.append(f"[保护] 规律挖掘连挂 {cold_streak}，权重已平滑下调")
-        elif strategy == "momentum_v1":
-            if hit1_rate < 0.5:
-                weights[strategy] *= 0.86
-            if cold_streak >= 2:
-                weights[strategy] *= 0.80
-        elif strategy == "cold_rebound_v1":
-            if cold_streak >= 2:
-                weights[strategy] *= 0.88
-        else:
-            if hit1_rate < 0.52:
-                weights[strategy] *= 0.92
-            if cold_streak >= 2:
-                weights[strategy] *= 0.84
+    recent5 = get_strategy_health(conn, window=5)
+    recent10 = get_strategy_health(conn, window=10)
+    recent18 = get_strategy_health(conn, window=18)
+    for strategy in list(weights.keys()):
+        h5 = recent5.get(strategy, {})
+        h10 = recent10.get(strategy, {})
+        h18 = recent18.get(strategy, {})
+        hit1_5 = float(h5.get("hit1_rate", 0.0))
+        hit1_10 = float(h10.get("hit1_rate", 0.0))
+        hit1_18 = float(h18.get("hit1_rate", 0.0))
+        cold_streak = int(h18.get("cold_streak", 0))
+        recent_score = hit1_5 * 0.46 + hit1_10 * 0.34 + hit1_18 * 0.20
+        weights[strategy] *= (0.84 + recent_score * 0.52)
+        if strategy == "pattern_mined_v1" and cold_streak >= 2:
+            weights[strategy] *= 0.72
+            protection_msgs.append(f"[保护] 规律挖掘连挂 {cold_streak}，权重已平滑下调")
+        elif strategy == "momentum_v1" and cold_streak >= 2:
+            weights[strategy] *= 0.80
+        elif strategy == "cold_rebound_v1" and cold_streak >= 2:
+            weights[strategy] *= 0.86
+        elif cold_streak >= 3:
+            weights[strategy] *= 0.78
+
+        if hit1_5 < 0.30:
+            weights[strategy] *= 0.82
+        elif hit1_5 >= 0.60:
+            weights[strategy] *= 1.10
 
     total = sum(weights.values()) or 1.0
     for msg in protection_msgs:
@@ -2268,18 +2268,23 @@ def get_trio_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAU
 
 def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DEFAULT) -> Dict[str, Dict[str, float]]:
     health: Dict[str, Dict[str, float]] = {}
+    windows = [5, 10, window]
     for strategy in STRATEGY_IDS:
-        rows = conn.execute(
-            """
-               SELECT hit_count
-               FROM prediction_runs
-               WHERE strategy = ? AND status = 'REVIEWED'
-               ORDER BY reviewed_at DESC
-               LIMIT ?
-               """,
-            (strategy, window),
-        ).fetchall()
-        if not rows:
+        combined_rows: List[int] = []
+        for w in windows:
+            rows = conn.execute(
+                """
+                   SELECT hit_count
+                   FROM prediction_runs
+                   WHERE strategy = ? AND status = 'REVIEWED'
+                   ORDER BY reviewed_at DESC
+                   LIMIT ?
+                   """,
+                (strategy, w),
+            ).fetchall()
+            if rows:
+                combined_rows.extend(int(r["hit_count"] or 0) for r in rows)
+        if not combined_rows:
             health[strategy] = {
                 "samples": 0.0,
                 "recent_avg_hit": 0.0,
@@ -2289,7 +2294,7 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
             }
             continue
 
-        hit_counts = [int(r["hit_count"] or 0) for r in rows]
+        hit_counts = combined_rows[:window] if window > 0 else combined_rows
         samples = len(hit_counts)
         hit1_rate = sum(1 for x in hit_counts if x >= 1) / samples
         hit2_rate = sum(1 for x in hit_counts if x >= 2) / samples
@@ -3102,6 +3107,23 @@ def print_final_recommendation(conn):
     z_rec = rm.get_bet_recommendation("zodiac_three_history", 0.30, 5.0, rm.bankroll)
     s_rec = rm.get_bet_recommendation("special", 0.03, 45.0, rm.bankroll)
     print(f"风控: 生肖{'暂停' if z_rec['suspended'] else '继续'} | 特别号{'暂停' if s_rec['suspended'] else '继续'}")
+    weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
+    health = get_strategy_health(conn, window=18)
+    active_strategies = []
+    weakened_strategies = []
+    for strategy in STRATEGY_IDS:
+        w = float(weights.get(strategy, 0.0))
+        h = health.get(strategy, {})
+        hit1 = float(h.get("hit1_rate", 0.0))
+        cold = int(h.get("cold_streak", 0))
+        if w >= 0.16 and hit1 >= 0.5 and cold < 3:
+            active_strategies.append(STRATEGY_LABELS.get(strategy, strategy))
+        elif cold >= 3 or hit1 < 0.35:
+            weakened_strategies.append(STRATEGY_LABELS.get(strategy, strategy))
+    print(f"有效策略: {('、'.join(active_strategies) if active_strategies else '无')}")
+    print(f"降权策略: {('、'.join(weakened_strategies) if weakened_strategies else '无')}")
+    if special is not None:
+        print(f"特别号理由: 当前主推 {_fmt_num(special)}，结合近期特别号热度、遗漏和生肖集中度综合判断")
     print("=" * 50)
 
 # ========== 历史回溯专用精选函数（避免数据穿越） ==========
@@ -3376,16 +3398,16 @@ def get_strong_special_from_strategies(
         weighted_scores[n] = weighted_scores.get(n, 0.0) + w
 
     recent_specials = [int(r["special_number"]) for r in conn.execute(
-        "SELECT special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 20"
+        "SELECT special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 10"
     ).fetchall()]
     omission = {n: 31 for n in ALL_NUMBERS}
     for idx, n in enumerate(recent_specials):
         omission[n] = min(omission.get(n, 31), idx + 1)
 
-    recent_special_zodiacs = [get_zodiac_by_number(n) for n in recent_specials[:8]]
+    recent_special_zodiacs = [get_zodiac_by_number(n) for n in recent_specials[:5]]
     recent_main_zodiacs: List[str] = []
     for row in conn.execute(
-        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 8"
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 5"
     ).fetchall():
         recent_main_zodiacs.extend(get_zodiac_by_number(int(n)) for n in json.loads(row["numbers_json"]))
     recent_zodiac_counter = Counter(recent_special_zodiacs + recent_main_zodiacs)
@@ -3592,7 +3614,13 @@ def print_dashboard(conn: sqlite3.Connection, recent_online: Optional[List[DrawR
     print(f"\n策略健康度（最近{HEALTH_WINDOW_DEFAULT}期）:")
     weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
     health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
-    for strategy in STRATEGY_IDS:
+    sorted_strategies = sorted(
+        STRATEGY_IDS,
+        key=lambda s: (-float(weights.get(s, 0.0)), -(int(health.get(s, {}).get("cold_streak", 0.0))), s)
+    )
+    effective_strategies = []
+    muted_strategies = []
+    for strategy in sorted_strategies:
         strategy_name = STRATEGY_LABELS.get(strategy, strategy)
         h = health.get(strategy, {})
         samples = int(h.get("samples", 0.0))
@@ -3601,10 +3629,20 @@ def print_dashboard(conn: sqlite3.Connection, recent_online: Optional[List[DrawR
         hit2 = float(h.get("hit2_rate", 0.0)) * 100.0
         cold = int(h.get("cold_streak", 0.0))
         weight = float(weights.get(strategy, 0.0)) * 100.0
-        print(
+        line = (
             f"  - {strategy_name}: 样本={samples} 最近均中={avg_hit:.2f} "
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
+        if weight >= 16.0 and hit1 >= 45.0:
+            effective_strategies.append(line)
+        else:
+            muted_strategies.append(line)
+    print("  当前有效策略:")
+    for line in effective_strategies:
+        print(line)
+    print("  当前降权策略:")
+    for line in muted_strategies:
+        print(line)
 
     one_rep = get_recent_single_zodiac_report(conn, lookback=10)
     two_rep = get_recent_two_zodiac_report(conn, lookback=10)
