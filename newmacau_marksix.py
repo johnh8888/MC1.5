@@ -3060,7 +3060,7 @@ def print_final_recommendation(conn):
     trio_str = " ".join(f"{n:02d}" for n in predict_trio) if predict_trio else "无"
     special_text = f"{special:02d}"
     print()
-    effective_6 = pool6[:6]
+    effective_6 = main6[:6]
     effective_10 = pool10[:10]
     effective_14 = pool14[:14]
     effective_6_text = " ".join(f"{n:02d}" for n in effective_6) if effective_6 else "无"
