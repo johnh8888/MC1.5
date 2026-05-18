@@ -2545,18 +2545,19 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
 
     params = load_best_zodiac_params()
     lstm_seq_len = int(params.get("lstm_seq_len", 30))
-    three_lstm_w = float(params.get("three_lstm_weight", 0.3))
-    three_hmm_w = float(params.get("three_hmm_weight", 0.2))
-    hmm_weight = float(params.get("hmm_weight", 0.2))
+    three_lstm_w = float(params.get("three_lstm_weight", 0.16))
+    three_hmm_w = float(params.get("three_hmm_weight", 0.10))
+    hmm_weight = float(params.get("hmm_weight", 0.12))
 
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.06)
-    recent = rows[-8:]
+    window_rows = rows[:10]
+    zodiac_scores = _build_zodiac_scores_from_rows(window_rows, decay=0.10)
+    recent = window_rows[:5]
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in recent]
     recent_main_zodiacs = [get_zodiac_by_number(int(n)) for r in recent for n in json.loads(r["numbers_json"])]
     for z, cnt in Counter(recent_special_zodiacs).items():
-        zodiac_scores[z] += cnt * 2.55
+        zodiac_scores[z] += cnt * 3.10
     for z, cnt in Counter(recent_main_zodiacs).items():
-        zodiac_scores[z] += cnt * 0.95
+        zodiac_scores[z] += cnt * 0.72
 
     if conn and predict_lstm_proba and three_lstm_w > 0.01:
         lstm_probs = predict_lstm_proba(conn, seq_len=lstm_seq_len)
@@ -2570,13 +2571,13 @@ def _get_three_zodiac_from_history_rows(rows: Sequence[sqlite3.Row], conn=None) 
             for z in zodiac_scores:
                 zodiac_scores[z] = (1 - three_hmm_w) * zodiac_scores[z] + three_hmm_w * hmm_probs.get(z, 0.0)
 
-    omission_zodiac = _zodiac_omission_map(rows)
+    omission_zodiac = _zodiac_omission_map(window_rows)
     for z, omit in omission_zodiac.items():
-        if omit >= 5:
-            zodiac_scores[z] += min(2.1, omit / 4.0)
+        if omit >= 8:
+            zodiac_scores[z] += min(1.6, omit / 8.0)
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
+    picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else []
     for z, _ in ranked[2:]:
         if z not in picks:
             picks.append(z)
