@@ -3059,12 +3059,21 @@ def print_final_recommendation(conn):
     trio_str = " ".join(f"{n:02d}" for n in predict_trio) if predict_trio else "无"
     special_text = f"{special:02d}"
     print()
+    effective_6 = pool6[:6]
+    effective_10 = pool10[:10]
+    effective_14 = pool14[:14]
+    effective_6_text = " ".join(f"{n:02d}" for n in effective_6) if effective_6 else "无"
+    effective_10_text = " ".join(f"{n:02d}" for n in effective_10) if effective_10 else "无"
+    effective_14_text = " ".join(f"{n:02d}" for n in effective_14) if effective_14 else "无"
     print(f"一生肖推荐: {zodiac_single}")
     print(f"二生肖推荐: {'、'.join(zodiac_two)}")
     three_history_rows = _draws_ordered_asc(conn)
     three_picks = _get_three_zodiac_from_history_rows(three_history_rows[:min(len(three_history_rows), 16)], conn=conn)
     print(f"三生肖推荐: {'、'.join(three_picks)}")
     print(f"特别生肖推荐: {'、'.join(special_zodiacs)}")
+    print(f"有效策略6码: {effective_6_text}")
+    print(f"有效策略10码: {effective_10_text}")
+    print(f"有效策略14码: {effective_14_text}")
     latest = get_latest_draw(conn)
     if latest:
         print(f"推荐期数日期: {latest['issue_no']}（{latest['draw_date']}）")
