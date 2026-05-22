@@ -1485,81 +1485,123 @@ def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dic
 
 
 # ========== 特别号 v4 增强版 ==========
-def _generate_special_number_v4(
-    conn: sqlite3.Connection,
-    main_pool: List[int],
-    issue_no: str
-) -> Tuple[int, float, List[int]]:
+def generate_special_number_improved(
+    conn,
+    main_pool,
+    issue_no,
+    lookback=80,
+    top_candidates=3
+):
+    """
+    改进版特别号预测，动态计算邻号、尾号、遗漏和冷热号。
+    返回：最优特别号, 置信度, 防守候选号列表
+    """
     recent_specials = [int(r["special_number"]) for r in conn.execute(
-        "SELECT special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?) OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?) ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (issue_no, issue_no, issue_no, 80),
+        "SELECT special_number FROM draws WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no ?) OR "
+        "(draw_date = (SELECT draw_date FROM draws WHERE issue_no ?) AND issue_no < ?) "
+        "ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (issue_no, issue_no, issue_no, lookback)
     ).fetchall()]
 
-    latest_sp_row = conn.execute(
-        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 1"
-    ).fetchone()
-    latest_sp = int(latest_sp_row["special_number"]) if latest_sp_row else None
-
-    prev_special = recent_specials[0] if recent_specials else None
     main_set = set(main_pool)
+    if not recent_specials:
+        return 1, 0.0, [2, 3, 4]
 
-    omission = {n: 80 for n in ALL_NUMBERS}
-    for i, num in enumerate(recent_specials):
-        omission[num] = min(omission.get(num, 80), i + 1)
+    omission = {n: lookback for n in range(1, 50)}
+    for idx, num in enumerate(recent_specials):
+        omission[num] = min(omission.get(num, lookback), idx + 1)
 
-    tail_counter = Counter([n % 10 for n in recent_specials[:40]])
-    coldest_tail = min(tail_counter.keys(), key=lambda t: tail_counter[t]) if tail_counter else 0
+    tail_counter = Counter([n % 10 for n in recent_specials])
+    coldest_tail = min(tail_counter, key=lambda t: tail_counter[t]) if tail_counter else 0
 
     scores = {}
-    for n in ALL_NUMBERS:
-        if n == latest_sp or n in main_set:
+    prev_special = recent_specials[0]
+    for n in range(1, 50):
+        if n in main_set or n == prev_special:
             continue
         score = 0.0
-        if prev_special is not None:
-            diff = abs(n - prev_special)
-            if diff == 1:
-                score += 8.8
-            elif diff == 2:
-                score += 6.6
-            elif diff == 3:
-                score += 3.8
-        if recent_specials and n == recent_specials[0]:
-            score *= 0.75
-        if recent_specials and n in recent_specials[:3]:
-            score *= 0.80
-        omit = omission.get(n, 80)
-        if omit >= 10:
-            score += 8.0 * (omit / 15.0)
-        elif omit >= 6:
-            score += 4.5
+
+        diff = abs(n - prev_special)
+        if diff == 1: score += 5 + omission.get(n, 0) * 0.1
+        elif diff == 2: score += 3 + omission.get(n, 0) * 0.08
+        elif diff == 3: score += 1.5 + omission.get(n, 0) * 0.05
+
+        score += min(omit := omission.get(n, 0), 20) * 0.5
+
         if n % 10 == coldest_tail:
-            score += 5.0
-        scores[n] = max(0.0, score)
+            score += 2.0
+
+        if n in recent_specials[:3]:
+            score *= 0.7
+
+        scores[n] = score
 
     if not scores:
         return 1, 0.0, [2, 3, 4]
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best = ranked[0][0]
-    confidence = min(1.0, ranked[0][1] / 29.0)
-    defenses = [n for n, _ in ranked[1:] if n not in main_set][:3]
+
+    max_score = max(scores.values())
+    confidence = min(1.0, ranked[0][1] / max_score if max_score > 0 else 0.0)
+
+    defenses = [n for n, _ in ranked[1:top_candidates + 3] if n not in main_set][:top_candidates]
+
     return best, round(confidence, 3), defenses
 
 
-def _ensemble_strategy_v3_1(draws, mined_config, strategy_weights, conn, issue_no):
+def generate_ensemble_strategy(
+    conn,
+    draws,
+    issue_no,
+    mined_config=None,
+    strategy_weights=None,
+    window_size=10
+):
+    """
+    改进版集成策略生成
+    返回：
+        main_picks, special_number, special_confidence, score_map, sub_strategy_weights
+    """
+    base_weights = strategy_weights or {
+        "hot_v1": 0.2,
+        "cold_rebound_v1": 0.2,
+        "momentum_v1": 0.2,
+        "balanced_v1": 0.2,
+        "pattern_mined_v1": 0.2,
+    }
+
+    bias_score, bias_info = detect_bias(conn, window=window_size)
+    adj_weights = adjust_weights_for_bias(base_weights, bias_score)
+
     sub_scores = {}
-    for sub in ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]:
-        _, _, _, score_map = generate_strategy(draws, sub, conn=conn, issue_no=issue_no)
-        sub_scores[sub] = score_map
+    for strategy in adj_weights.keys():
+        picks, special, _, score_map = generate_strategy(
+            draws,
+            strategy,
+            mined_config=mined_config,
+            strategy_weights=None,
+            conn=conn,
+            issue_no=issue_no
+        )
+        normalized = _normalize(score_map)
+        weighted = {n: v * adj_weights[strategy] for n, v in normalized.items()}
+        sub_scores[strategy] = weighted
+
     voted = {n: 0.0 for n in ALL_NUMBERS}
-    for score_map in sub_scores.values():
-        for n, v in score_map.items():
-            voted[n] += float(v)
+    for s_map in sub_scores.values():
+        for n, v in s_map.items():
+            voted[n] += v
     voted = _normalize(voted)
-    main_picked = _pick_top_six(voted, "集成投票v3.1")
-    main_set = {n for n, _, _, _ in main_picked}
-    special_number, confidence, _ = _generate_special_number_v4(conn, main_set, issue_no)
-    return main_picked, special_number, confidence, voted
+
+    main_picks = _pick_top_six(voted, "集成投票v4.0")
+    main_set = {n for n, _, _, _ in main_picks}
+
+    special_number, special_confidence, _ = generate_special_number_improved(
+        conn, list(main_set), issue_no, lookback=80, top_candidates=3
+    )
+
+    return main_picks, special_number, special_confidence, voted, adj_weights
 
 
 def generate_strategy(
