@@ -1659,7 +1659,7 @@ def generate_strategy(
             raise ValueError("ensemble_v2/v3 requires database connection")
         if issue_no is None:
             raise ValueError("ensemble_v2/v3 requires issue_no parameter")
-        return _ensemble_strategy_v3_1(strategy_draws, mined_config, strategy_weights, conn, issue_no)
+        return generate_ensemble_strategy(strategy_draws, mined_config, strategy_weights, conn, issue_no)
 
     return _apply_weight_config(
         strategy_draws,
