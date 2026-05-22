@@ -1576,7 +1576,14 @@ def generate_ensemble_strategy(
 
     sub_scores = {}
     for strategy in adj_weights.keys():
-        picks, special, _, score_map = generate_strategy(strategy_weights=None, draws, conn=conn, strategy, mined_config=mined_config)
+        picks, special, _, score_map = generate_strategy(
+            strategy=strategy,
+            draws=draws,
+            strategy_weights=None,
+            conn=conn,
+            issue_no=issue_no,
+            mined_config=mined_config
+        )
         normalized = _normalize(score_map)
         weighted = {n: v * adj_weights[strategy] for n, v in normalized.items()}
         sub_scores[strategy] = weighted
@@ -1597,8 +1604,14 @@ def generate_ensemble_strategy(
     return main_picks, special_number, special_confidence, voted, adj_weights
 
 
-def generate_strategy(float]] = None, draws: List[List[int]], strategy_weights: Optional[Dict[str, strategy: str, mined_config: Optional[Dict[str) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-
+def generate_strategy(
+    strategy: str,
+    draws: List[List[int]],
+    strategy_weights: Optional[Dict[str, float]] = None,
+    conn: Optional[sqlite3.Connection] = None,
+    issue_no: Optional[str] = None,
+    mined_config: Optional[Dict[str, float]] = None
+) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     window_size = STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
     strategy_draws = draws[:window_size] if len(draws) > window_size else draws
 
@@ -1645,20 +1658,31 @@ def generate_strategy(float]] = None, draws: List[List[int]], strategy_weights: 
             raise ValueError("ensemble_v2/v3 requires database connection")
         if issue_no is None:
             raise ValueError("ensemble_v2/v3 requires issue_no parameter")
-        return generate_ensemble_strategy(strategy_draws, mined_config, strategy_weights, conn, issue_no)
-
-    return _apply_weight_config(
-        strategy_draws,
-        {
-            "window": float(window_size),
-            "w_freq": 0.40,
-            "w_omit": 0.30,
-            "w_mom": 0.20,
-            "w_pair": 0.05,
-            "w_zone": 0.05,
-        },
-        "组合策略",
-    )
+        # draws 应该是历史号码列表，但 generate_ensemble_strategy 需要 conn, draws, issue_no 等
+        # 注意：generate_ensemble_strategy 期待 draws 为历史号码列表，而我们这里传递的 draws 是历史号码列表
+        # 由于 generate_ensemble_strategy 内部会调用 generate_strategy 再次，需避免无限递归
+        # 直接调用 generate_ensemble_strategy，但它的参数顺序不同
+        return generate_ensemble_strategy(
+            conn=conn,
+            draws=strategy_draws,
+            issue_no=issue_no,
+            mined_config=mined_config,
+            strategy_weights=strategy_weights,
+            window_size=window_size
+        )
+    else:
+        return _apply_weight_config(
+            strategy_draws,
+            {
+                "window": float(window_size),
+                "w_freq": 0.40,
+                "w_omit": 0.30,
+                "w_mom": 0.20,
+                "w_pair": 0.05,
+                "w_zone": 0.05,
+            },
+            "组合策略",
+        )
 
 
 def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = None) -> str:
@@ -1704,7 +1728,14 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
             )
             run_id = cur.lastrowid
 
-        picks, special_number, special_score, score_map = generate_strategy(strategy_weights=strategy_weights, draws, conn=conn, strategy, mined_config=mined_cfg)
+        picks, special_number, special_score, score_map = generate_strategy(
+            strategy=strategy,
+            draws=draws,
+            strategy_weights=strategy_weights,
+            conn=conn,
+            issue_no=target_issue,
+            mined_config=mined_cfg
+        )
         main_numbers = [n for n, _, _, _ in picks]
         conn.executemany(
             """
@@ -1798,7 +1829,14 @@ def run_historical_backtest(
                 if bucket not in mined_cfg_cache:
                     mined_cfg_cache[bucket] = mine_pattern_config_from_rows(draws[:i])
                 mined_cfg = mined_cfg_cache[bucket]
-            main_picks, special_number, special_score, score_map = generate_strategy(conn=conn, history_desc, issue_no=issue_no, strategy, mined_config=mined_cfg)
+            main_picks, special_number, special_score, score_map = generate_strategy(
+                strategy=strategy,
+                draws=history_desc,
+                strategy_weights=None,
+                conn=conn,
+                issue_no=issue_no,
+                mined_config=mined_cfg
+            )
             picked_main = [n for n, _, _, _ in main_picks]
             pools = _build_candidate_pools(score_map, picked_main)
             hit_count = len([n for n in picked_main if n in winning_main])
@@ -2159,7 +2197,14 @@ def backfill_missing_special_picks(conn: sqlite3.Connection) -> int:
         strategy_name = str(run["strategy"])
         run_issue = str(run["issue_no"])
         cfg = mined_cfg if strategy_name == "pattern_mined_v1" else None
-        _, special_number, special_score, _ = generate_strategy(conn=conn, draws, issue_no=run_issue, strategy_name, mined_config=cfg)
+        _, special_number, special_score, _ = generate_strategy(
+            strategy=strategy_name,
+            draws=draws,
+            strategy_weights=None,
+            conn=conn,
+            issue_no=run_issue,
+            mined_config=cfg
+        )
 
         if special_number in main_set:
             for n in ALL_NUMBERS:
