@@ -8,7 +8,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import argparse, csv, io, json, math, os, re, socket, sqlite3, time, pickle, subprocess
+import argparse, csv, io, json, math, os, re, socket, sqlite3, time, pickle, subprocess, ast
 from urllib.error import URLError
 from collections import Counter
 from dataclasses import dataclass
@@ -16,8 +16,42 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
-_BEST_PARAMS_PATH = Path(__file__).resolve().parent / "best_params_zodiac.json"
+# ---------- 安全 JSON 解析 ----------
+def _safe_json_loads(data: str) -> List[int]:
+    """安全解析 JSON 数组，处理递归过深或格式错误的情况。"""
+    if not data:
+        return []
+    # 尝试标准 JSON 解析
+    try:
+        obj = json.loads(data)
+        if isinstance(obj, list) and all(isinstance(x, int) for x in obj):
+            return obj
+        # 如果是列表但包含非整数，尝试转换
+        if isinstance(obj, list):
+            result = []
+            for x in obj:
+                try:
+                    result.append(int(x))
+                except (TypeError, ValueError):
+                    pass
+            return result
+        # 如果是其他类型，尝试提取数字
+        nums = re.findall(r'\d+', str(obj))
+        return [int(n) for n in nums if 1 <= int(n) <= 49][:6]
+    except (json.JSONDecodeError, RecursionError):
+        # 递归过深或 JSON 无效，尝试 ast.literal_eval
+        try:
+            obj = ast.literal_eval(data)
+            if isinstance(obj, list):
+                return [int(x) for x in obj if isinstance(x, (int, float)) or (isinstance(x, str) and x.isdigit())]
+        except (SyntaxError, ValueError, RecursionError):
+            pass
+        # 最后手段：正则提取所有数字
+        nums = re.findall(r'\d+', data)
+        return [int(n) for n in nums if 1 <= int(n) <= 49][:6]
 
+# 全局常量等保持不变
+_BEST_PARAMS_PATH = Path(__file__).resolve().parent / "best_params_zodiac.json"
 
 def load_best_zodiac_params():
     if _BEST_PARAMS_PATH.exists():
@@ -25,10 +59,8 @@ def load_best_zodiac_params():
             return json.load(f)
     return {}
 
-
 BEST_PARAMS_ZODIAC_PATH = Path(__file__).resolve().parent / "best_params_zodiac.json"
 BEST_PARAMS_PATH = Path(__file__).resolve().parent / "best_params.json"
-
 
 def load_best_params():
     for path in (BEST_PARAMS_ZODIAC_PATH, BEST_PARAMS_PATH):
@@ -46,7 +78,6 @@ for _stream_name in ("stdout", "stderr"):
         except Exception:
             pass
 
-# 可选外部模块（不存在时提供回退）
 try:
     from tail_predictor import get_best_tail, backtest_tail
 except Exception:
@@ -61,7 +92,6 @@ try:
 except ImportError:
     predict_lstm_proba = None
 
-# 安全包装 HMM 预测，避免缺少 hmmlearn 时崩溃
 def safe_get_hmm_state_proba(conn):
     try:
         from hmm_features import get_hmm_state_proba
@@ -76,8 +106,6 @@ except Exception:
         def __init__(self, bankroll: float = 1000.0): self.bankroll = bankroll
         def get_bet_recommendation(self, *_args, **_kwargs): return {"suspended": False, "recommended_stake": 0.0}
 
-
-# 全局常量
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 API_TIMEOUT_DEFAULT = 20
