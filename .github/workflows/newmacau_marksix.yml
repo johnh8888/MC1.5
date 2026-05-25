@@ -2,7 +2,7 @@ name: 新澳门彩每日自动更新与推送
 
 on:
   schedule:
-    - cron: '0 14 * * *'      # 北京时间 22:00
+    - cr00
   workflow_dispatch:
 
 jobs:
